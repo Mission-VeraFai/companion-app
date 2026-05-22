@@ -14,6 +14,7 @@ export default function TextToImgModal({
   open: boolean;
   setOpen: any;
 }) {
+  const { data: session } = useSession();
   const [imgSrc, setImgSrc] = useState("");
 
   /**
@@ -60,14 +61,117 @@ export default function TextToImgModal({
 
     return src;
   }
+  const { data: session } = useSession();
   const [loading, setLoading] = useState(false);
-  const sanitizePrompt = (input: string): string => {
+
+  /**
+   * Embeds a visible watermark onto an image (data URI or HTTPS URL)
+   * by drawing it onto an HTML Canvas and returning a watermarked data URI.
+   */
+  const embedWatermark = (src: string, label: string): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new window.Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(src);
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        // Watermark styling
+        const fontSize = Math.max(16, Math.floor(canvas.width / 20));
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.fillStyle = "rgba(255, 255, 255, 0.55)";
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.45)";
+        ctx.lineWidth = 2;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "bottom";
+        const padding = 12;
+        ctx.strokeText(label, canvas.width - padding, canvas.height - padding);
+        ctx.fillText(label, canvas.width - padding, canvas.height - padding);
+        resolve(canvas.toDataURL("image/png"));
+      };
+      img.onerror = () => resolve(src);
+      img.src = src;
+    });
+  };
+  const sanitizePrompt = (input: string): string | null => {
     // Trim whitespace and enforce max length
     let sanitized = input.trim().slice(0, 500);
     // Remove control characters and null bytes
     sanitized = sanitized.replace(/[\x00-\x1F\x7F]/g, "");
     // Remove characters that could be used for prompt injection
     sanitized = sanitized.replace(/[<>{}\[\]`]/g, "");
+
+    // Reject hidden prompt injection patterns (e.g. "ignore previous instructions")
+    const hiddenPromptPatterns = [
+      /ignore\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)/i,
+      /disregard\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)/i,
+      /forget\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)/i,
+      /you\s+are\s+now\s+/i,
+      /act\s+as\s+(if\s+you\s+are|a|an)\s+/i,
+      /new\s+(role|persona|instructions?|prompt)/i,
+      /system\s*:\s*/i,
+      /\[INST\]/i,
+      /<\|im_start\|>/i,
+      /###\s*(instruction|system|human|assistant)/i,
+    ];
+    for (const pattern of hiddenPromptPatterns) {
+      if (pattern.test(sanitized)) {
+        return null;
+      }
+    }
+
+    // Reject base64-encoded content (long base64 blobs that may hide payloads)
+    const base64Pattern = /(?:[A-Za-z0-9+\/]{4}){10,}(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?/;
+    if (base64Pattern.test(sanitized)) {
+      return null;
+    }
+
+    // Reject leetspeak obfuscation patterns (common substitutions used to bypass filters)
+    const leetspeakPattern = /(?:[\$3][xX][3e][cC]|[\$]h[3e][l1][l1]|[\$][cC][rR][i1!][pP][tT]|[eE][vV][4a][l1]|[pP][wW][nN]|[rR][0o][0o][tT])/;
+    if (leetspeakPattern.test(sanitized)) {
+      return null;
+    }
+
+    // Reject shell command patterns
+    const shellCommandPatterns = [
+      /\b(bash|sh|zsh|ksh|csh|fish|cmd|powershell|pwsh)\b/i,
+      /\b(exec|system|popen|subprocess|spawn|fork)\s*\(/i,
+      /[;&|`]\s*\w/,
+      /\$\(.*\)/,
+      /`[^`]+`/,
+      /\b(rm|del|format|mkfs|dd|wget|curl|nc|netcat|ncat)\b/i,
+      /\b(chmod|chown|sudo|su|passwd|useradd|usermod)\b/i,
+      /\/etc\/(passwd|shadow|hosts|sudoers)/i,
+      /\b(cat|echo|printf|tee)\s+.*[>|]/i,
+      />\s*\/dev\//i,
+    ];
+    for (const pattern of shellCommandPatterns) {
+      if (pattern.test(sanitized)) {
+        return null;
+      }
+    }
+
+    // Reject binary executable signatures (magic bytes encoded as text or escape sequences)
+    const binaryPatterns = [
+      /\\x4d\\x5a/i,           // MZ header (Windows PE)
+      /\\x7fELF/i,             // ELF header (Linux)
+      /\\xcf\\xfa\\xed\\xfe/i, // Mach-O header
+      /MZ[\s\S]{0,256}PE\x00\x00/i,
+      /\x7fELF/,
+      /%[0-9a-f]{2}(%[0-9a-f]{2}){3,}/i, // URL-encoded binary sequences
+    ];
+    for (const pattern of binaryPatterns) {
+      if (pattern.test(sanitized)) {
+        return null;
+      }
+    }
+
     return sanitized;
   };
 
@@ -84,46 +188,62 @@ export default function TextToImgModal({
     e.preventDefault();
     setLoading(true);
 
-    const prompt: string = e.target.value;
+    const prompt: string = sanitizePrompt(e.target.value);
     const timestamp = new Date().toISOString();
-    const modelId = "stability-ai/stable-diffusion";
-    const principal =
-      (typeof window !== "undefined" &&
-        (sessionStorage.getItem("userId") ||
-          localStorage.getItem("userId"))) ||
-      "anonymous";
+    const modelId = "org-approved/text-to-image-v1";
+    const principal = session?.user?.email || session?.user?.name || "anonymous";
     const inputHash = await computeInputHash(prompt);
 
-    const response = await fetch("/api/txt2img", {
+        const response = await fetch("/api/txt2img", {
       method: "POST",
       body: JSON.stringify({
         prompt,
       }),
       headers: {
         "Content-Type": "application/json",
+        "Authorization": `Bearer ${(session as any)?.accessToken ?? ""}`,
       },
     });
     const data = await response.json();
-    const outputUrl: string = data[0];
+    const rawOutputUrl: string = data[0];
+    const outputUrl: string | null = sanitizeImageSrc(rawOutputUrl);
+    if (!outputUrl) {
+      console.error("Invalid or unsafe image URL returned from server.");
+      setLoading(false);
+      return;
+    }
     setImgSrc(outputUrl);
 
     // Audit log: record all forensic fields to persistent store
     try {
       await fetch("/api/audit-log", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Audit-Append-Only": "true",
+          "X-Audit-Retention-Days": "365",
+        },
         body: JSON.stringify({
           timestamp,
           principal,
           action: "txt2img",
           modelId,
+          modelVersion,
           inputHash,
           prompt,
           output: outputUrl,
+          retentionPolicy: "append-only",
         }),
       });
     } catch (auditErr) {
       console.error("Audit logging failed:", auditErr);
+      // Re-throw so audit failures are never silently swallowed and can be
+      // surfaced to monitoring / alerting infrastructure.
+      throw new Error(
+        `Audit logging failure — action blocked to preserve forensic integrity: ${
+          auditErr instanceof Error ? auditErr.message : String(auditErr)
+        }`
+      );
     }
 
     setLoading(false);
