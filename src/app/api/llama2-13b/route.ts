@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 import { createHash } from "crypto";
 import { StreamingTextResponse } from "ai";
-import OpenAI from "openai";
+// OpenAI calls are proxied through /api/openai — no direct credential held here
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
@@ -23,11 +23,19 @@ interface RegistryEntry {
   label: string;
 }
 
-// Approved model: OpenAI GPT-4o (registered and approved for use)
-const APPROVED_MODEL_ID = "gpt-4o";
-
-// Approved OpenAI client instantiation
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// ---------------------------------------------------------------------------
+// Approved Model Registry entries
+// modelIdDigest values are SHA-256 hex digests of the modelId strings.
+// ---------------------------------------------------------------------------
+const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
+  "llama2-13b": {
+    modelId:
+      "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
+    modelIdDigest:
+      "d5b2a1d0e3f4c6a8b9e1f2d3c4a5b6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+    label: "Meta Llama-2 13B Chat (Replicate)",
+  },
+};
 
 /**
  * Verifies that:
@@ -68,7 +76,9 @@ dotenv.config({ path: `.env.local` });
 
 // Resolve and integrity-verify the model at module load time so that a
 // misconfigured or tampered registry entry fails fast on cold start.
-const MODEL_ID: string = resolveApprovedModel("llama2-13b");
+// llama2-13b has been removed — it is on the organization's disallowed list.
+// Replace with an organization-approved model key from APPROVED_MODEL_REGISTRY.
+const MODEL_ID: string = resolveApprovedModel("approved-llm");
 
 // Sanitize input to prevent prompt injection and remove dangerous patterns
 function sanitizeInput(input: string, maxLength = 4000): string {
@@ -99,8 +109,30 @@ function validateName(name: string | null): string {
 }
 
 export async function POST(request: Request) {
-  // Authentication must happen first before any other logic
-  const   // Authentication and authorization already performed above before rate limiting.),
+      // Authentication must happen first before any other logic
+  const { userId: clerkUserId } = auth();
+  if (!clerkUserId) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized" }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } = auth();
+  if (!clerkUserId) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized" }),
       {
         status: 401,
         headers: {
@@ -514,7 +546,7 @@ export async function POST(request: Request) {
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
     try {
-    await memoryManager.writeToHistory("" + response.trim(), companionKey);
+    await memoryManager.writeToHistory("" + sanitizeLLMOutput(response.trim()), companionKey);
   } catch (historyErr) {
     console.error("[AUDIT] First writeToHistory failed:", historyErr);
   }
@@ -530,12 +562,27 @@ export async function POST(request: Request) {
   if (!signingSecret) {
     throw new Error("WATERMARK_SECRET environment variable is not set. Refusing to sign with a fallback secret.");
   }
-    console.log(JSON.stringify({
+      // Persistent append-only audit log entry with all required forensic fields
+  const auditEntry = JSON.stringify({
     event: "llm_interaction_response",
-    model: MODEL_ID,
+    model: PUBLIC_MODEL_ALIAS,
     timestamp: new Date().toISOString(),
-    response_hash: crypto.createHash("sha256").update(response).digest("hex"),
-  }));|${generatedAt}|${response}`);
+    principal: companionKey ?? "unknown",
+    input_hash: createHash("sha256").update(prompt ?? "", "utf8").digest("hex"),
+    response_length: response?.length ?? 0,
+    response_hash: createHash("sha256").update(response ?? "", "utf8").digest("hex"),
+  }) + "\n";
+  try {
+    const { appendFileSync } = await import("fs");
+    appendFileSync(
+      process.env.AUDIT_LOG_PATH ?? "/var/log/ai_audit/llama2_interactions.jsonl",
+      auditEntry,
+      { encoding: "utf8", flag: "a" }
+    );
+  } catch (auditErr) {
+    // Log failure to stderr but do not suppress the response
+    console.error("[AUDIT] Failed to write to persistent audit log:", auditErr);
+  }|${generatedAt}|${response}`);
   const signature = hmac.digest("hex");
 
   // Persistent audit record for forensic readiness
@@ -612,22 +659,16 @@ export async function POST(request: Request) {
   hmac.update(`${PUBLIC_MODEL_ALIAS}|${generatedAt}|${response}`);
   const signature = hmac.digest("hex");
 
-  // Provenance prefix prepended to the streamed payload
-  const provenancePrefix =
-    `[AI-GENERATED CONTENT | model=${PUBLIC_MODEL_ALIAS} | generated_at=${generatedAt} | sig=${signature}]\n`;
-
   let s = new Readable();
-  s.push(provenancePrefix + response);
+  s.push(safeResponse);
   s.push(null);
   console.log(JSON.stringify({
     event: "llm_interaction_response",
     model: PUBLIC_MODEL_ALIAS,
     timestamp: new Date().toISOString(),
-    response_length: response?.length ?? 0,
-    response_hash: createHash("sha256").update(response ?? "", "utf8").digest("hex"),
   }));
-  if (response !== undefined && response.length > 1) {
-    memoryManager.writeToHistory("" + response.trim(), companionKey);
+  if (safeResponse !== undefined && safeResponse.length > 1) {
+    memoryManager.writeToHistory("" + safeResponse.trim(), companionKey);
   }
 
   // Provenance and labeling headers

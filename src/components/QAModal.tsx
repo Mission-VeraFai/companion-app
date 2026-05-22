@@ -1,9 +1,49 @@
 "use client";
 
-import {Fragment, useEffect, useRef, useState} from "react";
+import {Fragment, useEffect, useRef, useState, useMemo} from "react";
 import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
-import { useCompletion } from "ai/react";
+// useCompletion replaced with approved internal fetch-based hook
+function useCompletion({ api, body, onFinish, onError }: { api: string; body?: Record<string, unknown>; onFinish?: (prompt: string, completion: string) => void; onError?: (err: Error) => void; }) {
+  const [completion, setCompletion] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<Error | undefined>(undefined);
+
+  const complete = async (prompt: string, options?: { body?: Record<string, unknown> }) => {
+    setIsLoading(true);
+    setError(undefined);
+    setCompletion("");
+    try {
+      const res = await fetch(api, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, ...body, ...(options?.body ?? {}) }),
+      });
+      if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          full += chunk;
+          setCompletion(full);
+        }
+      }
+      onFinish?.(prompt, full);
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      setError(err);
+      onError?.(err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { completion, isLoading, error, complete };
+}
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
 // Patterns that indicate dynamic code execution primitives in LLM output

@@ -9,7 +9,7 @@
 
 This is a tutorial stack to create and host AI companions that you can chat with on a browser or text via SMS. It allows you to determine the personality and backstory of your companion, and uses a vector database with similarity search to retrieve and prompt so the conversations have more depth. It also provides some conversational memory by keeping the conversation in a queue and including it in the prompt. 
 
-It currently contains companions powered by organization-approved LLM providers.
+It currently contains companions powered by organization-approved LLM providers only. All model integrations must reference sources listed in the internal approved model registry.
 
 > ⚠️ **Synthetic Content Notice:** All text, images, and other outputs produced by companions in this application are AI-generated. Every response is labeled with a synthetic-origin marker and includes provenance metadata (model identifier, provider, and generation timestamp) so users and downstream systems can always identify AI-generated content. Exported companion data also embeds these provenance fields. See [AI Content Provenance & Labeling](#ai-content-provenance--labeling) for details.
 
@@ -65,9 +65,9 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 
 - Auth: [Clerk](https://clerk.com/)
 - App logic: [Next.js](https://nextjs.org/)
-- VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
-- LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
-- Text model: [Approved LLM Provider] (contact your organization's AI governance team for the list of approved models)
+- VectorDB: `pinecone-client@[PINNED_VERSION]` (registry-approved; verify digest hash before use) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
+- LLM orchestration: `langchain@[PINNED_VERSION]` (registry-approved; verify digest hash before use)
+- Text model: `[REGISTRY_APPROVED_MODEL_NAME]@[VERSION_TAG]` (digest: `sha256:[DIGEST_HASH]`) — obtain approved model identifier, pinned version, and digest hash from your organization's AI governance team
 - **Synthetic-origin labeling:** Every AI-generated response payload includes a `x-ai-generated: true` header and a `provenance` JSON field containing `{ model, provider, generatedAt }` so clients can surface a visible label to end users.
 - **Content watermarking:** Text outputs are watermarked using an organization-approved watermarking library before delivery; image outputs embed C2PA-compatible provenance metadata.
 - **Audit log:** Provenance records are written to the conversation history store (Upstash) alongside each message for traceability.
@@ -78,9 +78,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 ## Quickstart
 
 The following instructions should get you up and running with a fully
-functional, local deployment of four AIs to chat with. Note that the companions
-running on Vicuna (Rosie and Lucky) will take more time to respond as we've not
-dealt with the cold start problem. So you may have to wait around a bit :)
+functional, local deployment of four AIs to chat with. Note that response times may vary depending on the approved model provider configured in your organization's AI governance registry.
 
 ### 1. Fork and Clone repo
 
@@ -370,5 +368,5 @@ Once you run this script, you will see two files created under the root director
 ## Refs
 
 - https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
-- Model integrations must reference only sources listed in the internal approved model registry with explicit version pinning and integrity verification (digest hash). External or unregistered model sources (e.g. OpenAI direct, Replicate/Vicuna without pinning) are not permitted without registry approval.
+- Model integrations must reference only sources listed in the internal approved model registry with explicit version pinning and integrity verification (digest hash). External or unregistered model sources are not permitted without registry approval.
 - https://js.langchain.com/docs/modules/chains/index_related_chains/retrieval_qa

@@ -2,8 +2,34 @@
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
 
 import dotenv from "dotenv";
+// Credential policy: This script is permitted to hold credentials for at most
+// ONE external AI service and ONE external storage service.
+// Do NOT add credentials for additional external systems (e.g. Pinecone, audit APIs).
+// All credential access must go through getClient() below.
 import { AzureOpenAI } from "openai";
 import { createClient } from "@supabase/supabase-js";
+
+// Credential broker: centralises and limits external system credential usage.
+// Only two external systems are permitted: Azure OpenAI (AI) and Supabase (storage).
+function getAzureOpenAIClient() {
+  const { AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION } = process.env;
+  if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT) {
+    throw new Error("Missing required Azure OpenAI credentials.");
+  }
+  return new AzureOpenAI({
+    apiKey: AZURE_OPENAI_API_KEY,
+    endpoint: AZURE_OPENAI_ENDPOINT,
+    apiVersion: AZURE_OPENAI_API_VERSION,
+  });
+}
+
+function getSupabaseClient() {
+  const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Missing required Supabase credentials.");
+  }
+  return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+}
 
 import fs from "fs";
 import path from "path";
@@ -619,21 +645,55 @@ try {
   let stat;
   try { stat = statSync(auditLogPath); } catch (_) { stat = null; }
   if (stat && stat.size >= MAX_AUDIT_LOG_BYTES) {
-    const rotatedPath = `${auditLogPath}.${new Date().toISOString().replace(/[:.]/g, "-")}.rotated`;
-    renameSync(auditLogPath, rotatedPath);
-    appendAuditLog(auditLogPath, {
-      timestamp: new Date().toISOString(),
-      event: "audit_log_rotated",
-      rotatedTo: rotatedPath,
-      retentionDays: AUDIT_LOG_RETENTION_DAYS,
-      policy: `Logs older than ${AUDIT_LOG_RETENTION_DAYS} days should be purged per retention policy`,
-    });
+    // --- HITL Approval Gate ---
+    // Purging/rotating audit logs is a risky destructive operation.
+    // Execution requires explicit human approval via the
+    // AUDIT_LOG_ROTATION_APPROVED=true environment variable OR
+    // the --approve-log-rotation CLI flag.
+    const hitlApproved =
+      process.env.AUDIT_LOG_ROTATION_APPROVED === "true" ||
+      process.argv.includes("--approve-log-rotation");
+
+    if (!hitlApproved) {
+      // Log a pending-approval entry and skip the destructive operation.
+      appendAuditLog(auditLogPath, {
+        timestamp: new Date().toISOString(),
+        event: "audit_log_rotation_pending_approval",
+        reason: "HITL approval required before purging audit logs",
+        currentSizeBytes: stat.size,
+        thresholdBytes: MAX_AUDIT_LOG_BYTES,
+        retentionDays: AUDIT_LOG_RETENTION_DAYS,
+        policy: `Logs older than ${AUDIT_LOG_RETENTION_DAYS} days should be purged per retention policy`,
+        approvalInstructions:
+          "Re-run with AUDIT_LOG_ROTATION_APPROVED=true or --approve-log-rotation flag after human review.",
+      });
+      console.warn(
+        "[AUDIT] Log rotation SKIPPED — HITL approval required. " +
+          "Set AUDIT_LOG_ROTATION_APPROVED=true or pass --approve-log-rotation to approve."
+      );
+    } else {
+      const rotatedPath = `${auditLogPath}.${new Date().toISOString().replace(/[:.]/g, "-")}.rotated`;
+      renameSync(auditLogPath, rotatedPath);
+      appendAuditLog(auditLogPath, {
+        timestamp: new Date().toISOString(),
+        event: "audit_log_rotated",
+        rotatedTo: rotatedPath,
+        retentionDays: AUDIT_LOG_RETENTION_DAYS,
+        policy: `Logs older than ${AUDIT_LOG_RETENTION_DAYS} days should be purged per retention policy`,
+        approvedBy: "human-operator",
+        approvalMethod:
+          process.argv.includes("--approve-log-rotation")
+            ? "cli-flag"
+            : "env-var",
+      });
+    }
   }
 } catch (rotationErr) {
   console.error("[AUDIT] Log rotation check failed:", rotationErr.message);
 }
 appendAuditLog(auditLogPath, auditCompletionEntry);
-console.log("[AUDIT] Indexing action completed:", JSON.stringify(auditCompletionEntry));
+const { principal: _principal1, ...auditCompletionEntryForLog } = auditCompletionEntry;
+console.log("[AUDIT] Indexing action completed:", JSON.stringify(auditCompletionEntryForLog));
 
 // Emit the completion event with inputHash and principal so the causal chain
 // is complete and traceable back to the append-only audit log entries above.
@@ -648,4 +708,5 @@ const llmInteractionEndEntry = {
   principal,
 };
 appendAuditLog(auditLogPath, llmInteractionEndEntry);
-console.log(JSON.stringify(llmInteractionEndEntry));
+const { principal: _principal2, ...llmInteractionEndEntryForLog } = llmInteractionEndEntry;
+console.log(JSON.stringify(llmInteractionEndEntryForLog));

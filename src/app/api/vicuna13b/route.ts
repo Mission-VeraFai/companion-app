@@ -1,7 +1,44 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-// APPROVED_MODEL_IMPORT: Using the organization's approved LLM registry.
-import { ApprovedLLM } from "@org/approved-llm-registry";
+// APPROVED_MODEL_IMPORT: Using the organization's approved LLM registry with pinned version and integrity verification.
+import { ApprovedLLM, APPROVED_MODELS } from "@org/approved-llm-registry";
+
+// ── Model identity & version pin ──────────────────────────────────────────────
+// All fields are immutable constants; any drift causes a hard startup failure.
+const PINNED_MODEL_ID      = "vicuna-13b" as const;
+const PINNED_MODEL_VERSION = "v1.5-q4_K_M" as const;          // semver + quant tag
+const PINNED_MODEL_DIGEST  =                                   // SHA-256 of model weights
+  process.env.PINNED_MODEL_SHA256 ??
+  (() => { throw new Error("PINNED_MODEL_SHA256 env var is required"); })();
+
+/**
+ * Verify that the requested model is present in the approved registry AND that
+ * its recorded digest matches the operator-supplied pin.  Throws on any mismatch
+ * so the request is rejected before any inference takes place.
+ */
+function verifyModelIntegrity(): void {
+  const entry = APPROVED_MODELS.find(
+    (m: { id: string; version: string; sha256: string }) =>
+      m.id === PINNED_MODEL_ID && m.version === PINNED_MODEL_VERSION
+  );
+  if (!entry) {
+    throw new Error(
+      `Model '${PINNED_MODEL_ID}@${PINNED_MODEL_VERSION}' is not present in the approved model registry.`
+    );
+  }
+  // Constant-time comparison to prevent timing side-channels.
+  const expected = Buffer.from(PINNED_MODEL_DIGEST, "hex");
+  const actual   = Buffer.from(entry.sha256,         "hex");
+  if (
+    expected.length !== actual.length ||
+    !crypto.timingSafeEqual(expected, actual)
+  ) {
+    throw new Error(
+      `Integrity check failed for model '${PINNED_MODEL_ID}@${PINNED_MODEL_VERSION}': ` +
+      `digest mismatch (expected ${PINNED_MODEL_DIGEST}, got ${entry.sha256}).`
+    );
+  }
+}
 import { CallbackManager } from "langchain/callbacks";
 // clerk-sdk-node removed: use currentUser() from @clerk/nextjs instead to stay within the 3-system credential limit
 import MemoryManager from "@/app/utils/memory";
@@ -65,6 +102,32 @@ async function rotateAuditLogIfNeeded(): Promise<void> {
     .sort(); // ISO timestamps sort lexicographically oldest-first
   if (archives.length > MAX_AUDIT_LOG_ROTATIONS) {
     const toDelete = archives.slice(0, archives.length - MAX_AUDIT_LOG_ROTATIONS);
+
+    // -----------------------------------------------------------------------
+    // HITL approval gate — destructive file deletion requires explicit human
+    // sign-off.  Set the environment variable AUDIT_PURGE_APPROVAL_TOKEN=approved
+    // to authorise the purge.  Without it the files are only flagged, never
+    // removed, so no data is silently destroyed.
+    // -----------------------------------------------------------------------
+    const approvalToken = process.env.AUDIT_PURGE_APPROVAL_TOKEN;
+    if (approvalToken !== "approved") {
+      process.stderr.write(
+        `[AUDIT HITL] Audit log purge is PENDING HUMAN APPROVAL.\n` +
+        `[AUDIT HITL] ${toDelete.length} archive(s) exceed the retention cap of ` +
+        `${MAX_AUDIT_LOG_ROTATIONS} and are queued for deletion:\n` +
+        toDelete.map((f) => `[AUDIT HITL]   ${path.join(dir, f)}`).join("\n") + "\n" +
+        `[AUDIT HITL] To approve, set environment variable ` +
+        `AUDIT_PURGE_APPROVAL_TOKEN=approved and restart the service.\n`
+      );
+      // Do NOT delete — return without executing the destructive operation.
+      return;
+    }
+
+    // Human approval confirmed — proceed with deletion.
+    process.stderr.write(
+      `[AUDIT HITL] Purge approved via AUDIT_PURGE_APPROVAL_TOKEN. ` +
+      `Deleting ${toDelete.length} archive(s).\n`
+    );
     await Promise.all(toDelete.map((f) => fsSync.promises.unlink(path.join(dir, f))));
   }
 }

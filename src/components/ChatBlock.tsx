@@ -268,7 +268,7 @@ export function responseToChatBlocks(completion: any) {
     writeAuditRecord('responseToChatBlocks', completion);
 
     // First we try to parse completion as JSON in case we're dealing with an object.
-    console.log("got completoin", completion, typeof completion)
+    writeAuditRecord('responseToChatBlocks:input_received', { payload: completion, payloadType: typeof completion });
     if (typeof completion == "string") {
         try {
             completion = JSON.parse(completion)

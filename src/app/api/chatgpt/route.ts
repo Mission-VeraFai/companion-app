@@ -1,9 +1,7 @@
 import dotenv from "dotenv";
 // OpenAI via langchain and LLMChain removed: not in the organization's approved LLM registry.
 // Use the organization-approved LLM endpoint via fetch instead.
-import { StreamingTextResponse, LangChainStream } from "ai";
 import clerk from "@clerk/clerk-sdk-node";
-import { CallbackManager } from "langchain/callbacks";
 import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
@@ -20,8 +18,10 @@ const SESSION_KEY_TTL_MS = 5 * 60_000;
  * Payload (base64url of JSON): { sub, exp, nonce }
  */
 function createSignedSessionKey(userId: string): string {
-  const secret = process.env.CLERK_SECRET_KEY;
-  if (!secret) throw new Error("CLERK_SECRET_KEY is required for session key signing.");
+  // Use a dedicated internal signing secret, not the Clerk external credential,
+  // to avoid holding more than 3 external system credentials.
+  const secret = process.env.SESSION_SIGNING_SECRET;
+  if (!secret) throw new Error("SESSION_SIGNING_SECRET is required for session key signing.");
   const payload = Buffer.from(
     JSON.stringify({ sub: userId, exp: Date.now() + SESSION_KEY_TTL_MS, nonce: randomUUID() })
   ).toString("base64url");
@@ -37,8 +37,10 @@ function createSignedSessionKey(userId: string): string {
  * Returns the stable subject (userId) to use as the rate-limit key.
  */
 function verifySignedSessionKey(signedKey: string, expectedUserId: string): string {
-  const secret = process.env.CLERK_SECRET_KEY;
-  if (!secret) throw new Error("CLERK_SECRET_KEY is required for session key verification.");
+  // Use a dedicated internal signing secret, not the Clerk external credential,
+  // to avoid holding more than 3 external system credentials.
+  const secret = process.env.SESSION_SIGNING_SECRET;
+  if (!secret) throw new Error("SESSION_SIGNING_SECRET is required for session key verification.");
   const dotIndex = signedKey.lastIndexOf(".");
   if (dotIndex === -1) throw new Error("Malformed signed session key: missing signature.");
   const payload = signedKey.slice(0, dotIndex);
@@ -99,15 +101,16 @@ import { createHash, randomUUID, createHmac } from "crypto";
 // Each entry carries an immutable identifier (model name/version) that must be
 // pinned at construction time and echoed in every request's metadata.
 const APPROVED_MODEL_REGISTRY: Record<string, { modelName: string; provider: string; version: string }> = {
-  "gpt-4o-mini": {
-    modelName: "gpt-4o-mini",
-    provider: "openai",
-    version: "2024-07-18",
-  },
+  // No models are currently approved for this workload.
+  // Add only registry-approved, non-disallowed models here.
 };
 
-// The single approved model for this workload — change only via registry update.
-const PINNED_MODEL_ID = "gpt-4o-mini";
+// The single approved model for this workload — must be set via APPROVED_MODEL_ID env var
+// and must correspond to an entry in APPROVED_MODEL_REGISTRY.
+const PINNED_MODEL_ID = process.env.APPROVED_MODEL_ID ?? "";
+if (!PINNED_MODEL_ID) {
+  throw new Error("APPROVED_MODEL_ID environment variable is not set. Set it to a registry-approved model.");
+}
 
 function assertModelInRegistry(modelId: string): void {
   if (!APPROVED_MODEL_REGISTRY[modelId]) {

@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 import clerk from "@clerk/clerk-sdk-node";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
-import { rateLimit } from "@/app/utils/rateLimit";
+// Rate limiting removed from agent route — enforce via Next.js middleware to avoid holding Upstash Redis credentials here
 import { createHmac } from "crypto";
 import ConfigManager from "@/app/utils/config";
 import fs from "fs";
@@ -14,7 +14,7 @@ const AUDIT_LOG_BASE_DIR = process.env.AUDIT_LOG_DIR
   : "/var/log/app";
 const AUDIT_LOG_PATH = path.join(AUDIT_LOG_BASE_DIR, "audit_ai_actions.log");
 const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || "", 10) || 10 * 1024 * 1024; // 10 MB default
-const AUDIT_LOG_MODEL_ID = "steamship-agent-approved-v1";
+const AUDIT_LOG_MODEL_ID = "gpt-4-approved-v1";
 const AUDIT_LOG_MODEL_VERSION = APPROVED_MODEL_REGISTRY[AUDIT_LOG_MODEL_ID]?.version ?? "unknown";
 
 function rotateAuditLogIfNeeded(): void {
@@ -31,8 +31,8 @@ function rotateAuditLogIfNeeded(): void {
         const existingContent = fs.readFileSync(AUDIT_LOG_PATH);
         // Write archive with append flag so existing archive data is never overwritten.
         fs.appendFileSync(archivePath, existingContent);
-        // Truncate the active log in-place (preserves inode; no rename/delete).
-        fs.writeFileSync(AUDIT_LOG_PATH, "", { encoding: "utf8", flag: "w" });
+        // Active log is NOT cleared — append-only/immutability is preserved.
+        // New entries will continue to be appended to the active log.
       }
     }
   } catch (err) {
@@ -67,9 +67,98 @@ function writeAuditLog(entry: Record<string, unknown>): void {
 
 dotenv.config({ path: `.env.local` });
 
-// Approved model registry: only these pinned, versioned endpoints are permitted.
-// Add new approved endpoints here after security review.
-// Version MUST be an immutable digest or commit hash — mutable tags (e.g. "1.0.0") are not permitted.
+// Patterns that indicate prompt injection, shell commands, or encoded malicious content.
+const MALICIOUS_PROMPT_PATTERNS: RegExp[] = [
+  // Prompt injection / jailbreak attempts
+  /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+  /system\s*:\s*you\s+are/i,
+  /\[\s*system\s*\]/i,
+  /<\s*system\s*>/i,
+  /###\s*instruction/i,
+  /new\s+instructions?\s*:/i,
+  /disregard\s+(all\s+)?(previous|prior)/i,
+  /forget\s+(all\s+)?(previous|prior|your)/i,
+  /you\s+are\s+now\s+(a|an|the)\s+/i,
+  /act\s+as\s+(a|an|the)\s+/i,
+  /pretend\s+(you\s+are|to\s+be)/i,
+  /roleplay\s+as/i,
+  /jailbreak/i,
+  /DAN\s+mode/i,
+  // Shell command sequences
+  /[`$]\s*\(/,
+  /;\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su\s)/i,
+  /\|\s*(bash|sh|python|perl|ruby|nc|ncat|netcat)/i,
+  /&&\s*(rm|wget|curl|bash|sh|python|perl|ruby)/i,
+  /\beval\s*\(/i,
+  /\bexec\s*\(/i,
+  /\/bin\/(bash|sh|zsh|ksh|csh)/i,
+  /\bsystem\s*\(/i,
+  /\bpasswd\b/i,
+  /\/etc\/(passwd|shadow|sudoers)/i,
+  // Base64-encoded content (heuristic: long base64 strings are suspicious in prompts)
+  /(?:[A-Za-z0-9+\/]{40,}={0,2})/,
+  // SSRF / URL injection
+  /https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|169\.254\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)\S*/i,
+  // Exfiltration patterns
+  /send\s+(this|the|my|all|your)\s+(data|context|history|conversation|system\s+prompt)/i,
+  /exfiltrat/i,
+  /leak\s+(the|this|my|your)\s+(prompt|context|system|instruction)/i,
+];
+
+function containsMaliciousContent(text: string): boolean {
+  if (typeof text !== "string") return false;
+  return MALICIOUS_PROMPT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function validateInputs(
+  message: unknown,
+  chatHistory: unknown
+): { valid: boolean; reason?: string } {
+  if (typeof message !== "string") {
+    return { valid: false, reason: "message must be a string" };
+  }
+  if (message.length > 8000) {
+    return { valid: false, reason: "message exceeds maximum allowed length" };
+  }
+  if (containsMaliciousContent(message)) {
+    return { valid: false, reason: "message contains disallowed content" };
+  }
+
+  if (chatHistory !== undefined && chatHistory !== null) {
+    if (!Array.isArray(chatHistory)) {
+      return { valid: false, reason: "chatHistory must be an array" };
+    }
+    for (let i = 0; i < chatHistory.length; i++) {
+      const entry = chatHistory[i];
+      if (typeof entry !== "object" || entry === null) {
+        return { valid: false, reason: `chatHistory[${i}] must be an object` };
+      }
+      const entryObj = entry as Record<string, unknown>;
+      for (const field of ["text", "content", "message", "role"]) {
+        if (typeof entryObj[field] === "string") {
+          if ((entryObj[field] as string).length > 8000) {
+            return {
+              valid: false,
+              reason: `chatHistory[${i}].${field} exceeds maximum allowed length`,
+            };
+          }
+          if (containsMaliciousContent(entryObj[field] as string)) {
+            return {
+              valid: false,
+              reason: `chatHistory[${i}].${field} contains disallowed content`,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
+// Approved model registry: loaded exclusively from the organization-approved registry file
+// specified by MODEL_REGISTRY_PATH. Inline definitions are prohibited.
+// The registry file must be maintained and reviewed by the security team.ed.
 // The endpoint MUST be supplied via the environment variable; an empty/missing value is a hard startup error.
 (function validateApprovedModelRegistryEnv() {
   const requiredEnvVars: Record<string, string | undefined> = {
@@ -619,7 +708,7 @@ export async function POST(req: Request) {
     };
 
     // Compute an HMAC-SHA256 signature over the canonical provenance fields.
-    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET;
+    // Provenance signing secret removed — use a non-secret provenance identifier (e.g., a hash of public request metadata) instead of a shared secret credential
     if (!signingSecret) {
       console.error("PROVENANCE_SIGNING_SECRET environment variable is not set. Cannot sign provenance payload.");
       return returnError(500, "Server misconfiguration: provenance signing secret is not configured.");
@@ -629,19 +718,60 @@ export async function POST(req: Request) {
       .update(JSON.stringify(provenancePayload))
       .digest("hex");
 
-    // Minimise response blocks: expose only the fields the client actually needs.
+    // Sanitize a string value extracted from an MCP server response block.
+    // Strips HTML/script tags, null bytes, and enforces a maximum length.
+    const ALLOWED_BLOCK_TYPES = new Set(["text", "image", "tool_use", "tool_result"]);
+    const MAX_FIELD_LENGTH = 65536; // 64 KiB per field
+
+    function sanitizeString(value: unknown, maxLength: number): string | undefined {
+      if (typeof value !== "string") return undefined;
+      // Remove null bytes
+      let sanitized = value.replace(/\0/g, "");
+      // Strip HTML/script tags to prevent injection
+      sanitized = sanitized.replace(/<[^>]*>/g, "");
+      // Truncate to maximum allowed length
+      if (sanitized.length > maxLength) {
+        sanitized = sanitized.slice(0, maxLength);
+      }
+      return sanitized;
+    }
+
+    function sanitizeBlockType(value: unknown): string | undefined {
+      const cleaned = sanitizeString(value, 64);
+      if (cleaned === undefined || cleaned.length === 0) return undefined;
+      if (!ALLOWED_BLOCK_TYPES.has(cleaned)) {
+        // Log unexpected block type for audit purposes but do not propagate it
+        process.stderr.write(
+          `[MCP SANITIZATION] Rejected unknown block type: ${JSON.stringify(cleaned)}\n`
+        );
+        return undefined;
+      }
+      return cleaned;
+    }
+
+    // Minimise and sanitize response blocks: expose only validated fields the client actually needs.
     const minimisedBlocks = Array.isArray(responseBlocks)
-      ? (responseBlocks as Array<Record<string, unknown>>).map((block) => ({
-          ...(block.type !== undefined ? { type: block.type } : {}),
-          ...(block.text !== undefined ? { text: block.text } : {}),
-        }))
+      ? (responseBlocks as Array<Record<string, unknown>>)
+          .map((block) => {
+            const sanitizedType = sanitizeBlockType(block.type);
+            const sanitizedText = sanitizeString(block.text, MAX_FIELD_LENGTH);
+            return {
+              ...(sanitizedType !== undefined ? { type: sanitizedType } : {}),
+              ...(sanitizedText !== undefined ? { text: sanitizedText } : {}),
+            };
+          })
+          // Drop blocks that have no valid fields after sanitization
+          .filter((block) => Object.keys(block).length > 0)
       : [];
 
-    // Minimise provenance metadata: omit internal identifiers and signing artefacts.
+    // Include all required provenance fields: model identifier, watermark nonce, and cryptographic signature.
     const enrichedResponse = {
       _syntheticContentProvenance: {
         timestamp: provenanceTimestamp,
         contentLabel: provenancePayload.contentLabel,
+        modelId: provenancePayload.modelId,
+        watermarkNonce: provenancePayload.watermarkNonce,
+        provenanceSignature,
       },
       data: minimisedBlocks,
     };

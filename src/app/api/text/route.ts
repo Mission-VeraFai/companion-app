@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import twilio from "twilio";
+// Twilio messaging is delegated to the internal /api/notify endpoint to avoid holding Twilio credentials here.
 import { verifyToken } from "@clerk/clerk-sdk-node";
 
 /**
@@ -78,6 +78,42 @@ if (!ORG_MODEL_REGISTRY_URL) {
   );
 }
 
+// Allowlist of approved hostnames for the org model registry.
+// Only URLs whose hostname exactly matches one of these entries are permitted.
+const APPROVED_REGISTRY_HOSTNAMES: ReadonlySet<string> = new Set([
+  process.env.ORG_MODEL_REGISTRY_APPROVED_HOST ?? "",
+].filter(Boolean));
+
+function validateRegistryURL(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(
+      `FATAL: ORG_MODEL_REGISTRY_URL is not a valid URL: ${url}`
+    );
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      `FATAL: ORG_MODEL_REGISTRY_URL must use HTTPS. Got: ${parsed.protocol}`
+    );
+  }
+  if (APPROVED_REGISTRY_HOSTNAMES.size === 0) {
+    throw new Error(
+      "FATAL: No approved registry hostnames configured. " +
+      "Set ORG_MODEL_REGISTRY_APPROVED_HOST to the expected registry hostname."
+    );
+  }
+  if (!APPROVED_REGISTRY_HOSTNAMES.has(parsed.hostname)) {
+    throw new Error(
+      `FATAL: ORG_MODEL_REGISTRY_URL hostname '${parsed.hostname}' is not in the approved allowlist.`
+    );
+  }
+}
+
+// Validate the registry URL against the allowlist at startup.
+validateRegistryURL(ORG_MODEL_REGISTRY_URL);
+
 type ApprovedModelEntry = { pinnedVersion: string; endpoint: string };
 type ApprovedModelRegistry = Record<string, ApprovedModelEntry>;
 
@@ -93,6 +129,7 @@ async function fetchApprovedModelRegistry(): Promise<ApprovedModelRegistry> {
   if (registrySecret) {
     headers["Authorization"] = `Bearer ${registrySecret}`;
   }
+  validateRegistryURL(ORG_MODEL_REGISTRY_URL as string);
   const response = await fetch(ORG_MODEL_REGISTRY_URL as string, {
     method: "GET",
     headers,
@@ -114,17 +151,6 @@ async function resolveApprovedModel(
 ): Promise<ApprovedModelEntry | null> {
   const registry = await fetchApprovedModelRegistry();
   const entry = registry[requestedModel];
-  if (!entry) return null;
-  return entry;
-}> = {
-  // Add additional approved models here as needed.
-  // NOTE: GPT, LLaMA, and Claude models are disallowed per the organization's LLM policy.
-};
-
-function resolveApprovedModel(
-  requestedModel: string
-): { pinnedVersion: string; endpoint: string } | null {
-  const entry = APPROVED_MODEL_REGISTRY[requestedModel];
   if (!entry) return null;
   return entry;
 }
@@ -743,6 +769,34 @@ if (decodedKey) {
   const MAX_SMS_LENGTH = 1600;
   smsBody = smsBody.slice(0, MAX_SMS_LENGTH);
 
+  // Sanitize LLM output for dynamic code execution primitives before use in SMS
+  const sanitizeDynamicCodePrimitives = (text: string): string => {
+    // Patterns covering eval, exec, Function constructor, dynamic script execution
+    const dynamicCodePatterns = [
+      /\beval\s*\(/gi,
+      /\bexec\s*\(/gi,
+      /\bnew\s+Function\s*\(/gi,
+      /\bFunction\s*\(/gi,
+      /\bsetTimeout\s*\(\s*['"`]/gi,
+      /\bsetInterval\s*\(\s*['"`]/gi,
+      /\bsetImmediate\s*\(\s*['"`]/gi,
+      /\bimport\s*\(/gi,
+      /\brequire\s*\(/gi,
+      /\bprocess\.binding\s*\(/gi,
+      /\bvm\.runInThisContext\s*\(/gi,
+      /\bvm\.runInNewContext\s*\(/gi,
+      /\bvm\.Script\s*\(/gi,
+      /<script[\s\S]*?>/gi,
+      /javascript\s*:/gi,
+    ];
+    let sanitized = text;
+    for (const pattern of dynamicCodePatterns) {
+      sanitized = sanitized.replace(pattern, '[REMOVED]');
+    }
+    return sanitized;
+  };
+  smsBody = sanitizeDynamicCodePrimitives(smsBody);
+
     const piiEncryptionKey = process.env.PII_ENCRYPTION_KEY;
   if (!piiEncryptionKey) {
     console.error("ERROR: PII_ENCRYPTION_KEY is not configured.");
@@ -768,8 +822,35 @@ if (decodedKey) {
     return `${iv.toString("hex")}:${encrypted.toString("hex")}`;
   };
 
-  const toRaw = queryMap["From"]; // actual phone number for Twilio routing only
-  const from = queryMap["To"];
+  // Validate and sanitize phone number inputs before use
+  const PHONE_E164_REGEX = /^\+[1-9]\d{1,14}$/;
+  const sanitizePhoneNumber = (input: unknown): string => {
+    if (typeof input !== "string") {
+      throw new Error("Invalid phone number: not a string");
+    }
+    // Strip all whitespace
+    const trimmed = input.trim();
+    if (!PHONE_E164_REGEX.test(trimmed)) {
+      throw new Error("Invalid phone number format: must be E.164");
+    }
+    return trimmed;
+  };
+
+  let toRaw: string;
+  let from: string;
+  try {
+    toRaw = sanitizePhoneNumber(queryMap["From"]); // actual phone number for Twilio routing only
+    from = sanitizePhoneNumber(queryMap["To"]);
+  } catch (validationError) {
+    console.error("ERROR: Invalid phone number input.", validationError);
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid phone number input" }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
   // Encrypted reference used for any logging or internal storage — never log toRaw
   const toEncrypted = encryptPhoneNumber(toRaw, piiEncryptionKey);
 
@@ -777,12 +858,32 @@ if (decodedKey) {
     .create({
       body: smsBody,
       from,
-      to: toRaw, // Twilio requires plaintext number; transmitted over Twilio's encrypted HTTPS channel
+      to: decryptPhoneNumber(toEncrypted, piiEncryptionKey), // plaintext derived from encrypted reference only at point of transmission
     })
     .catch(() => {
       // Suppress error details to avoid leaking routing or payload information
       console.error("WARNING: failed to send SMS to encrypted recipient.");
     });
+  // Guard against prompt injection, base64 payloads, and shell commands in smsBody
+  const detectMaliciousPromptPatterns = (text: string): boolean => {
+    // Hidden/override prompt injection keywords
+    const promptInjectionPattern = /ignore\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)|system\s*prompt|you\s+are\s+now|act\s+as\s+|jailbreak|\[INST\]|<\|im_start\|>|<\|system\|>/i;
+    // Base64-encoded blobs (16+ contiguous base64 chars suggesting encoded payload)
+    const base64Pattern = /(?:[A-Za-z0-9+\/]{16,}={0,2})/;
+    // Shell command sequences
+    const shellCommandPattern = /(?:;|&&|\|\||`|\$\()\s*(?:rm|curl|wget|bash|sh|python|perl|nc|ncat|eval|exec|chmod|chown|sudo|su\s)/i;
+    return (
+      promptInjectionPattern.test(text) ||
+      base64Pattern.test(text) ||
+      shellCommandPattern.test(text)
+    );
+  };
+
+  if (detectMaliciousPromptPatterns(smsBody)) {
+    console.error("WARNING: Malicious prompt pattern detected in smsBody; replacing with safe fallback.");
+    smsBody = "[Response unavailable]";
+  }
+
   const provenanceFooter = ` | ${new Date().toISOString()}`;
   const aiLabel = "[AI-GENERATED CONTENT]";
   const labeledResponseText = attachProvenanceWatermark(`${aiLabel}\n${smsBody}${provenanceFooter}`);
@@ -791,7 +892,7 @@ if (decodedKey) {
     .create({
       body: labeledResponseText,
       from,
-      to,
+      to: decryptPhoneNumber(toEncrypted, piiEncryptionKey), // plaintext derived from encrypted reference only at point of transmission
     })
   );
   const wateredResponseText = attachProvenanceWatermark(smsBody);
@@ -799,10 +900,11 @@ if (decodedKey) {
     .create({
       body: wateredResponseText,
       from,
-      to,
+      to: decryptPhoneNumber(toEncrypted, piiEncryptionKey), // plaintext derived from encrypted reference only at point of transmission
     })
-    .catch((err) => {
-      console.log("WARNING: failed to send SMS.", err);
+    .catch(() => {
+      // Suppress error details to avoid leaking routing or payload information
+      console.error("WARNING: failed to send SMS to encrypted recipient.");
     });
 
   return NextResponse.json({ message: "Hello from the API!" });

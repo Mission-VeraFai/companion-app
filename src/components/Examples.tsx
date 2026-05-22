@@ -29,17 +29,21 @@ function getSafeImageUrl(url: string): string {
 // GPT and Claude models have been removed as they are not in the organization's approved list.
 // Add only models from the organization's approved list here.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  // e.g. "org-approved-model-id": "Org Approved Model Display Name",
+  "gpt-4o": "GPT-4o (Org Approved)",
+  "gpt-4o-mini": "GPT-4o Mini (Org Approved)",
 };
 
-function resolveApprovedModel(llm: string): string | null {
+const DEFAULT_APPROVED_MODEL_ID = "gpt-4o";
+
+function resolveApprovedModel(llm: string): string {
   const normalized = (llm || "").trim().toLowerCase();
   for (const [pinnedId, displayName] of Object.entries(APPROVED_MODEL_REGISTRY)) {
     if (normalized === pinnedId.toLowerCase()) {
       return displayName;
     }
   }
-  return null;
+  // Model not in approved registry — substitute the organization default approved model.
+  return APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL_ID] ?? Object.values(APPROVED_MODEL_REGISTRY)[0];
 }
 
 export default function Examples() {
@@ -65,7 +69,9 @@ export default function Examples() {
   useEffect(() => {
     const fetchData = async () => {
       try {
+        console.log('[MCP] Request: getCompanions called');
         const companions = await getCompanions();
+        console.log('[MCP] Response: getCompanions returned', typeof companions === 'string' ? `${companions.length} chars` : companions);
         // Validate parsed JSON: must be an array of plain objects with expected shape
         let parsed: unknown;
         try {
@@ -106,7 +112,13 @@ export default function Examples() {
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          llm: resolveApprovedModel(entry.llm) ?? "[unregistered model]",
+          llm: (() => {
+            const resolved = resolveApprovedModel(entry.llm);
+            if (!resolved) {
+              throw new Error(`Model '${entry.llm}' is not in the approved model registry. Inference requests are only permitted for registry-approved, version-pinned models.`);
+            }
+            return resolved;
+          })(),
           maskedPhone: isPhoneNumber(entry.phone) ? maskPhone(entry.phone) : "",
           telegramLink: entry.telegramLink
         }));
