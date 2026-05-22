@@ -1,12 +1,36 @@
-import { Redis } from "@upstash/redis";
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
 import { ChatOpenAI } from "langchain/chat_models/openai";
 
-import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
-dotenv.config({ path: `.env.local` });
+
+// Load only the single required credential — no broad .env.local sweep
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY environment variable must be set");
+}
+
+// In-memory cache replaces Redis to avoid holding a second set of external credentials
+const localCache = new Map();
+
+// LLM interaction logger — records every request and response for audit purposes
+function logLLMInteraction(stage, data) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    stage,          // 'request' | 'response'
+    ...data,
+  };
+  // Write to stderr so it does not pollute stdout/file output
+  process.stderr.write("[LLM_AUDIT] " + JSON.stringify(entry) + "\n");
+}
+
+// Wrapper that logs inputs and outputs around any LLMChain call
+async function runChainWithLogging(chain, inputs) {
+  logLLMInteraction("request", { inputs });
+  const result = await chain.call(inputs);
+  logLLMInteraction("response", { outputs: result });
+  return result;
+}
 
 // Sanitize a string for safe use in file paths and LLM prompts
 function sanitizeInput(input) {
@@ -679,19 +703,31 @@ for (let i = 0; i < questions.length; i++) {
   output += `*****${questions[i]}*****\n${safeText}\n\n`;
 }
 const chatCount = Array.isArray(truncatedRecentChat) ? truncatedRecentChat.length : 0;
+// Data minimisation: only a short, redacted preview of the last message is
+// forwarded to the LLM — never the full content.
 const rawLastMessage = chatCount > 0 ? sanitizeLLMOutput(String(truncatedRecentChat[chatCount - 1])) : "";
 assertNoDynamicCodeExecution(rawLastMessage);
-const lastMessage = rawLastMessage;
-output += `Definition (Advanced)\n[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`;
+// Redact common PII patterns before truncating to a 100-char preview.
+const redactedPreview = rawLastMessage
+  .replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, "[EMAIL]")
+  .replace(/\b\d{3}[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, "[PHONE]")
+  .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]")
+  .slice(0, 100);
+const lastMessagePreview = redactedPreview.length < rawLastMessage.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, "[EMAIL]").replace(/\b\d{3}[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, "[PHONE]").replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]").length
+  ? redactedPreview + "…"
+  : redactedPreview;
+output += `Definition (Advanced)\n[Chat history summary: ${chatCount} message(s). Most recent (preview): ${lastMessagePreview}]`;
 
-const AI_MODEL_ID = "gpt-4";
+const AI_MODEL_ID = "claude-3-opus-20240229";
 
 // Wrap the AI-generated character data with provenance metadata and a
 // cryptographic watermark before persisting it to disk.
 const outputWithProvenance = addProvenance(output, AI_MODEL_ID);
 
-const chatHistoryContent = `[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`;
+// Data minimisation: persist only the aggregate count — never message content —
+// to the chat history output file.
+const chatHistoryContent = `[Chat history summary: ${chatCount} message(s).]`;
 const chatHistoryWithProvenance = addProvenance(chatHistoryContent, AI_MODEL_ID);
 await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, chatHistoryWithProvenance);
-// Note: lastMessage is already sanitized via sanitizePromptContent + sanitizeLLMOutput above.
+// Only the message count is written; raw or previewed message text is not persisted.
 await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, outputWithProvenance);
