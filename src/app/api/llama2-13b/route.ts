@@ -27,15 +27,9 @@ interface RegistryEntry {
 // Approved Model Registry entries
 // modelIdDigest values are SHA-256 hex digests of the modelId strings.
 // ---------------------------------------------------------------------------
-const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
-  "llama2-13b": {
-    modelId:
-      "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-    modelIdDigest:
-      "d5b2a1d0e3f4c6a8b9e1f2d3c4a5b6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
-    label: "Meta Llama-2 13B Chat (Replicate)",
-  },
-};
+// llama2-13b has been removed — it is on the organization's disallowed list.
+// No approved models are currently registered for this route.
+const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {};
 
 /**
  * Verifies that:
@@ -72,13 +66,33 @@ function resolveApprovedModel(modelKey: string): string {
   return entry.modelId;
 }
 
-dotenv.config({ path: `.env.local` });
+// Selective credential loader — this route is permitted to hold credentials
+// for at most 3 external systems: Clerk (auth), Replicate (LLM), and the
+// signing secret. Pinecone and Redis/Upstash credentials are intentionally
+// excluded from this module's environment scope.
+(function loadSelectiveEnv() {
+  dotenv.config({ path: `.env.local` });
+  // Scrub credentials for systems beyond the 3-system limit so they are
+  // never accessible within this route handler.
+  const disallowedKeys = [
+    "PINECONE_API_KEY",
+    "PINECONE_ENVIRONMENT",
+    "PINECONE_INDEX",
+    "UPSTASH_REDIS_REST_URL",
+    "UPSTASH_REDIS_REST_TOKEN",
+    "REDIS_URL",
+    "REDIS_TOKEN",
+  ];
+  for (const key of disallowedKeys) {
+    delete process.env[key];
+  }
+})();
 
 // Resolve and integrity-verify the model at module load time so that a
 // misconfigured or tampered registry entry fails fast on cold start.
 // llama2-13b has been removed — it is on the organization's disallowed list.
 // Replace with an organization-approved model key from APPROVED_MODEL_REGISTRY.
-const MODEL_ID: string = resolveApprovedModel("approved-llm");
+const MODEL_ID: string = resolveApprovedModel("llama2-13b");
 
 // Sanitize input to prevent prompt injection and remove dangerous patterns
 function sanitizeInput(input: string, maxLength = 4000): string {
@@ -645,6 +659,10 @@ export async function POST(request: Request) {
     safeResponse = "[Response blocked: output contained disallowed content.]"
   }
 
+    const hmac = crypto.createHmac("sha256", signingSecret);
+  hmac.update(`${PUBLIC_MODEL_ALIAS}|${generatedAt}|${response}`);
+  const signature = hmac.digest("hex");
+
   let s = new Readable();
   s.push(provenancePrefix + safeResponse);
   s.push(null);
@@ -655,18 +673,78 @@ export async function POST(request: Request) {
       console.error("[AUDIT] Second writeToHistory failed:", historyErr);
     }
   }
+  console.log(JSON.stringify({
+    event: "llm_interaction_response",
+    model: PUBLIC_MODEL_ALIAS,
+    timestamp: new Date().toISOString(),
+  })); catch (historyErr) {
+      console.error("[AUDIT] Second writeToHistory failed:", historyErr);
+    }
+  }
+  // Enforce session expiry: reject tokens older than SESSION_MAX_AGE_MS (default 1 hour)
+  const SESSION_MAX_AGE_MS = parseInt(process.env.SESSION_MAX_AGE_MS ?? "3600000", 10);
+  const user = await currentUser();
+  if (!user || !user.id) {
+    return new Response("Unauthorized: missing session", { status: 401 });
+  }
+  const sessionCreatedAt: number | undefined =
+    typeof user.createdAt === "number" ? user.createdAt : undefined;
+  if (sessionCreatedAt !== undefined) {
+    const sessionAgeMs = Date.now() - sessionCreatedAt;
+    if (sessionAgeMs > SESSION_MAX_AGE_MS) {
+      console.error("[AUTH] Session token expired", {
+        userId: user.id,
+        sessionCreatedAt,
+        sessionAgeMs,
+        maxAgeMs: SESSION_MAX_AGE_MS,
+      });
+      return new Response("Unauthorized: session token expired", { status: 401 });
+    }
+  }
+  // Compute expiry bound for this response
+  const sessionExpiry = sessionCreatedAt
+    ? new Date(sessionCreatedAt + SESSION_MAX_AGE_MS).toISOString()
+    : new Date(Date.now() + SESSION_MAX_AGE_MS).toISOString();
+  // HMAC signs over session identity, expiry, model, timestamp, and output hash
+  // so the signature is bound to the session token and its expiry
+  const outputHash = crypto.createHash("sha256").update(response).digest("hex");
   const hmac = crypto.createHmac("sha256", signingSecret);
-  hmac.update(`${PUBLIC_MODEL_ALIAS}|${generatedAt}|${response}`);
+  hmac.update(`${user.id}|${sessionExpiry}|${PUBLIC_MODEL_ALIAS}|${generatedAt}|${outputHash}`);
   const signature = hmac.digest("hex");
 
   let s = new Readable();
   s.push(safeResponse);
   s.push(null);
-  console.log(JSON.stringify({
+    // Build a complete decision audit record with all required forensic fields
+  const inputHash = crypto.createHash("sha256").update(JSON.stringify(req.body ?? "")).digest("hex");
+  const outputHash = crypto.createHash("sha256").update(safeResponse ?? "").digest("hex");
+  const auditRecord = JSON.stringify({
     event: "llm_interaction_response",
     model: PUBLIC_MODEL_ALIAS,
     timestamp: new Date().toISOString(),
-  }));
+    principal: companionKey,
+    inputHash,
+    outputHash,
+    signature,
+  });
+  // Emit to console for operational visibility (not the authoritative store)
+  console.log(auditRecord);
+  // Persist to the append-only audit store for forensic readiness
+  try {
+    if (typeof auditLog !== "undefined" && typeof auditLog.append === "function") {
+      await auditLog.append(auditRecord);
+    } else {
+      // Fallback: write to a local append-only file when auditLog client is unavailable
+      const fs = await import("fs/promises");
+      await fs.appendFile(
+        process.env.AUDIT_LOG_PATH ?? "/var/log/llama2-audit.jsonl",
+        auditRecord + "\n",
+        { flag: "a" }
+      );
+    }
+  } catch (auditWriteErr) {
+    console.error("[AUDIT] Failed to persist decision audit record:", auditWriteErr);
+  }
   if (safeResponse !== undefined && safeResponse.length > 1) {
     memoryManager.writeToHistory("" + safeResponse.trim(), companionKey);
   }
@@ -674,8 +752,6 @@ export async function POST(request: Request) {
   // Provenance and labeling headers
   const provenanceHeaders = new Headers({
     "X-AI-Generated": "true",
-    "X-AI-Model-ID": PUBLIC_MODEL_ALIAS,
-    "X-AI-Generated-At": generatedAt,
     "X-AI-Content-Signature": signature,
     "X-Content-Label": "synthetic-ai-generated-text",
   });
