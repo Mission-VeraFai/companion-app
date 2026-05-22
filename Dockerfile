@@ -18,11 +18,12 @@ FROM base as build
 
 # Install packages needed to build node modules
 RUN apt-get update -qq && \
-    apt-get install -y python-is-python3 pkg-config build-essential 
+    apt-get install --no-install-recommends python-is-python3 pkg-config build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install node modules
 COPY --link package-lock.json package.json ./
-RUN npm ci --include=dev
+RUN npm install --frozen-lockfile
 
 # Copy application code
 COPY --link . .
@@ -31,7 +32,7 @@ COPY --link . .
 RUN npm run build
 
 # Remove development dependencies
-RUN npm prune --omit=dev
+RUN npm install --production --frozen-lockfile
 
 
 # Final stage for app image
