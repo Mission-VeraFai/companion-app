@@ -317,7 +317,7 @@ npm run export-to-character [COMPANION_NAME] [MODEL_NAME] [USER_ID]
 `
 
 - `COMPANION_NAME`: name of your companion. i.e Alice
-- `MODEL_NAME`: `chatgpt` or `vicuna13b`
+- `MODEL_NAME`: refer to the organization's approved LLM registry for valid model names
 - `USER_ID`: you can find this on Clerk, under "Users" -> click on your user -> copy "User ID"
 
 Once you run this script, you will see two files created under the root directory:
@@ -328,5 +328,5 @@ Once you run this script, you will see two files created under the root director
 ## Refs
 
 - https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
-- https://js.langchain.com/docs/modules/models/llms/integrations#replicate
+- Model integrations must reference only sources listed in the internal approved model registry with explicit version pinning and integrity verification (digest hash). External or unregistered model sources (e.g. OpenAI direct, Replicate/Vicuna without pinning) are not permitted without registry approval.
 - https://js.langchain.com/docs/modules/chains/index_related_chains/retrieval_qa
