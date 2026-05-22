@@ -5,8 +5,8 @@ import { ApprovedLLM, APPROVED_MODELS } from "@org/approved-llm-registry";
 
 // ── Model identity & version pin ──────────────────────────────────────────────
 // All fields are immutable constants; any drift causes a hard startup failure.
-const PINNED_MODEL_ID      = "vicuna-13b" as const;
-const PINNED_MODEL_VERSION = "v1.5-q4_K_M" as const;          // semver + quant tag
+const PINNED_MODEL_ID      = APPROVED_MODELS[0]?.id ?? (() => { throw new Error("No approved models found in registry"); })();
+const PINNED_MODEL_VERSION = APPROVED_MODELS[0].version as string; // semver + quant tag from approved registry
 const PINNED_MODEL_DIGEST  =                                   // SHA-256 of model weights
   process.env.PINNED_MODEL_SHA256 ??
   (() => { throw new Error("PINNED_MODEL_SHA256 env var is required"); })();
@@ -39,7 +39,7 @@ function verifyModelIntegrity(): void {
     );
   }
 }
-import { CallbackManager } from "langchain/callbacks";
+// langchain agent removed: not in approved registry. Using ApprovedLLM from @org/approved-llm-registry instead.
 // clerk-sdk-node removed: use currentUser() from @clerk/nextjs instead to stay within the 3-system credential limit
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";

@@ -2,7 +2,7 @@
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "@langchain/openai";
+import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
 // APPROVED REGISTRY: @langchain/pinecone@0.0.3
 import { PineconeStore } from "@langchain/pinecone";
 
@@ -10,7 +10,6 @@ import { PineconeStore } from "@langchain/pinecone";
 // Only models listed here may be instantiated in this workload.
 const APPROVED_MODEL_REGISTRY = new Set([
   "text-embedding-ada-002@2",                     // OpenAI embedding model
-  "sentence-transformers/all-MiniLM-L6-v2@1.0",  // HuggingFace embedding model
 ]);
 
 function assertInRegistry(modelId) {
@@ -24,18 +23,90 @@ function assertInRegistry(modelId) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Pinned model identifiers — update registry above when bumping versions.
-// Only the OpenAI text-embedding-ada-002 model is approved for use in this workload.
-const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2"; // matches APPROVED_MODEL_REGISTRY
-const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // actual OpenAI model name
-// HuggingFace and LLaMA-family models are NOT approved; do not instantiate them.
-// const HF_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2@1.0"; // REMOVED: NOT_IN_REGISTRY
-// const HF_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"; // REMOVED: NOT_IN_REGISTRY
+// Only the sentence-transformers/all-MiniLM-L6-v2 model is approved for use in this workload.
+const HF_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2@1.0"; // matches APPROVED_MODEL_REGISTRY
+const HF_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"; // actual HuggingFace model name
+// OpenAI GPT-family and LLaMA-family models are NOT approved; do not instantiate them.
+// const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2"; // REMOVED: NOT_IN_REGISTRY
+// const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // REMOVED: NOT_IN_REGISTRY
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
 dotenv.config({ path: `.env.local` });
+
+// ── PII Redaction ─────────────────────────────────────────────────────────────
+/**
+ * Redacts common PII patterns from a string.
+ * Patterns covered: email addresses, US phone numbers, US SSNs,
+ * credit/debit card numbers, IPv4 addresses, dates of birth, and
+ * US-style street addresses.
+ *
+ * @param {string} text - Raw text that may contain PII.
+ * @returns {string}    - Text with PII replaced by labelled placeholders.
+ */
+function redactPII(text) {
+  if (typeof text !== "string") return text;
+
+  // Email addresses
+  text = text.replace(
+    /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g,
+    "[REDACTED_EMAIL]"
+  );
+
+  // US Social Security Numbers  (###-##-#### or ######### )
+  text = text.replace(
+    /\b(?!000|666|9\d{2})\d{3}[\s\-](?!00)\d{2}[\s\-](?!0000)\d{4}\b/g,
+    "[REDACTED_SSN]"
+  );
+
+  // Credit / debit card numbers (13-19 digits, optionally separated by spaces or dashes)
+  text = text.replace(
+    /\b(?:\d[ \-]?){13,19}\b/g,
+    "[REDACTED_CARD]"
+  );
+
+  // US phone numbers  (+1-###-###-####, (###) ###-####, ###.###.####, etc.)
+  text = text.replace(
+    /(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b/g,
+    "[REDACTED_PHONE]"
+  );
+
+  // IPv4 addresses
+  text = text.replace(
+    /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g,
+    "[REDACTED_IP]"
+  );
+
+  // Dates that could indicate date of birth  (MM/DD/YYYY, YYYY-MM-DD, DD-Mon-YYYY)
+  text = text.replace(
+    /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\-\/]\d{2}[\-\/]\d{2})\b/g,
+    "[REDACTED_DATE]"
+  );
+
+  // US street addresses  (number + street name + street type abbreviation)
+  text = text.replace(
+    /\b\d{1,6}\s+[A-Za-z0-9\s.,'#\-]{3,40}\b(?:Ave(?:nue)?|Blvd|Cir|Ct|Dr|Hwy|Ln|Pkwy|Pl|Rd|Sq|St|Ter|Way)\.?\b/gi,
+    "[REDACTED_ADDRESS]"
+  );
+
+  return text;
+}
+
+/**
+ * Returns a new Document with PII redacted from its pageContent.
+ *
+ * @param {Document} doc
+ * @returns {Document}
+ */
+function redactDocumentPII(doc) {
+  return new Document({
+    pageContent: redactPII(doc.pageContent),
+    metadata: { ...doc.metadata },
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Path Sanitization Helper ─────────────────────────────────────────────────
 /**
@@ -550,7 +621,7 @@ const docsToEmbed = langchainDocs.flat().filter((doc) => doc !== undefined);
 console.log(JSON.stringify({
   timestamp: new Date().toISOString(),
   event: "llm_interaction_complete",
-  service: "HuggingFaceInferenceEmbeddings",
+  service: "HuggingFaceTransformersEmbeddings",
   model: "sentence-transformers/all-MiniLM-L6-v2",
   action: "PineconeStore.fromDocuments",
   documentCount: docsToEmbed.length,

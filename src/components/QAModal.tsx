@@ -4,8 +4,50 @@ import {Fragment, useEffect, useRef, useState, useMemo} from "react";
 import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 // useCompletion replaced with approved internal fetch-based hook
-function useCompletion({ api, body, onFinish, onError }: { api: string; body?: Record<string, unknown>; onFinish?: (prompt: string, completion: string) => void; onError?: (err: Error) => void; }) {
+// Approved LLM models registry — only models listed here may be invoked.
+const APPROVED_MODELS: ReadonlySet<string> = new Set([
+  "org-llm-v1",
+  "org-llm-v2",
+]);
+
+// Provenance metadata attached to every AI-generated completion
+interface CompletionProvenance {
+  modelId: string;
+  timestamp: string;
+  label: string;
+  watermark: string; // HMAC-SHA256 hex digest (keyed with session + timestamp)
+}
+
+async function generateProvenance(
+  content: string,
+  modelId: string
+): Promise<CompletionProvenance> {
+  const timestamp = new Date().toISOString();
+  const label = "AI_GENERATED_SYNTHETIC_CONTENT";
+  // Derive a per-completion HMAC watermark using SubtleCrypto
+  const encoder = new TextEncoder();
+  // Key material: label + timestamp (non-secret; purpose is integrity/traceability)
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(label + timestamp),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sigBuffer = await crypto.subtle.sign(
+    "HMAC",
+    keyMaterial,
+    encoder.encode(content)
+  );
+  const watermark = Array.from(new Uint8Array(sigBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return { modelId, timestamp, label, watermark };
+}
+
+function useCompletion({ api, body, onFinish, onError }: { api: string; body?: Record<string, unknown>; onFinish?: (prompt: string, completion: string, provenance?: CompletionProvenance) => void; onError?: (err: Error) => void; }) {
   const [completion, setCompletion] = useState("");
+  const [provenance, setProvenance] = useState<CompletionProvenance | undefined>(undefined);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | undefined>(undefined);
 
@@ -14,10 +56,19 @@ function useCompletion({ api, body, onFinish, onError }: { api: string; body?: R
     setError(undefined);
     setCompletion("");
     try {
+      // Enforce approved model policy before making any network request.
+      const mergedBody = { ...body, ...(options?.body ?? {}) };
+      const requestedModel = typeof mergedBody["model"] === "string" ? mergedBody["model"] : undefined;
+      if (!requestedModel || !APPROVED_MODELS.has(requestedModel)) {
+        throw new Error(
+          `LLM model "${requestedModel ?? "(none specified)"}" is not in the organization's approved model registry. ` +
+          `Approved models: ${[...APPROVED_MODELS].join(", ")}.`
+        );
+      }
       const res = await fetch(api, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, ...body, ...(options?.body ?? {}) }),
+        body: JSON.stringify({ prompt, ...mergedBody }),
       });
       if (!res.ok) throw new Error(`Request failed: ${res.status}`);
       const reader = res.body?.getReader();
@@ -32,7 +83,16 @@ function useCompletion({ api, body, onFinish, onError }: { api: string; body?: R
           setCompletion(full);
         }
       }
-      onFinish?.(prompt, full);
+      // Audit log: record the completion received from the LLM
+      console.log(JSON.stringify({ audit: true, event: "llm_completion", timestamp: new Date().toISOString(), api, prompt, completion: full }));
+      // Attach provenance metadata, label, and watermark before surfacing the completion
+      const modelId =
+        (body as Record<string, unknown>)?.model as string ||
+        (options?.body?.model as string) ||
+        "unknown-model";
+      const prov = await generateProvenance(full, modelId);
+      setProvenance(prov);
+      onFinish?.(prompt, full, prov);
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       setError(err);
@@ -42,7 +102,7 @@ function useCompletion({ api, body, onFinish, onError }: { api: string; body?: R
     }
   };
 
-  return { completion, isLoading, error, complete };
+  return { completion, provenance, isLoading, error, complete };
 }
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 

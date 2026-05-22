@@ -9,7 +9,7 @@
 
 This is a tutorial stack to create and host AI companions that you can chat with on a browser or text via SMS. It allows you to determine the personality and backstory of your companion, and uses a vector database with similarity search to retrieve and prompt so the conversations have more depth. It also provides some conversational memory by keeping the conversation in a queue and including it in the prompt. 
 
-It currently contains companions powered by organization-approved LLM providers only. All model integrations must reference sources listed in the internal approved model registry.
+It currently contains companions powered by organization-approved LLM providers only. All model integrations must reference sources listed in the internal approved model registry. Unapproved models (including any not present in the registry) must not be referenced or used.
 
 > ⚠️ **Synthetic Content Notice:** All text, images, and other outputs produced by companions in this application are AI-generated. Every response is labeled with a synthetic-origin marker and includes provenance metadata (model identifier, provider, and generation timestamp) so users and downstream systems can always identify AI-generated content. Exported companion data also embeds these provenance fields. See [AI Content Provenance & Labeling](#ai-content-provenance--labeling) for details.
 
@@ -65,9 +65,9 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 
 - Auth: [Clerk](https://clerk.com/)
 - App logic: [Next.js](https://nextjs.org/)
-- VectorDB: `pinecone-client@[PINNED_VERSION]` (registry-approved; verify digest hash before use) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
-- LLM orchestration: `langchain@[PINNED_VERSION]` (registry-approved; verify digest hash before use)
-- Text model: `[REGISTRY_APPROVED_MODEL_NAME]@[VERSION_TAG]` (digest: `sha256:[DIGEST_HASH]`) — obtain approved model identifier, pinned version, and digest hash from your organization's AI governance team
+- VectorDB: `pinecone-client@<EXACT_VERSION>` — **You must replace `<EXACT_VERSION>` with the immutable version string (e.g. `2.2.4`) and verify the full `sha256:<64-char-hex-digest>` from your organization's approved package registry before use.** Alternatively: [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector) (no external registry pin required).
+- LLM orchestration: `langchain@<EXACT_VERSION>` — **You must replace `<EXACT_VERSION>` with the immutable version string (e.g. `0.1.20`) and verify the full `sha256:<64-char-hex-digest>` from your organization's approved package registry before use.** `langchain` must appear in your organization's approved model/component registry; do not deploy until registry approval is confirmed.
+- Text model: `<REGISTRY_APPROVED_MODEL_NAME>@<EXACT_VERSION>` (digest: `sha256:<64-char-hex-digest>`) — **All three values must be obtained from your organization's AI governance team and filled in before deployment. Placeholder values are not acceptable.** Models such as GPT, Claude, and vicuna-13b are currently NOT_IN_REGISTRY and must not be used until formally registered and approved by your AI governance team.
 - **Synthetic-origin labeling:** Every AI-generated response payload includes a `x-ai-generated: true` header and a `provenance` JSON field containing `{ model, provider, generatedAt }` so clients can surface a visible label to end users.
 - **Content watermarking:** Text outputs are watermarked using an organization-approved watermarking library before delivery; image outputs embed C2PA-compatible provenance metadata.
 - **Audit log:** Provenance records are written to the conversation history store (Upstash) alongside each message for traceability.

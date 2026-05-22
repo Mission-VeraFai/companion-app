@@ -268,7 +268,7 @@ export function responseToChatBlocks(completion: any) {
     writeAuditRecord('responseToChatBlocks', completion);
 
     // First we try to parse completion as JSON in case we're dealing with an object.
-    writeAuditRecord('responseToChatBlocks:input_received', { payload: completion, payloadType: typeof completion });
+    writeAuditRecord('responseToChatBlocks:input_received', completion);
     if (typeof completion == "string") {
         try {
             completion = JSON.parse(completion)
@@ -293,6 +293,7 @@ export function responseToChatBlocks(completion: any) {
             if (safeBlock !== null) {
                 blocks.push(<ChatBlock {...safeBlock} />);
             } else {
+                writeAuditRecord('responseToChatBlocks:block_skipped', block);
                 console.warn('Skipping invalid or dangerous block from LLM output', block);
             }
         }
@@ -301,6 +302,7 @@ export function responseToChatBlocks(completion: any) {
         if (safeCompletion !== null) {
             blocks.push(<ChatBlock {...safeCompletion} />);
         } else {
+            writeAuditRecord('responseToChatBlocks:completion_skipped', completion);
             console.warn('Skipping invalid or dangerous completion object from LLM output', completion);
         }
     }

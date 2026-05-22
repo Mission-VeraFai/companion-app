@@ -9,6 +9,72 @@ import Image from "next/image";
  * Computes a SHA-256 hex digest of the given string.
  * Used to hash prompt inputs and output references for the audit trail.
  */
+/**
+ * Sanitizes and validates a user-supplied prompt before sending to the AI API.
+ * Returns the sanitized string, or null if the prompt is invalid/malicious.
+ */
+function sanitizePrompt(prompt: unknown): string | null {
+  // Must be a non-empty string
+  if (typeof prompt !== "string" || prompt.trim() === "") {
+    return null;
+  }
+
+  // Enforce maximum length to prevent prompt flooding
+  const MAX_PROMPT_LENGTH = 2000;
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    return null;
+  }
+
+  // Remove null bytes and ASCII control characters (except tab/newline/CR)
+  // eslint-disable-next-line no-control-regex
+  let sanitized = prompt.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Decode common encodings to detect hidden content
+  let decoded = sanitized;
+  try {
+    // Attempt URL-decode to surface encoded injection attempts
+    decoded = decodeURIComponent(sanitized.replace(/\+/g, " "));
+  } catch {
+    // If decoding fails, use the original sanitized string
+    decoded = sanitized;
+  }
+
+  // Patterns indicative of prompt injection, role overrides, or hidden instructions
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
+    /forget\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
+    /you\s+are\s+now\s+(a|an|the)?\s*\w+/i,
+    /act\s+as\s+(a|an|the)?\s*\w+/i,
+    /pretend\s+(you\s+are|to\s+be)/i,
+    /system\s*:\s*you/i,
+    /\[\s*system\s*\]/i,
+    /<\s*system\s*>/i,
+    /###\s*(instruction|system|prompt)/i,
+    // Detect base64-encoded blocks (potential hidden payloads)
+    /[A-Za-z0-9+/]{60,}={0,2}/,
+    // Detect excessive repetition of special characters (obfuscation)
+    /([^\w\s])\1{10,}/,
+    // Detect unicode direction-override characters used to hide text
+    /[\u202A-\u202E\u2066-\u2069\u200F\u200E]/,
+    // Detect zero-width characters used for steganographic injection
+    /[\u200B-\u200D\uFEFF]/,
+  ];
+
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(decoded)) {
+      return null;
+    }
+  }
+
+  // Trim and return the sanitized prompt
+  const trimmed = sanitized.trim();
+  if (trimmed === "") {
+    return null;
+  }
+  return trimmed;
+}
+
 async function sha256Hex(text: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(text);
@@ -28,23 +94,36 @@ interface AuditRecord {
   httpStatus: number | null;  // HTTP status returned by the AI API
   success: boolean;
   errorMessage?: string;
+  retentionDays: number;      // Retention policy: number of days the record must be kept
 }
 
 /**
  * Persists an audit record to the server-side audit log endpoint.
- * Fire-and-forget: errors are caught and logged to console only,
- * so audit failures never silently swallow the original error.
+ * Returns a Promise that rejects on network failure or a non-2xx response,
+ * so callers can detect and surface audit failures rather than silently swallowing them.
+ * Each record includes retentionDays to communicate the required retention policy
+ * to the server-side log store.
  */
-function persistAuditRecord(record: AuditRecord): void {
-  fetch("/api/audit-log", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(record),
-    // keepalive ensures the request completes even if the page unloads
-    keepalive: true,
-  }).catch((err) => {
-    console.error("[audit] Failed to persist audit record:", err);
-  });
+async function persistAuditRecord(record: AuditRecord): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch("/api/audit-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record),
+      // keepalive ensures the request completes even if the page unloads
+      keepalive: true,
+    });
+  } catch (networkErr) {
+    const msg = `[audit] Network error persisting audit record: ${networkErr}`;
+    console.error(msg);
+    throw new Error(msg);
+  }
+  if (!response.ok) {
+    const msg = `[audit] Audit log endpoint returned HTTP ${response.status}`;
+    console.error(msg);
+    throw new Error(msg);
+  }
 }
 
 export default function TextToImgModal({
@@ -104,7 +183,7 @@ export default function TextToImgModal({
   const [loading, setLoading] = useState(false);
 
   // Stable model identifier – update this constant whenever the backend model changes.
-  const AI_MODEL_ID = "openai/dall-e-3";
+  const AI_MODEL_ID = "openai/gpt-image-1";
 
   /**
    * Embeds a visible watermark onto an image (data URI or HTTPS URL)
