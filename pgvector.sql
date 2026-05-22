@@ -17,9 +17,8 @@ create function match_documents (
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}'
 ) returns table (
-  id bigint,
   content text,
-  metadata jsonb,
+  source text,
   similarity float
 )
 language plpgsql
@@ -28,9 +27,10 @@ as $$
 begin
   return query
   select
-    id,
     content,
-    metadata,
+    -- Expose only the 'source' key from metadata; add other safe keys as needed.
+    -- Raw internal id and full metadata jsonb are intentionally excluded.
+    (metadata->>'source')::text as source,
     1 - (documents.embedding <=> query_embedding) as similarity
   from documents
   where metadata @> filter
