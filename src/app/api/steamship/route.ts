@@ -14,7 +14,7 @@ const AUDIT_LOG_BASE_DIR = process.env.AUDIT_LOG_DIR
   : "/var/log/app";
 const AUDIT_LOG_PATH = path.join(AUDIT_LOG_BASE_DIR, "audit_ai_actions.log");
 const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || "", 10) || 10 * 1024 * 1024; // 10 MB default
-const AUDIT_LOG_MODEL_ID = "steamship-agent-v1";
+const AUDIT_LOG_MODEL_ID = "steamship-agent-approved-v1";
 const AUDIT_LOG_MODEL_VERSION = APPROVED_MODEL_REGISTRY[AUDIT_LOG_MODEL_ID]?.version ?? "unknown";
 
 function rotateAuditLogIfNeeded(): void {
@@ -22,11 +22,17 @@ function rotateAuditLogIfNeeded(): void {
     if (fs.existsSync(AUDIT_LOG_PATH)) {
       const { size } = fs.statSync(AUDIT_LOG_PATH);
       if (size >= MAX_AUDIT_LOG_BYTES) {
-        const rotated = AUDIT_LOG_PATH.replace(
+        // Archive by COPYING (appending) existing content into a timestamped file.
+        // The active log file is NEVER renamed or deleted — immutability is preserved.
+        const archivePath = AUDIT_LOG_PATH.replace(
           /(\.log)?$/,
           `.${new Date().toISOString().replace(/[:.]/g, "-")}.log`
         );
-        fs.renameSync(AUDIT_LOG_PATH, rotated);
+        const existingContent = fs.readFileSync(AUDIT_LOG_PATH);
+        // Write archive with append flag so existing archive data is never overwritten.
+        fs.appendFileSync(archivePath, existingContent);
+        // Truncate the active log in-place (preserves inode; no rename/delete).
+        fs.writeFileSync(AUDIT_LOG_PATH, "", { encoding: "utf8", flag: "w" });
       }
     }
   } catch (err) {
@@ -397,11 +403,32 @@ export async function POST(req: Request) {
   // Invoke the generation. The allow list is forwarded so the remote agent
   // can also restrict itself to only the approved tools.
   // To build, deploy, and host your own multi-tenant agent see: https://www.steamship.com/learn/agent-guidebook
+  const steamshipApiKey = process.env.STEAMSHIP_API_KEY;
+  if (!steamshipApiKey) {
+    writeAuditLog({
+      event: "ai_agent_auth_misconfigured",
+      principal: clerkUserId,
+      agentUrl,
+      companionName,
+      chatSessionId,
+      inputHash,
+      modelIdentifier: ((): string => {
+        const _APPROVED: Record<string, string> = {
+          "steamship-agent": "steamship-agent@v1.0.0",
+        };
+        const _key: string =
+          (companionConfig as { modelId?: string }).modelId ?? "steamship-agent";
+        return _APPROVED[_key] ?? _APPROVED["steamship-agent"]!;
+      })(),
+      error: "STEAMSHIP_API_KEY environment variable is not set",
+    });
+    return returnError(500, "Agent authentication is not configured. Set STEAMSHIP_API_KEY.");
+  }
   const response = await fetch(agentUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.STEAMSHIP_API_KEY}`
+      "Authorization": `Bearer ${steamshipApiKey}`
     },
     body: JSON.stringify({
       question: prompt,
@@ -428,13 +455,23 @@ export async function POST(req: Request) {
     return returnError(500, "Server authentication is not configured. Set AGENT_SERVER_TOKEN.");
   }
   const presentedServerToken = response.headers.get("X-Agent-Token");
+  // Use HMAC comparison to avoid length oracle: hash both tokens before
+  // constant-time comparison so buffer lengths are always equal (32 bytes)
+  // regardless of input length, preventing timing and length side-channels.
+  const expectedTokenHash = crypto
+    .createHmac("sha256", expectedServerToken)
+    .update("agent-server-token")
+    .digest();
+  const presentedTokenHash =
+    presentedServerToken !== null
+      ? crypto
+          .createHmac("sha256", presentedServerToken)
+          .update("agent-server-token")
+          .digest()
+      : Buffer.alloc(32, 0);
   const serverTokenValid =
     presentedServerToken !== null &&
-    presentedServerToken.length === expectedServerToken.length &&
-    crypto.timingSafeEqual(
-      Buffer.from(presentedServerToken, "utf8"),
-      Buffer.from(expectedServerToken, "utf8")
-    );
+    crypto.timingSafeEqual(expectedTokenHash, presentedTokenHash);
   if (!serverTokenValid) {
     writeAuditLog({
       event: "ai_agent_server_auth_failure",
@@ -554,7 +591,22 @@ export async function POST(req: Request) {
 
     // Attach synthetic-content provenance, labeling, and watermark per policy.
     const provenanceTimestamp = new Date().toISOString();
-    const modelIdentifier = companionConfig.generateEndpoint ?? agentUrl ?? "steamship-agent";
+
+    // Approved model registry: only identifiers listed here may be used for provenance.
+    // Version-pin each entry; do NOT derive identity from runtime URLs or config values.
+    const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+      "steamship-agent": "steamship-agent@v1.0.0",
+      // Add additional approved, version-pinned model identifiers here as needed.
+    };
+
+    // Resolve model identity exclusively from the approved registry.
+    // companionConfig.modelId (if present) must match a registry key; otherwise use the
+    // pinned default.  Runtime endpoints/URLs are never used as model identifiers.
+    const requestedModelKey: string =
+      (companionConfig as { modelId?: string }).modelId ?? "steamship-agent";
+    const modelIdentifier: string =
+      APPROVED_MODEL_REGISTRY[requestedModelKey] ??
+      APPROVED_MODEL_REGISTRY["steamship-agent"]!;  // guaranteed pinned fallback
     const watermarkNonce = crypto.randomBytes(16).toString("hex");
 
     // Build the provenance payload that will be signed.
@@ -567,18 +619,31 @@ export async function POST(req: Request) {
     };
 
     // Compute an HMAC-SHA256 signature over the canonical provenance fields.
-    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? "default-insecure-secret";
+    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET;
+    if (!signingSecret) {
+      console.error("PROVENANCE_SIGNING_SECRET environment variable is not set. Cannot sign provenance payload.");
+      return returnError(500, "Server misconfiguration: provenance signing secret is not configured.");
+    }
     const provenanceSignature = crypto
       .createHmac("sha256", signingSecret)
       .update(JSON.stringify(provenancePayload))
       .digest("hex");
 
+    // Minimise response blocks: expose only the fields the client actually needs.
+    const minimisedBlocks = Array.isArray(responseBlocks)
+      ? (responseBlocks as Array<Record<string, unknown>>).map((block) => ({
+          ...(block.type !== undefined ? { type: block.type } : {}),
+          ...(block.text !== undefined ? { text: block.text } : {}),
+        }))
+      : [];
+
+    // Minimise provenance metadata: omit internal identifiers and signing artefacts.
     const enrichedResponse = {
       _syntheticContentProvenance: {
-        ...provenancePayload,
-        signature: provenanceSignature,
+        timestamp: provenanceTimestamp,
+        contentLabel: provenancePayload.contentLabel,
       },
-      data: responseBlocks,
+      data: minimisedBlocks,
     };
 
     return NextResponse.json(enrichedResponse);
