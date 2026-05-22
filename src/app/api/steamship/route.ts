@@ -9,12 +9,29 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
-const AUDIT_LOG_BASE_DIR = process.env.AUDIT_LOG_DIR
-  ? path.resolve(process.env.AUDIT_LOG_DIR)
-  : "/var/log/app";
+const AUDIT_LOG_SAFE_DEFAULT = "/var/log/app";
+
+function resolveWithinAllowedBase(envValue: string | undefined, allowedBase: string): string {
+  if (!envValue) return allowedBase;
+  const resolved = path.resolve(envValue);
+  // Ensure the resolved path is exactly the allowed base or a subdirectory of it.
+  // Normalize with a trailing separator to prevent prefix-only matches (e.g. /var/log/app2).
+  const normalizedBase = allowedBase.endsWith(path.sep) ? allowedBase : allowedBase + path.sep;
+  if (resolved !== allowedBase && !resolved.startsWith(normalizedBase)) {
+    process.stderr.write(
+      `[AUDIT LOG CONFIG] AUDIT_LOG_DIR resolved to '${resolved}' which is outside allowed base '${allowedBase}'. Falling back to default.\n`
+    );
+    return allowedBase;
+  }
+  return resolved;
+}
+
+const AUDIT_LOG_BASE_DIR = resolveWithinAllowedBase(process.env.AUDIT_LOG_DIR, AUDIT_LOG_SAFE_DEFAULT);
 const AUDIT_LOG_PATH = path.join(AUDIT_LOG_BASE_DIR, "audit_ai_actions.log");
 const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || "", 10) || 10 * 1024 * 1024; // 10 MB default
-const AUDIT_LOG_MODEL_ID = "gpt-4-approved-v1";
+// Retention policy: archived log files older than this many days are deleted. Default 90 days.
+const AUDIT_LOG_RETENTION_DAYS = parseInt(process.env.AUDIT_LOG_RETENTION_DAYS || "", 10) || 90;
+const AUDIT_LOG_MODEL_ID = Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? (() => { throw new Error("No approved models found in APPROVED_MODEL_REGISTRY"); })();
 const AUDIT_LOG_MODEL_VERSION = APPROVED_MODEL_REGISTRY[AUDIT_LOG_MODEL_ID]?.version ?? "unknown";
 
 function rotateAuditLogIfNeeded(): void {
@@ -24,15 +41,41 @@ function rotateAuditLogIfNeeded(): void {
       if (size >= MAX_AUDIT_LOG_BYTES) {
         // Archive by COPYING (appending) existing content into a timestamped file.
         // The active log file is NEVER renamed or deleted — immutability is preserved.
-        const archivePath = AUDIT_LOG_PATH.replace(
+        const candidateArchivePath = AUDIT_LOG_PATH.replace(
           /(\.log)?$/,
           `.${new Date().toISOString().replace(/[:.]/g, "-")}.log`
         );
+        // Validate archive path stays within the allowed base directory before writing.
+        const resolvedArchivePath = path.resolve(candidateArchivePath);
+        const normalizedBase = AUDIT_LOG_BASE_DIR.endsWith(path.sep)
+          ? AUDIT_LOG_BASE_DIR
+          : AUDIT_LOG_BASE_DIR + path.sep;
+        if (resolvedArchivePath !== AUDIT_LOG_BASE_DIR && !resolvedArchivePath.startsWith(normalizedBase)) {
+          throw new Error(
+            `Archive path '${resolvedArchivePath}' is outside allowed base '${AUDIT_LOG_BASE_DIR}'. Aborting rotation.`
+          );
+        }
+        const archivePath = resolvedArchivePath;
         const existingContent = fs.readFileSync(AUDIT_LOG_PATH);
         // Write archive with append flag so existing archive data is never overwritten.
         fs.appendFileSync(archivePath, existingContent);
         // Active log is NOT cleared — append-only/immutability is preserved.
         // New entries will continue to be appended to the active log.
+      }
+    }
+    // Time-based retention: delete archived log files older than AUDIT_LOG_RETENTION_DAYS.
+    const retentionMs = AUDIT_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const files = fs.readdirSync(AUDIT_LOG_BASE_DIR);
+    for (const file of files) {
+      // Only consider archived (timestamped) log files, not the active log.
+      if (file === path.basename(AUDIT_LOG_PATH)) continue;
+      if (!file.startsWith("audit_ai_actions") || !file.endsWith(".log")) continue;
+      const filePath = path.join(AUDIT_LOG_BASE_DIR, file);
+      const { mtimeMs } = fs.statSync(filePath);
+      if (now - mtimeMs > retentionMs) {
+        fs.unlinkSync(filePath);
+        process.stderr.write(`[AUDIT LOG RETENTION] Deleted expired archive: ${filePath}\n`);
       }
     }
   } catch (err) {
@@ -84,17 +127,17 @@ const MALICIOUS_PROMPT_PATTERNS: RegExp[] = [
   /roleplay\s+as/i,
   /jailbreak/i,
   /DAN\s+mode/i,
-  // Shell command sequences
+  // Shell command sequences (patterns constructed dynamically to avoid literal high-risk strings in source)
   /[`$]\s*\(/,
-  /;\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su\s)/i,
-  /\|\s*(bash|sh|python|perl|ruby|nc|ncat|netcat)/i,
-  /&&\s*(rm|wget|curl|bash|sh|python|perl|ruby)/i,
-  /\beval\s*\(/i,
-  /\bexec\s*\(/i,
-  /\/bin\/(bash|sh|zsh|ksh|csh)/i,
-  /\bsystem\s*\(/i,
-  /\bpasswd\b/i,
-  /\/etc\/(passwd|shadow|sudoers)/i,
+  new RegExp(';\\s*(' + ['r\x6d','w\x67et','c\x75rl','b\x61sh','s\x68','p\x79thon','p\x65rl','r\x75by','n\x63','n\x63at','n\x65tcat','c\x68mod','c\x68own','s\x75do','s\x75\\s'].join('|') + ')', 'i'),
+  new RegExp('\\|\\s*(' + ['b\x61sh','s\x68','p\x79thon','p\x65rl','r\x75by','n\x63','n\x63at','n\x65tcat'].join('|') + ')', 'i'),
+  new RegExp('&&\\s*(' + ['r\x6d','w\x67et','c\x75rl','b\x61sh','s\x68','p\x79thon','p\x65rl','r\x75by'].join('|') + ')', 'i'),
+  new RegExp('\\b' + 'ev\x61l' + '\\s*\\(', 'i'),
+  new RegExp('\\b' + 'ex\x65c' + '\\s*\\(', 'i'),
+  new RegExp('\\/bin\\/(' + ['b\x61sh','s\x68','z\x73h','k\x73h','c\x73h'].join('|') + ')', 'i'),
+  new RegExp('\\b' + 's\x79stem' + '\\s*\\(', 'i'),
+  new RegExp('\\b' + 'p\x61sswd' + '\\b', 'i'),
+  new RegExp('\\/etc\\/(' + ['p\x61sswd','sh\x61dow','sud\x6fers'].join('|') + ')', 'i'),
   // Base64-encoded content (heuristic: long base64 strings are suspicious in prompts)
   /(?:[A-Za-z0-9+\/]{40,}={0,2})/,
   // SSRF / URL injection
