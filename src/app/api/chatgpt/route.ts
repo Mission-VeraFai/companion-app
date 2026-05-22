@@ -10,13 +10,81 @@ import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
 // In-process rate limiter replacing Upstash Redis to avoid a 4th credentialed external system.
 const _rateLimitMap = new Map<string, { count: number; resetAt: number }>();
-function rateLimit(identifier: string): { success: boolean } {
+
+// Session key TTL: signed keys are valid for at most 5 minutes.
+const SESSION_KEY_TTL_MS = 5 * 60_000;
+
+/**
+ * Creates an HMAC-SHA256-signed, expiry-enforced, subject-bound session key.
+ * Format (base64url): `<payload>.<signature>`
+ * Payload (base64url of JSON): { sub, exp, nonce }
+ */
+function createSignedSessionKey(userId: string): string {
+  const secret = process.env.CLERK_SECRET_KEY;
+  if (!secret) throw new Error("CLERK_SECRET_KEY is required for session key signing.");
+  const payload = Buffer.from(
+    JSON.stringify({ sub: userId, exp: Date.now() + SESSION_KEY_TTL_MS, nonce: randomUUID() })
+  ).toString("base64url");
+  const sig = createHmac("sha256", secret).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+/**
+ * Verifies a signed session key:
+ *  - Re-derives HMAC and compares in constant time
+ *  - Checks expiry
+ *  - Asserts subject binding matches expectedUserId
+ * Returns the stable subject (userId) to use as the rate-limit key.
+ */
+function verifySignedSessionKey(signedKey: string, expectedUserId: string): string {
+  const secret = process.env.CLERK_SECRET_KEY;
+  if (!secret) throw new Error("CLERK_SECRET_KEY is required for session key verification.");
+  const dotIndex = signedKey.lastIndexOf(".");
+  if (dotIndex === -1) throw new Error("Malformed signed session key: missing signature.");
+  const payload = signedKey.slice(0, dotIndex);
+  const providedSig = signedKey.slice(dotIndex + 1);
+  const expectedSig = createHmac("sha256", secret).update(payload).digest("base64url");
+  // Constant-time comparison to prevent timing attacks
+  const expectedBuf = Buffer.from(expectedSig);
+  const providedBuf = Buffer.from(providedSig);
+  if (
+    expectedBuf.length !== providedBuf.length ||
+    !require("crypto").timingSafeEqual(expectedBuf, providedBuf)
+  ) {
+    throw new Error("Session key signature verification failed.");
+  }
+  let parsed: { sub: string; exp: number; nonce: string };
+  try {
+    parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Session key payload is not valid JSON.");
+  }
+  if (Date.now() > parsed.exp) {
+    throw new Error("Session key has expired.");
+  }
+  if (parsed.sub !== expectedUserId) {
+    throw new Error(
+      `Session key subject binding mismatch: expected '${expectedUserId}', got '${parsed.sub}'.`
+    );
+  }
+  return parsed.sub;
+}
+
+function rateLimit(signedKey: string, expectedUserId: string): { success: boolean } {
+  // Verify signature, expiry, and subject binding before using the key.
+  let subject: string;
+  try {
+    subject = verifySignedSessionKey(signedKey, expectedUserId);
+  } catch {
+    // Treat any verification failure as a rate-limit denial.
+    return { success: false };
+  }
   const now = Date.now();
   const windowMs = 60_000; // 1 minute
   const maxRequests = 10;
-  const entry = _rateLimitMap.get(identifier);
+  const entry = _rateLimitMap.get(subject);
   if (!entry || now > entry.resetAt) {
-    _rateLimitMap.set(identifier, { count: 1, resetAt: now + windowMs });
+    _rateLimitMap.set(subject, { count: 1, resetAt: now + windowMs });
     return { success: true };
   }
   if (entry.count >= maxRequests) {
@@ -25,21 +93,21 @@ function rateLimit(identifier: string): { success: boolean } {
   entry.count += 1;
   return { success: true };
 }
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomUUID, createHmac } from "crypto";
 
 // Approved model registry — only models listed here may be used at inference time.
 // Each entry carries an immutable identifier (model name/version) that must be
 // pinned at construction time and echoed in every request's metadata.
 const APPROVED_MODEL_REGISTRY: Record<string, { modelName: string; provider: string; version: string }> = {
-  "gpt-3.5-turbo-0125": {
-    modelName: "gpt-3.5-turbo-0125",
+  "gpt-4o-mini": {
+    modelName: "gpt-4o-mini",
     provider: "openai",
-    version: "0125",
+    version: "2024-07-18",
   },
 };
 
 // The single approved model for this workload — change only via registry update.
-const PINNED_MODEL_ID = "gpt-3.5-turbo-0125";
+const PINNED_MODEL_ID = "gpt-4o-mini";
 
 function assertModelInRegistry(modelId: string): void {
   if (!APPROVED_MODEL_REGISTRY[modelId]) {
@@ -540,11 +608,36 @@ export async function POST(req: Request) {
   // Streaming path: inject provenance as the first SSE comment so the
   // raw stream is also annotated before any text tokens arrive.
   const provenanceMeta = buildProvenance("[streaming]");
+
+  // Generate a shared trace/correlation ID that links this streaming
+  // response to its audit record for end-to-end forensic reconstruction.
+  const traceId = crypto.randomUUID();
+
+  // Write audit record for the streaming response; wrap in try/catch so
+  // a failed write is caught and alerted rather than silently dropped.
+  try {
+    await writeAuditLog({
+      event: "streaming_response_initiated",
+      timestamp: new Date().toISOString(),
+      trace_id: traceId,
+      principal: clerkUserId,
+      companion: name,
+      model_id: MODEL_ID,
+      provenance_signature: provenanceMeta.signature,
+      content_label: "AI_GENERATED_SYNTHETIC_CONTENT",
+    });
+  } catch (auditErr) {
+    console.error(
+      "[AUDIT FAILURE] streaming_response_initiated audit log write failed:",
+      auditErr
+    );
+  }
   const provenancePrefix = new TextEncoder().encode(
     `: X-Content-Label: AI_GENERATED_SYNTHETIC_CONTENT\n` +
     `: X-Model-Id: ${MODEL_ID}\n` +
     `: X-Generated-At: ${provenanceTimestamp}\n` +
-    `: X-Provenance-Signature: ${provenanceMeta.signature}\n\n`
+    `: X-Provenance-Signature: ${provenanceMeta.signature}\n` +
+    `: X-Trace-Id: ${traceId}\n\n`
   );
   const prefixStream = new ReadableStream({
     start(controller) {
@@ -558,26 +651,167 @@ export async function POST(req: Request) {
         controller.enqueue(chunk);
       }
       const reader = (stream as any).getReader?.() ?? (stream as any)[Symbol.asyncIterator]?.();
+      // Output-specific patterns for dynamic code execution primitives
+      const OUTPUT_DANGEROUS_PATTERNS: RegExp[] = [
+        ...MALICIOUS_PATTERNS,
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bnew\s+Function\s*\(/gi,
+        /\bsetTimeout\s*\(\s*['"`]/gi,
+        /\bsetInterval\s*\(\s*['"`]/gi,
+        /\bFunction\s*\(\s*['"`]/gi,
+        /\bimport\s*\(/gi,
+        /\brequire\s*\(/gi,
+        /\bprocess\.(?:exec|spawn|fork|execFile|execSync|spawnSync)\s*\(/gi,
+        /\bchild_process/gi,
+        /\b(?:os|subprocess|popen|system)\s*\./gi,
+        /__import__\s*\(/gi,
+        /compile\s*\(/gi,
+      ];
+
+      function sanitizeLLMOutputChunk(raw: Uint8Array | string): Uint8Array {
+        const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+        for (const pattern of OUTPUT_DANGEROUS_PATTERNS) {
+          if (pattern.test(text)) {
+            // Log and strip the dangerous content rather than forwarding it
+            console.warn("[LLM Output Sanitization] Dangerous pattern detected and removed from LLM output chunk.");
+            // Replace the matched dangerous content with an empty string
+            const sanitized = text.replace(pattern, "[REDACTED]");
+            return new TextEncoder().encode(sanitized);
+          }
+        }
+        return typeof raw === "string" ? new TextEncoder().encode(text) : raw;
+      }
+
       if (reader && typeof reader.read === "function") {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          controller.enqueue(value);
+          controller.enqueue(sanitizeLLMOutputChunk(value));
         }
       } else if (reader) {
         for await (const chunk of reader) {
-          controller.enqueue(typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk);
+          controller.enqueue(sanitizeLLMOutputChunk(chunk));
         }
       }
       controller.close();
     },
   });
-  return new StreamingTextResponse(annotatedStream, {
+  // --- Steganographic watermark embedded in content ---
+  // Encode a cryptographic HMAC as zero-width Unicode characters injected
+  // into the text stream. Zero-width space (U+200B) = bit 0,
+  // zero-width non-joiner (U+200C) = bit 1. The watermark payload is a
+  // truncated HMAC-SHA256 over (modelId + timestamp + signature) keyed by
+  // OPENAI_API_KEY so it is verifiable server-side but opaque to readers.
+  const WATERMARK_SECRET = process.env.OPENAI_API_KEY as string;
+  const watermarkPayload = `${MODEL_ID}|${provenanceTimestamp}|${provenanceMeta.signature}`;
+  const watermarkHmac = createHmac("sha256", WATERMARK_SECRET)
+    .update(watermarkPayload)
+    .digest("hex")
+    .slice(0, 16); // 16 hex chars = 64 bits — sufficient for detection
+
+  // Convert hex string to binary string, then to zero-width chars.
+  const hexToBinaryString = (hex: string): string =>
+    hex
+      .split("")
+      .map((h) => parseInt(h, 16).toString(2).padStart(4, "0"))
+      .join("");
+  const ZW_ZERO = "\u200B"; // zero-width space  → bit 0
+  const ZW_ONE  = "\u200C"; // zero-width non-joiner → bit 1
+  const ZW_START = "\u200D"; // zero-width joiner → watermark start sentinel
+  const ZW_END   = "\uFEFF"; // BOM / zero-width no-break space → end sentinel
+  const watermarkBits = hexToBinaryString(watermarkHmac);
+  const zwWatermark =
+    ZW_START +
+    watermarkBits
+      .split("")
+      .map((b) => (b === "0" ? ZW_ZERO : ZW_ONE))
+      .join("") +
+    ZW_END;
+
+  // Inject the watermark into the stream: prepend the sentinel block so it
+  // is present even if the client truncates the stream.
+  const encoder = new TextEncoder();
+  const watermarkBytes = encoder.encode(zwWatermark);
+  const watermarkedStream = new ReadableStream({
+    async start(controller) {
+      // Emit watermark first (invisible to human readers)
+      controller.enqueue(watermarkBytes);
+      const reader2 = (annotatedStream as any).getReader?.() ?? (annotatedStream as any)[Symbol.asyncIterator]?.();
+      if (reader2 && typeof reader2.read === "function") {
+        while (true) {
+          const { done, value } = await reader2.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+      } else if (reader2) {
+        for await (const chunk of reader2) {
+          controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
+        }
+      }
+      controller.close();
+    },
+  });
+
+  return new StreamingTextResponse(watermarkedStream, {
     headers: {
       "X-Content-Label": "AI_GENERATED_SYNTHETIC_CONTENT",
       "X-Model-Id": MODEL_ID,
       "X-Generated-At": provenanceTimestamp,
       "X-Provenance-Signature": provenanceMeta.signature,
+      // Expose the watermark HMAC in headers so verifiers can re-derive and
+      // detect the embedded zero-width sequence without the secret key.
+      "X-Watermark-Id": watermarkHmac,
     },
   });
+}
+
+/**
+ * Validates and sanitizes all inputs that will be forwarded to the LLM.
+ * Throws a descriptive error if any input contains malicious content.
+ * Returns sanitized copies of every input field.
+ */
+export function validateAndSanitizeAllLLMInputs(inputs: {
+  userMessage: string;
+  companionName?: string;
+  companionInstructions?: string;
+  memoryContext?: string;
+}): {
+  userMessage: string;
+  companionName: string;
+  companionInstructions: string;
+  memoryContext: string;
+} {
+  const fields: Array<{ key: string; value: string | undefined }> = [
+    { key: "userMessage", value: inputs.userMessage },
+    { key: "companionName", value: inputs.companionName },
+    { key: "companionInstructions", value: inputs.companionInstructions },
+    { key: "memoryContext", value: inputs.memoryContext },
+  ];
+
+  const sanitized: Record<string, string> = {};
+
+  for (const { key, value } of fields) {
+    const raw = value ?? "";
+    // Reject before sanitization so injected content is never partially processed
+    if (containsMaliciousContent(raw)) {
+      throw new Error(
+        `Input validation failed: field '${key}' contains potentially malicious content and cannot be forwarded to the LLM.`
+      );
+    }
+    sanitized[key] = sanitizeInput(raw);
+    // Re-check after sanitization to catch any content that survived transformation
+    if (containsMaliciousContent(sanitized[key])) {
+      throw new Error(
+        `Input validation failed after sanitization: field '${key}' still contains potentially malicious content.`
+      );
+    }
+  }
+
+  return {
+    userMessage: sanitized["userMessage"],
+    companionName: sanitized["companionName"],
+    companionInstructions: sanitized["companionInstructions"],
+    memoryContext: sanitized["memoryContext"],
+  };
 }
