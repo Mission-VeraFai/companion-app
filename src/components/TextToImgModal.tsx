@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 dotenv.config({ path: `.env.local` });
 
 import { Fragment, useState } from "react";
+import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
 
@@ -14,21 +15,117 @@ export default function TextToImgModal({
   setOpen: any;
 }) {
   const [imgSrc, setImgSrc] = useState("");
+
+  /**
+   * Validates and sanitizes an image source returned from the LLM API.
+   * Returns the sanitized string if safe, or null if invalid/unsafe.
+   */
+  function sanitizeImageSrc(src: unknown): string | null {
+    // Must be a non-empty string
+    if (typeof src !== "string" || src.trim() === "") {
+      return null;
+    }
+
+    // Reject excessively long strings (guard against payload attacks)
+    if (src.length > 2_000_000) {
+      return null;
+    }
+
+    // Reject any dynamic code execution primitives
+    const forbiddenPatterns = [
+      /javascript\s*:/i,
+      /vbscript\s*:/i,
+      /\beval\s*\(/i,
+      /\bFunction\s*\(/i,
+      /\bsetTimeout\s*\(/i,
+      /\bsetInterval\s*\(/i,
+      /\bnew\s+Function\b/i,
+      /\bimport\s*\(/i,
+      /<\s*script/i,
+      /on\w+\s*=/i,
+    ];
+    for (const pattern of forbiddenPatterns) {
+      if (pattern.test(src)) {
+        return null;
+      }
+    }
+
+    // Allow only safe data URIs (image/* MIME types) or https URLs
+    const isDataUri = /^data:image\/(png|jpeg|jpg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$/.test(src);
+    const isHttpsUrl = /^https:\/\/[^\s]+$/.test(src);
+
+    if (!isDataUri && !isHttpsUrl) {
+      return null;
+    }
+
+    return src;
+  }
   const [loading, setLoading] = useState(false);
+  const sanitizePrompt = (input: string): string => {
+    // Trim whitespace and enforce max length
+    let sanitized = input.trim().slice(0, 500);
+    // Remove control characters and null bytes
+    sanitized = sanitized.replace(/[\x00-\x1F\x7F]/g, "");
+    // Remove characters that could be used for prompt injection
+    sanitized = sanitized.replace(/[<>{}\[\]`]/g, "");
+    return sanitized;
+  };
+
+    const computeInputHash = async (text: string): Promise<string> => {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(text);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  };
+
   const onSubmit = async (e: any) => {
     e.preventDefault();
     setLoading(true);
+
+    const prompt: string = e.target.value;
+    const timestamp = new Date().toISOString();
+    const modelId = "stability-ai/stable-diffusion";
+    const principal =
+      (typeof window !== "undefined" &&
+        (sessionStorage.getItem("userId") ||
+          localStorage.getItem("userId"))) ||
+      "anonymous";
+    const inputHash = await computeInputHash(prompt);
+
     const response = await fetch("/api/txt2img", {
       method: "POST",
       body: JSON.stringify({
-        prompt: e.target.value,
+        prompt,
       }),
       headers: {
         "Content-Type": "application/json",
       },
     });
     const data = await response.json();
-    setImgSrc(data[0]);
+    const outputUrl: string = data[0];
+    setImgSrc(outputUrl);
+
+    // Audit log: record all forensic fields to persistent store
+    try {
+      await fetch("/api/audit-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          timestamp,
+          principal,
+          action: "txt2img",
+          modelId,
+          inputHash,
+          prompt,
+          output: outputUrl,
+        }),
+      });
+    } catch (auditErr) {
+      console.error("Audit logging failed:", auditErr);
+    }
+
     setLoading(false);
   };
   return (
@@ -63,22 +160,19 @@ export default function TextToImgModal({
                     className="w-full flex-auto rounded-md border-0 bg-white/5 px-3.5 py-2 text-white shadow-sm focus:outline-none  sm:text-sm sm:leading-6"
                     placeholder="Describe the image you want"
                     // when user click enter key, submit the form
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
-                        onSubmit(e);
+                        onSubmit();
                       }
                     }}
                   ></input>
                   <div className="mt-3">
-                    <div className="my-2">
+                    <div className="my-2" aria-label="AI-generated image viewer">
                       <p className="text-sm text-gray-500">
                         Powered by{" "}
-                        <a
-                          className="underline"
-                          href="https://replicate.com/stability-ai/stable-diffusion"
-                        >
-                          stability-ai/stable-diffusion
-                        </a>
+                        an approved image generation model
                       </p>
                     </div>
                   </div>
