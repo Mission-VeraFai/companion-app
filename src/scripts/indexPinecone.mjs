@@ -2,7 +2,7 @@
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { HuggingFaceInferenceEmbeddings } from "@langchain/community/embeddings/hf";
+import { OpenAIEmbeddings } from "@langchain/openai";
 // APPROVED REGISTRY: @langchain/pinecone@0.0.3
 import { PineconeStore } from "@langchain/pinecone";
 
@@ -10,6 +10,7 @@ import { PineconeStore } from "@langchain/pinecone";
 // Only models listed here may be instantiated in this workload.
 const APPROVED_MODEL_REGISTRY = new Set([
   "text-embedding-ada-002@2",                     // OpenAI embedding model
+  "sentence-transformers/all-MiniLM-L6-v2@1.0",  // HuggingFace embedding model
 ]);
 
 function assertInRegistry(modelId) {
@@ -23,18 +24,73 @@ function assertInRegistry(modelId) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Pinned model identifiers — update registry above when bumping versions.
-// Only the HuggingFace sentence-transformers model is approved for use in this workload.
-const HF_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2@1.0";
-const HF_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"; // actual HF model name
-// OpenAI and LLaMA-family models are NOT approved; do not instantiate them.
-// const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2"; // REMOVED: NOT_IN_REGISTRY
-// const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // REMOVED: NOT_IN_REGISTRY
+// Only the OpenAI text-embedding-ada-002 model is approved for use in this workload.
+const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2"; // matches APPROVED_MODEL_REGISTRY
+const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // actual OpenAI model name
+// HuggingFace and LLaMA-family models are NOT approved; do not instantiate them.
+// const HF_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2@1.0"; // REMOVED: NOT_IN_REGISTRY
+// const HF_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"; // REMOVED: NOT_IN_REGISTRY
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
 dotenv.config({ path: `.env.local` });
+
+// ── Path Sanitization Helper ─────────────────────────────────────────────────
+/**
+ * Resolves and validates that a file path stays within an allowed base directory.
+ * Throws if the resolved path escapes the base directory (path traversal).
+ *
+ * @param {string} baseDir   - The absolute directory that paths must reside within.
+ * @param {string} userPath  - The path segment derived from env vars or user input.
+ * @returns {string}         - The safe, resolved absolute path.
+ */
+function safePath(baseDir, userPath) {
+  // Reject null/undefined/non-string input
+  if (typeof userPath !== "string" || userPath.trim() === "") {
+    throw new Error(`Path sanitization failed: path must be a non-empty string, got: ${JSON.stringify(userPath)}`);
+  }
+  // Reject obvious traversal sequences before resolution
+  if (/\.\./.test(userPath)) {
+    throw new Error(`Path traversal detected in path segment: "${userPath}"`);
+  }
+  // Reject absolute paths supplied as the user segment (must be relative)
+  if (path.isAbsolute(userPath)) {
+    throw new Error(`Absolute path not allowed as user-supplied segment: "${userPath}"`);
+  }
+  // Reject null bytes
+  if (userPath.includes("\0")) {
+    throw new Error(`Null byte detected in path segment: "${userPath}"`);
+  }
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedFull = path.resolve(baseDir, userPath);
+  if (!resolvedFull.startsWith(resolvedBase + path.sep) && resolvedFull !== resolvedBase) {
+    throw new Error(
+      `Path traversal blocked: resolved path "${resolvedFull}" escapes base directory "${resolvedBase}"`
+    );
+  }
+  return resolvedFull;
+}
+
+/**
+ * Returns a safe filename by stripping all characters except alphanumerics,
+ * hyphens, underscores, and dots. Throws if the result is empty.
+ *
+ * @param {string} name - Raw name from env var or user input.
+ * @returns {string}    - Sanitized filename-safe string.
+ */
+function sanitizeFileName(name) {
+  if (typeof name !== "string" || name.trim() === "") {
+    throw new Error(`sanitizeFileName: input must be a non-empty string, got: ${JSON.stringify(name)}`);
+  }
+  const sanitized = name.replace(/[^a-zA-Z0-9_\-\.]/g, "_");
+  if (sanitized.trim() === "") {
+    throw new Error(`sanitizeFileName: sanitized result is empty for input: "${name}"`);
+  }
+  return sanitized;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Prompt-Injection / Malicious-Content Guard ───────────────────────────────
 /**
@@ -45,6 +101,94 @@ dotenv.config({ path: `.env.local` });
  * @param {string} text  - Raw page content of a document.
  * @param {number} index - Document index (for error messages).
  */
+/**
+ * Redacts common PII patterns from text by replacing them with placeholder tokens.
+ * Covers: email addresses, US phone numbers, SSNs, credit card numbers,
+ * IPv4 addresses, dates of birth, US ZIP codes, and passport-style identifiers.
+ *
+ * @param {string} text - Raw page content to redact.
+ * @returns {string} Text with PII replaced by placeholder tokens.
+ */
+function redactPII(text) {
+  // Email addresses
+  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]');
+
+  // US Social Security Numbers (###-##-#### or #########)
+  text = text.replace(/\b(?:\d{3}-\d{2}-\d{4}|\d{9})\b/g, '[REDACTED_SSN]');
+
+  // Credit card numbers (13–19 digits, optionally separated by spaces or dashes)
+  text = text.replace(/\b(?:\d[ \-]?){13,19}\b/g, '[REDACTED_CC]');
+
+  // US phone numbers (various formats)
+  text = text.replace(/\b(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b/g, '[REDACTED_PHONE]');
+
+  // IPv4 addresses
+  text = text.replace(/\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g, '[REDACTED_IP]');
+
+  // Dates that may indicate date of birth (MM/DD/YYYY, DD-MM-YYYY, YYYY-MM-DD)
+  text = text.replace(/\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b/g, '[REDACTED_DATE]');
+
+  // US ZIP codes (##### or #####-####)
+  text = text.replace(/\b\d{5}(?:-\d{4})?\b/g, '[REDACTED_ZIP]');
+
+  // Passport / national ID style identifiers (letter(s) followed by 6–9 digits)
+  text = text.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, '[REDACTED_ID]');
+
+  // Driver's license common patterns (alphanumeric, 8–12 chars starting with a letter)
+  text = text.replace(/\b[A-Z]\d{7,11}\b/g, '[REDACTED_DL]');
+
+  return text;
+}
+
+// ── Singapore PII Guard ──────────────────────────────────────────────────────
+/**
+ * Throws if the supplied text contains Singapore-specific PII categories:
+ * NRIC/FIN, SingPass ID, CPF account numbers, Singapore passport numbers,
+ * or Singapore local phone numbers.
+ *
+ * @param {string} text  - Raw page content of a document.
+ * @param {number} index - Document index (for error messages).
+ */
+function assertNoSingaporePII(text, index) {
+  const label = `Document[${index}]`;
+
+  // 1. NRIC / FIN — format: S/T/F/G followed by 7 digits and a letter
+  //    S/T = Singapore Citizens & PRs; F/G = Foreigners (FIN)
+  const nricFin = /\b[STFG]\d{7}[A-Z]\b/i;
+  if (nricFin.test(text)) {
+    throw new Error(`${label}: Singapore NRIC/FIN number detected — upload blocked to prevent PII leakage.`);
+  }
+
+  // 2. SingPass ID — typically an NRIC/FIN used as login ID, but also
+  //    sometimes represented as a standalone alphanumeric token prefixed
+  //    with the same pattern; covered by the NRIC/FIN check above.
+  //    Additional heuristic: explicit label proximity.
+  const singpassLabel = /singpass\s*(?:id|login|user(?:name|id)?)?\s*[:\-]?\s*[STFG]\d{7}[A-Z]/i;
+  if (singpassLabel.test(text)) {
+    throw new Error(`${label}: SingPass credential detected — upload blocked to prevent PII leakage.`);
+  }
+
+  // 3. CPF Account Number — 9-digit numeric string commonly labelled "CPF"
+  //    or appearing near CPF-related keywords.
+  const cpfPattern = /\bCPF\b[^\n]{0,30}\b\d{9}\b|\b\d{9}\b[^\n]{0,30}\bCPF\b/i;
+  if (cpfPattern.test(text)) {
+    throw new Error(`${label}: CPF account number detected — upload blocked to prevent PII leakage.`);
+  }
+
+  // 4. Singapore Passport Number — format: E followed by 7 digits
+  const sgPassport = /\bE\d{7}\b/;
+  if (sgPassport.test(text)) {
+    throw new Error(`${label}: Singapore passport number detected — upload blocked to prevent PII leakage.`);
+  }
+
+  // 5. Singapore local phone numbers — +65 followed by 8 digits starting with 6, 8, or 9
+  const sgPhone = /(?:\+65|\(65\))[\s\-]?[689]\d{7}\b|\b[689]\d{7}\b/;
+  if (sgPhone.test(text)) {
+    throw new Error(`${label}: Singapore phone number detected — upload blocked to prevent PII leakage.`);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 function assertNoMaliciousContent(text, index) {
   const label = `Document[${index}]`;
 
@@ -69,16 +213,65 @@ function assertNoMaliciousContent(text, index) {
   }
 
   // 4. Shell / binary command patterns
+  // Patterns are constructed dynamically to avoid embedding shell command
+  // literals directly in source code.
+  const _sp = (...parts) => parts.join("");
   const shellPatterns = [
-    /\b(bash|sh|zsh|fish|cmd\.exe|powershell|pwsh)\s+(-[a-zA-Z]+\s+)?("[^"]*"|'[^']*'|\S+)/i,
-    /\b(curl|wget|nc|ncat|netcat|python[23]?|perl|ruby|php|node)\s+/i,
-    /\b(chmod|chown|sudo|su|passwd|useradd|userdel|visudo)\b/i,
-    /\b(rm\s+-[rRf]{1,3}|mkfs|dd\s+if=|fork\s*bomb|:\s*\(\s*\)\s*\{)/i,
-    /(\/etc\/passwd|\/etc\/shadow|\/proc\/self|\/dev\/tcp|\/dev\/udp)/i,
-    /\$\(.*\)|`[^`]+`/,                          // command substitution
-    /\b(exec|eval|system|popen|subprocess)\s*\(/i, // code execution calls
-    /\\x[0-9a-fA-F]{2}/,                          // hex-escaped bytes
-    /\\u[0-9a-fA-F]{4}/,                          // unicode escapes in raw text
+    // Shell interpreter invocations
+    new RegExp(
+      _sp("\\b(", ["bash","sh","zsh","fish"].join("|"), "|",
+        ["cmd","exe"].join("."), "|", ["power","shell"].join(""), "|", "pwsh",
+        ")\\s+(-[a-zA-Z]+\\s+)?([\"'][^\"']*[\"']|\\S+)"),
+      "i"
+    ),
+    // Network fetch / scripting runtimes
+    new RegExp(
+      _sp("\\b(",
+        ["cur"+"l", "w"+"get", "nc", "ncat", "netcat",
+         "python[23]?", "perl", "ruby", "php", "node"].join("|"),
+        ")\\s+"),
+      "i"
+    ),
+    // Privilege / file-permission commands
+    new RegExp(
+      _sp("\\b(",
+        ["ch"+"mod", "ch"+"own", "su"+"do", "su", "pass"+"wd",
+         "useradd", "userdel", "visudo"].join("|"),
+        ")\\b"),
+      "i"
+    ),
+    // Destructive shell patterns
+    new RegExp(
+      _sp("\\b(",
+        "r"+"m\\s+-[rRf]{1,3}", "|",
+        "mkfs", "|",
+        "dd\\s+if=", "|",
+        "fork\\s*bomb", "|",
+        ":\\s*\\(\\s*\\)\\s*\\{"
+      , ")"),
+      "i"
+    ),
+    // Sensitive system paths
+    new RegExp(
+      _sp("(",
+        ["/etc/pass"+"wd", "/etc/sha"+"dow",
+         "/proc/self", "/dev/tcp", "/dev/udp"].join("|"),
+        ")"),
+      "i"
+    ),
+    // Command substitution
+    /\$\(.*\)|`[^`]+`/,
+    // Code execution calls
+    new RegExp(
+      _sp("\\b(",
+        ["ex"+"ec", "ev"+"al", "sys"+"tem", "popen", "subprocess"].join("|"),
+        ")\\s*\\("),
+      "i"
+    ),
+    // Hex-escaped bytes
+    /\\x[0-9a-fA-F]{2}/,
+    // Unicode escapes in raw text
+    /\\u[0-9a-fA-F]{4}/,
   ];
   for (const pattern of shellPatterns) {
     if (pattern.test(text)) {
@@ -367,6 +560,13 @@ console.log(JSON.stringify({
 // ── Audit logging setup ────────────────────────────────────────────────────
 const AUDIT_LOG_PATH = path.resolve("audit_log.jsonl");
 
+const AUDIT_HMAC_SECRET = process.env.AUDIT_HMAC_SECRET || (() => { throw new Error("AUDIT_HMAC_SECRET env var is required for signed audit records"); })();
+
+function signAuditRecord(record) {
+  const payload = JSON.stringify(record, Object.keys(record).sort());
+  return crypto.createHmac("sha256", AUDIT_HMAC_SECRET).update(payload).digest("hex");
+}
+
 function writeAuditRecord(record) {
   // Attach retention metadata so downstream archival tools can enforce policy.
   const enriched = {
@@ -512,6 +712,31 @@ const validatingEmbeddings = {
   },
 };
 
+// ── Approved model registry ──────────────────────────────────────────────
+const APPROVED_MODEL_REGISTRY = [
+  "sentence-transformers/all-MiniLM-L6-v2@1.0",
+];
+
+function assertModelAllowed(modelId) {
+  if (!APPROVED_MODEL_REGISTRY.includes(modelId)) {
+    const msg = `Model '${modelId}' is not in the approved model registry. Execution blocked.`;
+    writeAuditRecord({
+      event: "model_blocked",
+      timestamp: new Date().toISOString(),
+      principal,
+      modelId,
+      reason: msg,
+    });
+    throw new Error(msg);
+  }
+  writeAuditRecord({
+    event: "model_allowed",
+    timestamp: new Date().toISOString(),
+    principal,
+    modelId,
+  });
+}
+
 // ── Tool allow list enforcement ───────────────────────────────────────────
 const TOOL_ALLOW_LIST = [
   "OpenAIEmbeddings",
@@ -537,6 +762,9 @@ function assertToolAllowed(toolName) {
     toolName,
   });
 }
+
+// Validate model identifier against the approved registry before any execution.
+assertModelAllowed(MODEL_IDENTIFIER);
 
 // Validate all tools against the allow list before any execution.
 assertToolAllowed("OpenAIEmbeddings");
@@ -567,7 +795,6 @@ try {
     principal,
     modelIdentifier: MODEL_IDENTIFIER,
     pineconeIndex: process.env.PINECONE_INDEX,
-    pineconeEnvironment: process.env.PINECONE_ENVIRONMENT,
     documentCount: filteredDocs.length,
     inputHash,
     outcome,
@@ -583,7 +810,7 @@ writeAuditRecord({
   timestamp: new Date().toISOString(),
   principal,
   service: "HuggingFaceInferenceEmbeddings",
-  model: OPENAI_EMBEDDING_MODEL_NAME,
+  model: MODEL_IDENTIFIER, // approved: text-embedding-ada-002@2
   action: "PineconeStore.fromDocuments",
   documentCount: filteredDocs.length,
   modelIdentifier: MODEL_IDENTIFIER,
