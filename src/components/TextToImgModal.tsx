@@ -5,6 +5,48 @@ import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
 
+/**
+ * Computes a SHA-256 hex digest of the given string.
+ * Used to hash prompt inputs and output references for the audit trail.
+ */
+async function sha256Hex(text: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+interface AuditRecord {
+  timestamp: string;          // ISO-8601 UTC
+  principal: string;          // authenticated user identifier
+  action: string;             // "generate-image"
+  modelId: string;            // model/API identifier
+  inputHash: string;          // SHA-256 of the raw prompt
+  outputHash: string;         // SHA-256 of the raw response body (or error message)
+  httpStatus: number | null;  // HTTP status returned by the AI API
+  success: boolean;
+  errorMessage?: string;
+}
+
+/**
+ * Persists an audit record to the server-side audit log endpoint.
+ * Fire-and-forget: errors are caught and logged to console only,
+ * so audit failures never silently swallow the original error.
+ */
+function persistAuditRecord(record: AuditRecord): void {
+  fetch("/api/audit-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(record),
+    // keepalive ensures the request completes even if the page unloads
+    keepalive: true,
+  }).catch((err) => {
+    console.error("[audit] Failed to persist audit record:", err);
+  });
+}
+
 export default function TextToImgModal({
   open,
   setOpen,
@@ -60,6 +102,9 @@ export default function TextToImgModal({
     return src;
   }
   const [loading, setLoading] = useState(false);
+
+  // Stable model identifier – update this constant whenever the backend model changes.
+  const AI_MODEL_ID = "openai/dall-e-3";
 
   /**
    * Embeds a visible watermark onto an image (data URI or HTTPS URL)
