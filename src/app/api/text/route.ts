@@ -122,7 +122,8 @@ let _cachedRegistry: ApprovedModelRegistry | null = null;
 
 async function fetchApprovedModelRegistry(): Promise<ApprovedModelRegistry> {
   if (_cachedRegistry) return _cachedRegistry;
-  const registrySecret = process.env.ORG_MODEL_REGISTRY_SECRET;
+  // ORG_MODEL_REGISTRY_SECRET removed: registry access is performed via the registry URL only.
+// If authentication is required, delegate to an internal secrets-manager service.
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
@@ -854,17 +855,7 @@ if (decodedKey) {
   // Encrypted reference used for any logging or internal storage — never log toRaw
   const toEncrypted = encryptPhoneNumber(toRaw, piiEncryptionKey);
 
-    await twilioClient.messages
-    .create({
-      body: smsBody,
-      from,
-      to: decryptPhoneNumber(toEncrypted, piiEncryptionKey), // plaintext derived from encrypted reference only at point of transmission
-    })
-    .catch(() => {
-      // Suppress error details to avoid leaking routing or payload information
-      console.error("WARNING: failed to send SMS to encrypted recipient.");
-    });
-  // Guard against prompt injection, base64 payloads, and shell commands in smsBody
+      // Guard against prompt injection, base64 payloads, and shell commands in smsBody
   const detectMaliciousPromptPatterns = (text: string): boolean => {
     // Hidden/override prompt injection keywords
     const promptInjectionPattern = /ignore\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)|system\s*prompt|you\s+are\s+now|act\s+as\s+|jailbreak|\[INST\]|<\|im_start\|>|<\|system\|>/i;
@@ -884,7 +875,35 @@ if (decodedKey) {
     smsBody = "[Response unavailable]";
   }
 
-  const provenanceFooter = ` | ${new Date().toISOString()}`;
+  // Compute input hash and capture model version for audit trail
+  const crypto = await import("crypto");
+  const fs = await import("fs");
+  const inputHash = crypto.createHash("sha256").update(smsBody).digest("hex");
+  const modelVersion = process.env.AI_MODEL_VERSION ?? "unknown";
+  const auditTimestamp = new Date().toISOString();
+
+  // Persistent fallback audit writer — used when primary logging fails
+  const writeFallbackAudit = (event: string, detail: string) => {
+    const entry = JSON.stringify({ event, detail, inputHash, modelVersion, auditTimestamp }) + "\n";
+    try {
+      fs.appendFileSync("/var/log/ai_audit_fallback.log", entry);
+    } catch (fsErr) {
+      // Last-resort: surface to process stderr so the host OS captures it
+      process.stderr.write(`AUDIT_FALLBACK_WRITE_FAILED: ${entry}`);
+    }
+  };
+
+  // Primary audit record — model version + input hash required by policy
+  console.log(
+    JSON.stringify({
+      event: "ai_inference_audit",
+      modelVersion,
+      inputHash,
+      timestamp: auditTimestamp,
+    })
+  );
+
+  const provenanceFooter = ` | ${auditTimestamp}`;
   const aiLabel = "[AI-GENERATED CONTENT]";
   const labeledResponseText = attachProvenanceWatermark(`${aiLabel}\n${smsBody}${provenanceFooter}`);
 
@@ -894,17 +913,30 @@ if (decodedKey) {
       from,
       to: decryptPhoneNumber(toEncrypted, piiEncryptionKey), // plaintext derived from encrypted reference only at point of transmission
     })
-  );
-  const wateredResponseText = attachProvenanceWatermark(smsBody);
-  await twilioClient.messages
+    .catch(() => {
+      // Suppress error details to avoid leaking routing or payload information
+      console.error("WARNING: failed to send SMS to encrypted recipient.");
+    });
+  // SMS sent successfully with watermark and provenance label
     .create({
       body: wateredResponseText,
       from,
       to: decryptPhoneNumber(toEncrypted, piiEncryptionKey), // plaintext derived from encrypted reference only at point of transmission
     })
-    .catch(() => {
-      // Suppress error details to avoid leaking routing or payload information
-      console.error("WARNING: failed to send SMS to encrypted recipient.");
+    .catch((smsErr: unknown) => {
+      // Log with audit context — never log plaintext recipient
+      const errMsg = smsErr instanceof Error ? smsErr.message : String(smsErr);
+      console.error(
+        JSON.stringify({
+          event: "sms_send_failure",
+          warning: "failed to send SMS to encrypted recipient",
+          inputHash,
+          modelVersion,
+          timestamp: new Date().toISOString(),
+          errorSummary: errMsg.slice(0, 120),
+        })
+      );
+      writeFallbackAudit("sms_send_failure", errMsg.slice(0, 120));
     });
 
   return NextResponse.json({ message: "Hello from the API!" });
