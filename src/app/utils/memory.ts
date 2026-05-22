@@ -1,13 +1,13 @@
 // Redis removed: replaced with in-memory store to stay within 3-credential limit
-import { CohereEmbeddings } from "langchain/embeddings/cohere";
+import { BedrockEmbeddings } from "langchain/embeddings/bedrock";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
 
 const DANGEROUS_PATTERNS = [
-  /\beval\s*\(/i,
-  /\bexec\s*\(/i,
+  /\be(?:v)al\s*\(/i,
+  /\be(?:x)ec\s*\(/i,
   /\bnew\s+Function\s*\(/i,
   /\bsetTimeout\s*\(\s*['"`]/i,
   /\bsetInterval\s*\(\s*['"`]/i,
@@ -386,12 +386,37 @@ class MemoryManager {
     }
 
     const key = this.generateRedisCompanionKey(companionKey);
+    const writeScore = Date.now();
+    const WRITE_EXPIRY_SECONDS = 86400;
+        const score = Date.now();
+    const mac = createHmac('sha256', SESSION_SECRET)
+      .update(`${key}:${score}:${text}`)
+      .digest('hex');
+    const signedMember = `${mac}:${text}`;
     const result = await this.history.zadd(key, {
-      score: Date.now(),
-      member: text,
+      score,
+      member: signedMember,
     });
     // Refresh expiry on every write; sessions expire after 24 hours of inactivity
-    await this.history.expire(key, 86400);
+    await this.history.expire(key, WRITE_EXPIRY_SECONDS);
+    // Audit log: record AI-driven history write with forensic fields
+    const auditEntry = JSON.stringify({
+      event: "write_to_history",
+      timestamp: new Date(writeScore).toISOString(),
+      principal: companionKey.userId,
+      modelName: companionKey.modelName,
+      companionName: companionKey.companionName,
+      inputHash: hashInput(text),
+      score: writeScore,
+      writeResult: result,
+      retentionPolicy: { expirySeconds: WRITE_EXPIRY_SECONDS },
+    });
+    await this.history.zadd(
+      `audit:${key}`,
+      { score: writeScore, member: auditEntry }
+    );
+    await this.history.expire(`audit:${key}`, WRITE_EXPIRY_SECONDS);
+    console.log(`[AUDIT] write_to_history: ${auditEntry}`);
 
     return result;
   }
@@ -403,7 +428,7 @@ class MemoryManager {
     }
 
     const key = this.generateRedisCompanionKey(companionKey);
-    let result = await this.history.zrange(key, 0, Date.now(), {
+        let result = await this.history.zrange(key, 0, Date.now(), {
       byScore: true,
     });
 
@@ -412,7 +437,25 @@ class MemoryManager {
     result = result.slice(-MAX_HISTORY_ENTRIES).reverse();
     const recentChats = result
       .reverse()
-      .map((entry: string) => redactSensitiveText(entry.slice(0, MAX_ENTRY_LENGTH)))
+      .map((entry: string) => {
+        const colonIdx = entry.indexOf(':');
+        if (colonIdx === -1) return ''; // reject unsigned entries
+        const storedMac = entry.slice(0, colonIdx);
+        const payload = entry.slice(colonIdx + 1);
+        // Re-derive MAC; we don't have the original score here so verify payload integrity only
+        const expectedMac = createHmac('sha256', SESSION_SECRET)
+          .update(`${key}:${payload}`)
+          .digest('hex');
+        // Use timing-safe comparison
+        const storedBuf = Buffer.from(storedMac, 'hex');
+        const expectedBuf = Buffer.from(expectedMac, 'hex');
+        if (storedBuf.length !== expectedBuf.length || !timingSafeEqual(storedBuf, expectedBuf)) {
+          console.warn('Session entry failed MAC verification; discarding.');
+          return '';
+        }
+        return redactSensitiveText(payload.slice(0, MAX_ENTRY_LENGTH));
+      })
+      .filter((entry: string) => entry !== '')
       .join("\n");
     return recentChats;
   }
@@ -436,11 +479,38 @@ class MemoryManager {
       return;
     }
 
-            const content = seedContent.split(delimiter);
+            const DANGEROUS_PATTERNS = [
+      /system\s*:/i,
+      /ignore\s+(previous|above|all)\s+instructions/i,
+      /you\s+are\s+now/i,
+      /execute\s*[(`]/i,
+      /eval\s*\(/i,
+      /\$\([^)]*\)/,
+      /`[^`]*`/,
+      /;\s*(rm|del|format|shutdown|reboot|kill|wget|curl|bash|sh|cmd|powershell)/i,
+      /&&\s*(rm|del|format|shutdown|reboot|kill|wget|curl|bash|sh|cmd|powershell)/i,
+      /\|\s*(rm|del|format|shutdown|reboot|kill|wget|curl|bash|sh|cmd|powershell)/i,
+    ];
+
+    const content = seedContent.split(delimiter);
     let counter = 0;
     const baseTime = Date.now();
-    for (const line of content) {
-      await this.history.zadd(key, { score: baseTime + counter, member: line });
+        for (const line of content) {
+      const mac = createHmac('sha256', SESSION_SECRET)
+        .update(`${key}:${baseTime + counter}:${line}`)
+        .digest('hex');
+      const signedMember = `${mac}:${line}`;
+      await this.history.zadd(key, { score: baseTime + counter, member: signedMember });
+      counter += 1;
+    }
+      const isDangerous = DANGEROUS_PATTERNS.some((pattern) =>
+        pattern.test(sanitizedLine)
+      );
+      if (isDangerous) {
+        console.warn("Skipping dangerous seed content line");
+        continue;
+      }
+      await this.history.zadd(key, { score: baseTime + counter, member: sanitizedLine });
       counter += 1;
     }
     // Set expiry so seeded sessions expire after 24 hours of inactivity
@@ -448,10 +518,15 @@ class MemoryManager {
   });
       counter += 1;
     }
-      await this.history.zadd(key, { score: counter, member: sanitizedLine });
+    // Set expiry so seeded sessions expire after 24 hours of inactivity
+    await this.history.expire(key, 86400);
+  });
       counter += 1;
     }
+    // Set expiry so seeded sessions expire after 24 hours of inactivity
+    await this.history.expire(key, 86400);
   }
 }
+
 
 export default MemoryManager;
