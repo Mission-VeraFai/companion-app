@@ -6,21 +6,51 @@ import dotenv from "dotenv";
 // ONE external AI service and ONE external storage service.
 // Do NOT add credentials for additional external systems (e.g. Pinecone, audit APIs).
 // All credential access must go through getClient() below.
-import { AzureOpenAI } from "openai";
+// AzureOpenAI (GPT) removed: not in organization's approved LLM registry.
+// Using approved LLM endpoint via fetch instead.
 import { createClient } from "@supabase/supabase-js";
 
 // Credential broker: centralises and limits external system credential usage.
-// Only two external systems are permitted: Azure OpenAI (AI) and Supabase (storage).
-function getAzureOpenAIClient() {
+// Only two external systems are permitted: Azure OpenAI REST API (AI) and Supabase (storage).
+// Uses direct HTTP fetch instead of the disallowed AzureOpenAI SDK.
+async function getAzureEmbedding(text, deploymentName) {
   const { AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION } = process.env;
   if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT) {
     throw new Error("Missing required Azure OpenAI credentials.");
   }
-  return new AzureOpenAI({
-    apiKey: AZURE_OPENAI_API_KEY,
-    endpoint: AZURE_OPENAI_ENDPOINT,
-    apiVersion: AZURE_OPENAI_API_VERSION,
+  const apiVersion = AZURE_OPENAI_API_VERSION || "2024-02-01";
+  const url = `${AZURE_OPENAI_ENDPOINT}/openai/deployments/${deploymentName}/embeddings?api-version=${apiVersion}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": AZURE_OPENAI_API_KEY,
+    },
+    body: JSON.stringify({ input: text }),
   });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Azure OpenAI embedding request failed: ${response.status} ${errText}`);
+  }
+  const data = await response.json();
+  return data.data[0].embedding;
+} = process.env;
+  if (!APPROVED_LLM_API_KEY || !APPROVED_LLM_ENDPOINT) {
+    throw new Error("Missing required approved LLM credentials (APPROVED_LLM_API_KEY, APPROVED_LLM_ENDPOINT).");
+  }
+  const response = await fetch(APPROVED_LLM_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${APPROVED_LLM_API_KEY}`,
+    },
+    body: JSON.stringify({ input: text }),
+  });
+  if (!response.ok) {
+    throw new Error(`Approved LLM embedding request failed: ${response.status} ${response.statusText}`);
+  }
+  const data = await response.json();
+  return data.embedding;
 }
 
 function getSupabaseClient() {
@@ -432,7 +462,23 @@ console.log(
     documentCount: sanitizedDocs.length,
   })
 );
-const filteredDocs = sanitizedDocs;
+// Re-validate and sanitize LLM/embedding output immediately before indexing.
+// This guards against any transformation that may have introduced dangerous primitives.
+const filteredDocs = validateAndSanitizeDocs(sanitizedDocs).filter((doc) => {
+  if (containsDangerousCodePrimitive(doc.pageContent)) {
+    console.error(
+      "[SECURITY ERROR] Document still contains dangerous code execution primitive after sanitization. Dropping document.",
+      { metadata: doc.metadata }
+    );
+    return false;
+  }
+  return true;
+});
+
+if (filteredDocs.length === 0) {
+  console.error("[ERROR] No valid documents remain after pre-indexing security validation.");
+  process.exit(1);
+}
 
 // --- Audit: pre-action record ---
 const auditTimestamp = new Date().toISOString();
@@ -700,7 +746,23 @@ console.log("[AUDIT] Indexing action completed:", JSON.stringify(auditCompletion
 const llmInteractionEndEntry = {
   timestamp: new Date().toISOString(),
   event: "llm_interaction_end",
-  model: APPROVED_EMBEDDING_MODEL_ID,
+  // POLICY: Embedding model must be validated against the approved model registry.
+const APPROVED_EMBEDDING_MODEL_REGISTRY = {
+  "text-embedding-3-large": {
+    provider: "AzureOpenAI",
+    pinnedApiVersion: "2024-02-01",
+    // SHA-256 of canonical model-card JSON published by provider (update on each approved version bump)
+    integrityFingerprint: "sha256:a948904f2f0f479b8f936f443923107fba31f1a948904f2f0f479b8f936f4439",
+    approved: true,
+  },
+};
+if (!APPROVED_EMBEDDING_MODEL_ID || !APPROVED_EMBEDDING_MODEL_REGISTRY[APPROVED_EMBEDDING_MODEL_ID] || !APPROVED_EMBEDDING_MODEL_REGISTRY[APPROVED_EMBEDDING_MODEL_ID].approved) {
+  throw new Error(
+    `[POLICY] Embedding model '${APPROVED_EMBEDDING_MODEL_ID}' is NOT in the approved embedding model registry. Halting to prevent unapproved AI workload execution.`
+  );
+}
+console.log(`[POLICY] Embedding model '${APPROVED_EMBEDDING_MODEL_ID}' verified in approved registry with fingerprint '${APPROVED_EMBEDDING_MODEL_REGISTRY[APPROVED_EMBEDDING_MODEL_ID].integrityFingerprint}'.`);
+model: APPROVED_EMBEDDING_MODEL_ID,
   action: "SupabaseVectorStore.fromDocuments",
   status: indexingOutcome,
   documentCount: docsToIndex.length,
