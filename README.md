@@ -9,7 +9,9 @@
 
 This is a tutorial stack to create and host AI companions that you can chat with on a browser or text via SMS. It allows you to determine the personality and backstory of your companion, and uses a vector database with similarity search to retrieve and prompt so the conversations have more depth. It also provides some conversational memory by keeping the conversation in a queue and including it in the prompt. 
 
-It currently contains companions powered by organization-approved LLM providers. 
+It currently contains companions powered by organization-approved LLM providers.
+
+> ⚠️ **Synthetic Content Notice:** All text, images, and other outputs produced by companions in this application are AI-generated. Every response is labeled with a synthetic-origin marker and includes provenance metadata (model identifier, provider, and generation timestamp) so users and downstream systems can always identify AI-generated content. Exported companion data also embeds these provenance fields. See [AI Content Provenance & Labeling](#ai-content-provenance--labeling) for details.
 
 There are many possible use cases for these companions - romantic (AI girlfriends / boyfriends), friendship, entertainment, coaching, etc. You can guide your companion towards your ideal use case with the backstory you write and the model you choose.
 
@@ -24,6 +26,38 @@ There are many possible use cases for these companions - romantic (AI girlfriend
 - 👩‍💻 [How to contribute to this repo](#how-to-contribute-to-this-repo)
 - 🐍 [Python support](#python-support)
 - 💽 [Exporting your companion to Character.ai](#export-to-characterai)
+- 🏷️ [AI Content Provenance & Labeling](#ai-content-provenance--labeling)
+
+## AI Content Provenance & Labeling
+
+All AI-generated outputs in this application (chat messages, images, exported companion data) must comply with the following requirements:
+
+### Response Labeling
+Every API response that contains AI-generated content must include:
+- HTTP header: `x-ai-generated: true`
+- A `provenance` field in the JSON body:
+  ```json
+  {
+    "provenance": {
+      "synthetic": true,
+      "model": "<model-identifier>",
+      "provider": "<approved-provider-name>",
+      "generatedAt": "<ISO-8601 timestamp>"
+    }
+  }
+  ```
+- A visible **"AI-generated"** badge rendered in the UI for every companion message.
+
+### Watermarking
+- **Text outputs:** Apply an organization-approved text watermarking scheme (e.g., statistical token-level watermarking) before the response is sent to the client.
+- **Image outputs:** Embed [C2PA](https://c2pa.org/)-compatible provenance metadata into any generated images.
+
+### Audit & Traceability
+- Provenance records are stored alongside each message in the conversation history (Upstash) and must not be deleted for the retention period defined by your organization's AI governance policy.
+- Exported companion files (`.txt`) must include the `# PROVENANCE` header block described in the [Export to Character.ai](#export-to-characterai) section.
+
+### Governance
+Contact your organization's AI governance team to obtain the list of approved models and watermarking libraries before deploying this stack.
 
 ## Stack
 
@@ -34,10 +68,12 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 - VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
 - LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
 - Text model: [Approved LLM Provider] (contact your organization's AI governance team for the list of approved models)
+- **Synthetic-origin labeling:** Every AI-generated response payload includes a `x-ai-generated: true` header and a `provenance` JSON field containing `{ model, provider, generatedAt }` so clients can surface a visible label to end users.
+- **Content watermarking:** Text outputs are watermarked using an organization-approved watermarking library before delivery; image outputs embed C2PA-compatible provenance metadata.
+- **Audit log:** Provenance records are written to the conversation history store (Upstash) alongside each message for traceability.
 - Text streaming: [ai sdk](https://github.com/vercel-labs/ai)
-- Conversation history: [Upstash](https://upstash.com/)
+- Conversation history: Upstash (optional)
 - Deployment: [Fly](https://fly.io/)
-- Text with companion: [Twilio](https://twilio.com/)
 
 ## Quickstart
 
@@ -85,13 +121,9 @@ If you want to text your AI companion in later steps, you should also enable "ph
 <img width="1013" alt="Screen Shot 2023-07-10 at 11 05 42 PM" src="https://github.com/a16z-infra/companion-app/assets/3489963/4435c759-f33e-4e38-a276-1be6d538df28">
 
 
-b. **OpenAI API key**
+b. **LLM Provider API key**
 
-Visit https://platform.openai.com/account/api-keys to get your OpenAI API key if you're using OpenAI for your language model.
-
-c. **Replicate API key**
-
-Visit https://replicate.com/account/api-tokens to get your Replicate API key if you're using Vicuna for your language model.
+Obtain an API key from your organization's approved LLM provider (e.g., visit https://platform.openai.com/account/api-keys for OpenAI). Contact your AI governance team for the list of approved providers.
 
 
 ❗ **_NOTE:_** By default, this template uses Pinecone as vector store, but you can turn on Supabase pgvector easily by uncommenting `VECTOR_DB=supabase` in `.env.local`. This means you only need to fill out either Pinecone API key _or_ Supabase API key.
@@ -323,7 +355,17 @@ npm run export-to-character [COMPANION_NAME] [MODEL_NAME] [USER_ID]
 Once you run this script, you will see two files created under the root directory:
 
 - `[COMPANION_NAME]_chat_history.txt`: This outputs all of the chat history stored in Upstash
-- `[COMPANION_NAME_]_character_ai_data.txt`: This outputs the data you need in order to re-create the companion on Character.ai. You can find Character.ai character configurations under "View Character Settings" on any newly-created characters.
+- `[COMPANION_NAME_]_character_ai_data.txt`: This outputs the data you need in order to re-create the companion on Character.ai.
+
+> **Provenance requirement:** The exported file must include a `provenance` block at the top of the document:
+> ```
+> # PROVENANCE
+> # generated_by: [Approved LLM Provider]
+> # generated_at: <ISO-8601 timestamp>
+> # synthetic_content: true
+> # watermark_id: <unique watermark token>
+> ```
+> Downstream platforms that ingest this export must preserve these fields and surface the synthetic-origin label to their users. You can find Character.ai character configurations under "View Character Settings" on any newly-created characters.
 
 ## Refs
 

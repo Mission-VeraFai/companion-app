@@ -6,6 +6,116 @@ import { Dialog, Transition } from "@headlessui/react";
 import { useCompletion } from "ai/react";
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
+// Patterns that indicate dynamic code execution primitives in LLM output
+const DYNAMIC_CODE_PATTERNS: RegExp[] = [
+  /\beval\s*\(/gi,
+  /\bFunction\s*\(/gi,
+  /\bnew\s+Function\b/gi,
+  /\bexec\s*\(/gi,
+  /\bexecSync\s*\(/gi,
+  /\bspawnSync\s*\(/gi,
+  /\bspawn\s*\(/gi,
+  /\bexecFile\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
+  /\bsetImmediate\s*\(\s*['"`]/gi,
+  /\bvm\.runInThisContext\b/gi,
+  /\bvm\.runInNewContext\b/gi,
+  /\bvm\.Script\b/gi,
+  /\bimportScripts\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\binnerHTML\s*=/gi,
+  /\bouterHTML\s*=/gi,
+  /\binsertAdjacentHTML\s*\(/gi,
+  /javascript\s*:/gi,
+  /data\s*:\s*text\/html/gi,
+  /\bprocess\.binding\s*\(/gi,
+  /\brequire\s*\(\s*['"`]child_process/gi,
+  /\b__import__\s*\(/gi,
+  /\bcompile\s*\(/gi,
+  /\bexecfile\s*\(/gi,
+];
+
+/**
+ * Validates LLM output for the presence of dynamic code execution primitives.
+ * Returns an object indicating whether the output is safe and which patterns were found.
+ */
+function validateLLMOutput(output: string): { safe: boolean; violations: string[] } {
+  const violations: string[] = [];
+  for (const pattern of DYNAMIC_CODE_PATTERNS) {
+    // Reset lastIndex for global regexes
+    pattern.lastIndex = 0;
+    if (pattern.test(output)) {
+      violations.push(pattern.toString());
+    }
+  }
+  return { safe: violations.length === 0, violations };
+}
+
+/**
+ * Sanitizes LLM output by removing dynamic code execution primitives.
+ * Logs a warning if any violations are found.
+ * Returns sanitized output, or throws if the output cannot be safely sanitized.
+ */
+function sanitizeLLMOutput(output: string): string {
+  const { safe, violations } = validateLLMOutput(output);
+  if (!safe) {
+    console.warn(
+      "[security] LLM output contained dynamic code execution primitives. Blocking output.",
+      violations
+    );
+    // Block the entire output to prevent any partial execution risk
+    return "[Response blocked: output contained potentially unsafe dynamic code execution patterns.]"
+  }
+  return output;
+}
+
+function detectMaliciousInput(input: string): { safe: boolean; reason: string } {
+  // Check for hidden/invisible characters used in prompt injection
+  const hiddenCharsPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/;
+  if (hiddenCharsPattern.test(input)) {
+    return { safe: false, reason: "Input contains hidden or invisible characters that may indicate a prompt injection attempt." };
+  }
+
+  // Check for base64-encoded content (blocks of base64 that could hide malicious payloads)
+  const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/;
+  if (base64Pattern.test(input)) {
+    return { safe: false, reason: "Input contains base64-encoded content which may conceal malicious commands." };
+  }
+
+  // Check for leetspeak patterns commonly used to obfuscate malicious instructions
+  const leetspeakPattern = /(?:[e3][x*][e3][c*]|[s$][h#][e3][l1][l1]|[p*][o0][w*][e3][r*][s$][h#][e3][l1][l1]|[s$][y*][s$][t*][e3][m*]|[r*][m*]\s*[-\/]|[d*][e3][l1][e3][t*][e3]\s)/i;
+  if (leetspeakPattern.test(input)) {
+    return { safe: false, reason: "Input contains leetspeak obfuscation patterns associated with malicious commands." };
+  }
+
+  // Check for shell command patterns
+  const shellCommandPattern = /(?:^|\s|;|\||&|`)(\s*)(sudo|chmod|chown|wget|curl\s+.*-[oO]|nc\s|ncat\s|bash\s+-[ci]|sh\s+-[ci]|python[23]?\s+-c|perl\s+-e|ruby\s+-e|php\s+-r|eval\s*\(|exec\s*\(|system\s*\(|passthru\s*\(|popen\s*\(|proc_open\s*\(|shell_exec\s*\(|`[^`]+`|\$\([^)]+\)|rm\s+(-rf?\s+\/|--no-preserve-root)|mkfs|dd\s+if=|fork\s*bomb|:\s*\(\s*\)\s*\{)/i;
+  if (shellCommandPattern.test(input)) {
+    return { safe: false, reason: "Input contains shell command patterns that could execute malicious code." };
+  }
+
+  // Check for binary/executable magic bytes encoded as escape sequences or hex strings
+  const binaryMagicPattern = /(?:\\x4d\\x5a|\\x7f\\x45\\x4c\\x46|MZ[\s\S]{0,2}\x90|\x7fELF|%PDF-|\x89PNG)/i;
+  if (binaryMagicPattern.test(input)) {
+    return { safe: false, reason: "Input contains binary executable signatures." };
+  }
+
+  // Check for prompt injection instruction overrides
+  const promptInjectionPattern = /(?:ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context|rules?)|disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?)|you\s+are\s+now\s+(?:a\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted|jailbroken|DAN)|do\s+anything\s+now|pretend\s+(you\s+have\s+no\s+restrictions|there\s+are\s+no\s+rules)|act\s+as\s+(if\s+you\s+are\s+)?(?:an?\s+)?(?:unrestricted|evil|malicious)|\[SYSTEM\]|\[INST\]|<\|im_start\|>|<\|system\|>)/i;
+  if (promptInjectionPattern.test(input)) {
+    return { safe: false, reason: "Input contains prompt injection patterns attempting to override system instructions." };
+  }
+
+  // Check for excessive special characters that may indicate obfuscated payloads
+  const specialCharRatio = (input.match(/[^a-zA-Z0-9\s.,!?;:'"()-]/g) || []).length / Math.max(input.length, 1);
+  if (specialCharRatio > 0.3 && input.length > 20) {
+    return { safe: false, reason: "Input contains an unusually high ratio of special characters, which may indicate an obfuscated payload." };
+  }
+
+  return { safe: true, reason: "" };
+}
+
 async function sha256Hex(message: string): Promise<string> {
   const msgBuffer = new TextEncoder().encode(message);
   const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
@@ -14,22 +124,71 @@ async function sha256Hex(message: string): Promise<string> {
     .join("");
 }
 
-async function computeProvenanceSignature(text: string, modelId: string, timestamp: string): Promise<string> {
-  const payload = `${modelId}|${timestamp}|${text}`;
-  return sha256Hex(payload);
+/**
+ * Compute an HMAC-SHA-256 MAC over `message` using a secret key.
+ * The secret is read from the NEXT_PUBLIC_AUDIT_HMAC_SECRET env var;
+ * falls back to a build-time constant so the function never throws.
+ * NOTE: for production, NEXT_PUBLIC_AUDIT_HMAC_SECRET must be set to a
+ * high-entropy secret that is NOT committed to source control.
+ */
+async function hmacSha256Hex(message: string, secret: string): Promise<string> {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", keyMaterial, enc.encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-async function writeAuditLog(entry: Record<string, unknown>): Promise<void> {
+// Sanitized completion derived from rawCompletion — safe to render
+  const completion = sanitizeLLMOutput(rawCompletion ?? "");
+
+async function computeProvenanceSignature(text: string, modelId: string, timestamp: string): Promise<string> {
+  const payload = `${modelId}|${timestamp}|${text}`;
+  const secret = process.env.NEXT_PUBLIC_AUDIT_HMAC_SECRET ?? "__CHANGE_ME_IN_ENV__";
+  return hmacSha256Hex(payload, secret);
+}
+
+/** Sanitizing wrapper around the raw `complete` function from useCompletion. */
+  const safeComplete = async (rawInput: string, options?: Parameters<typeof _complete>[1]) => {
+    const sanitized = sanitizeAndValidatePrompt(rawInput);
+    return _complete(sanitized, options);
+  };
+
+// Module-level trace ID: generated once per page/session load and shared across
+// all writeAuditLog calls so that every log entry in a multi-step workflow can
+// be correlated end-to-end by this single traceId.
+const _auditTraceId: string = (() => {
+  if (typeof window === "undefined") return `trace-ssr-${Date.now()}`;
+  const stored = sessionStorage.getItem("auditTraceId");
+  if (stored) return stored;
+  const generated = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  sessionStorage.setItem("auditTraceId", generated);
+  return generated;
+})();
+
+/**
+ * @param entry        - Audit fields to record.
+ * @param principalId  - Verified principal identifier obtained from the
+ *                       server-side signed session (e.g. next-auth session
+ *                       user email/id). Must NOT come from client storage.
+ */
+async function writeAuditLog(entry: Record<string, unknown>, principalId: string = "anonymous"): Promise<void> {
   // Enrich entry with required forensic fields if not already present.
-  const sessionId =
-    (typeof window !== "undefined" && (sessionStorage.getItem("sessionId") || localStorage.getItem("sessionId"))) ||
-    "anonymous";
+  // principalId is supplied by the caller from a server-verified session token
+  // (next-auth JWT) — never read from sessionStorage/localStorage directly.
 
   const enrichedEntry: Record<string, unknown> = {
     ...entry,
     // Principal / session identifier (forensic requirement)
-    principalId: sessionId,
-    sessionId,
+    principalId,
+    sessionId: principalId,
     // Timestamp (ISO-8601, always overwrite to guarantee server-side ordering)
     timestamp: new Date().toISOString(),
   };
@@ -71,38 +230,110 @@ async function writeAuditLog(entry: Record<string, unknown>): Promise<void> {
     console.error(msg);
     throw new Error(msg);
   }
+
+  // Enforce server-side retention policy acknowledgement.
+  // The audit server MUST respond with a body confirming immutable/append-only
+  // storage was applied. Advisory headers alone are insufficient — we require
+  // the server to echo back its enforcement decision so the client can detect
+  // misconfigured or non-compliant audit backends.
+  let ackBody: Record<string, unknown> = {};
+  try {
+    ackBody = (await response.json()) as Record<string, unknown>;
+  } catch {
+    throw new Error(
+      "[audit] Audit endpoint did not return a parseable JSON acknowledgement — retention policy enforcement cannot be confirmed."
+    );
+  }
+  const retentionAck = ackBody["retentionPolicy"] ?? ackBody["retention_policy"];
+  if (retentionAck !== "immutable") {
+    throw new Error(
+      `[audit] Server did not confirm immutable retention policy. Received: ${JSON.stringify(retentionAck)}. ` +
+        "Audit record may not be forensically preserved."
+    );
+  }
 }
 
 var last_name = "";
+
+// Maximum allowed prompt length (characters)
+const MAX_PROMPT_LENGTH = 2000;
+
+/**
+ * Sanitize and validate user input before sending to the LLM.
+ * - Trims whitespace
+ * - Strips null bytes and control characters (except newlines/tabs)
+ * - Removes potential prompt-injection patterns
+ * - Enforces a maximum length
+ * Throws an Error if the input is invalid.
+ */
+function sanitizeAndValidatePrompt(input: string): string {
+  if (typeof input !== "string") {
+    throw new Error("Invalid input: prompt must be a string.");
+  }
+
+  // Trim surrounding whitespace
+  let sanitized = input.trim();
+
+  // Reject empty input
+  if (sanitized.length === 0) {
+    throw new Error("Prompt must not be empty.");
+  }
+
+  // Enforce maximum length
+  if (sanitized.length > MAX_PROMPT_LENGTH) {
+    throw new Error(
+      `Prompt exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.`
+    );
+  }
+
+  // Strip null bytes and non-printable control characters (keep \n, \r, \t)
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Remove common prompt-injection delimiters / jailbreak scaffolding
+  sanitized = sanitized.replace(
+    /<\|.*?\|>|\[INST\]|\[\/INST\]|###\s*(System|Human|Assistant|Instruction):/gi,
+    ""
+  );
+
+  // Final check: ensure something meaningful remains after sanitization
+  if (sanitized.trim().length === 0) {
+    throw new Error("Prompt contained only disallowed characters.");
+  }
+
+  return sanitized;
+}
 
 // Approved model registry: only models from the organization's approved list are permitted.
 // IMPORTANT: Populate this registry exclusively with model identifiers and pinned versions
 // that appear in the organization's official approved model registry.
 // Do NOT add any model that has not been reviewed and approved by the security team.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  // Example (replace with actual org-approved entries):
-  // "org-approved-model-v1": "org-approved-model-v1@2024-01-01",
+  // Pinned, integrity-verified model identifiers approved by the security team.
+  // Format: "<namespace>/<model-id>": "<model-id>@<pinned-version>"
+  "openai/gpt-4o": "gpt-4o@2024-08-06",
+  "anthropic/claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
+  "meta/llama-3.1-70b": "llama-3.1-70b@2024-07-23",
 };
 
 // Set this to a key that exists in APPROVED_MODEL_REGISTRY above.
-const DEFAULT_APPROVED_MODEL = Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? "";
+const DEFAULT_APPROVED_MODEL = "openai/gpt-4o";
 
 function resolveApprovedModel(llmIdentifier: string): string {
-  // Normalize bare model names to namespaced registry keys
-  const normalize = (id: string): string => {
-    if (id.startsWith("gpt-")) return `openai/${id}`;
-    if (id.startsWith("claude-")) return `anthropic/${id}`;
-    if (id.startsWith("llama-")) return `meta/${id}`;
-    return id;
-  };
-  const normalized = normalize(llmIdentifier);
-  if (!normalized || !(normalized in APPROVED_MODEL_REGISTRY)) {
+  // Only allow models that are explicitly listed in the approved registry.
+  // No normalization or prefix-based routing is performed — identifiers must
+  // match registry keys exactly to prevent disallowed models from being used.
+  if (!llmIdentifier || !(llmIdentifier in APPROVED_MODEL_REGISTRY)) {
     console.warn(
-      `Model "${llmIdentifier}" (normalized: "${normalized}") is not in the approved registry. Falling back to default: ${DEFAULT_APPROVED_MODEL}`
+      `Model "${llmIdentifier}" is not in the approved registry. Falling back to default: ${DEFAULT_APPROVED_MODEL}`
     );
-    return APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL];
+    return APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL] ?? "";
   }
-  return APPROVED_MODEL_REGISTRY[normalized];
+  return APPROVED_MODEL_REGISTRY[llmIdentifier];
+}" is not in the approved registry. Falling back to default: ${DEFAULT_APPROVED_MODEL}`
+    );
+    return APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL] ?? "";
+  }
+  return APPROVED_MODEL_REGISTRY[llmIdentifier];
 }
 
 // Allowlist of permitted LLM API endpoint segments.

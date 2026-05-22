@@ -2,11 +2,8 @@
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
 
 import dotenv from "dotenv";
-import { Document } from "langchain/document";
-import { AzureOpenAIEmbeddings } from "@langchain/openai";
-import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
+import { AzureOpenAI } from "openai";
 import { createClient } from "@supabase/supabase-js";
-import { CharacterTextSplitter } from "langchain/text_splitter";
 
 import fs from "fs";
 import path from "path";
@@ -400,17 +397,16 @@ if (sanitizedDocs.length === 0) {
   process.exit(1);
 }
 
-const docsToIndex = langchainDocs.flat().filter((doc) => doc !== undefined);
 console.log(
   JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_start",
     model: "HuggingFaceInferenceEmbeddings",
     action: "SupabaseVectorStore.fromDocuments",
-    documentCount: docsToIndex.length,
+    documentCount: sanitizedDocs.length,
   })
 );
-const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
+const filteredDocs = sanitizedDocs;
 
 // --- Audit: pre-action record ---
 const auditTimestamp = new Date().toISOString();
@@ -615,20 +611,41 @@ try {
     status: indexingOutcome,
     ...(indexingError && { error: indexingError }),
   };
-  appendAuditLog(auditLogPath, auditCompletionEntry);
-  console.log("[AUDIT] Indexing action completed:", JSON.stringify(auditCompletionEntry));
+  // Retention policy: rotate audit log when it exceeds MAX_AUDIT_LOG_BYTES.
+const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MB retention threshold
+const AUDIT_LOG_RETENTION_DAYS = 90;
+try {
+  const { statSync, renameSync } = await import("fs");
+  let stat;
+  try { stat = statSync(auditLogPath); } catch (_) { stat = null; }
+  if (stat && stat.size >= MAX_AUDIT_LOG_BYTES) {
+    const rotatedPath = `${auditLogPath}.${new Date().toISOString().replace(/[:.]/g, "-")}.rotated`;
+    renameSync(auditLogPath, rotatedPath);
+    appendAuditLog(auditLogPath, {
+      timestamp: new Date().toISOString(),
+      event: "audit_log_rotated",
+      rotatedTo: rotatedPath,
+      retentionDays: AUDIT_LOG_RETENTION_DAYS,
+      policy: `Logs older than ${AUDIT_LOG_RETENTION_DAYS} days should be purged per retention policy`,
+    });
+  }
+} catch (rotationErr) {
+  console.error("[AUDIT] Log rotation check failed:", rotationErr.message);
 }
+appendAuditLog(auditLogPath, auditCompletionEntry);
+console.log("[AUDIT] Indexing action completed:", JSON.stringify(auditCompletionEntry));
+
 // Emit the completion event with inputHash and principal so the causal chain
 // is complete and traceable back to the append-only audit log entries above.
-console.log(
-  JSON.stringify({
-    timestamp: new Date().toISOString(),
-    event: "llm_interaction_end",
-    model: "OpenAIEmbeddings",
-    action: "SupabaseVectorStore.fromDocuments",
-    status: indexingOutcome,
-    documentCount: docsToIndex.length,
-    inputHash,
-    principal,
-  })
-);
+const llmInteractionEndEntry = {
+  timestamp: new Date().toISOString(),
+  event: "llm_interaction_end",
+  model: APPROVED_EMBEDDING_MODEL_ID,
+  action: "SupabaseVectorStore.fromDocuments",
+  status: indexingOutcome,
+  documentCount: docsToIndex.length,
+  inputHash,
+  principal,
+};
+appendAuditLog(auditLogPath, llmInteractionEndEntry);
+console.log(JSON.stringify(llmInteractionEndEntry));

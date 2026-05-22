@@ -1,6 +1,4 @@
-import dotenv from "dotenv";
-
-dotenv.config({ path: `.env.local` });
+// Environment variables are handled by Next.js natively
 
 import { Fragment, useState } from "react";
 import { useSession } from "next-auth/react";
@@ -61,7 +59,6 @@ export default function TextToImgModal({
 
     return src;
   }
-  const { data: session } = useSession();
   const [loading, setLoading] = useState(false);
 
   /**

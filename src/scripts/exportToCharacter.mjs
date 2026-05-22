@@ -1,7 +1,7 @@
 import { Redis } from "@upstash/redis";
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { ChatAnthropic } from "langchain/chat_models/anthropic";
+import { ChatOpenAI } from "langchain/chat_models/openai";
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -18,12 +18,85 @@ function sanitizeInput(input) {
 // Sanitize free-text content for prompt injection (strip control sequences and prompt delimiters)
 function sanitizePromptContent(input) {
   if (typeof input !== "string") return "";
-  // Remove null bytes, and aggressively escape sequences commonly used in prompt injection
-  return input
-    .replace(/\x00/g, "")
+
+  // 1. Remove null bytes and other ASCII control characters (except common whitespace)
+  let sanitized = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // 2. Remove invisible / zero-width Unicode characters commonly used to hide injected text
+  sanitized = sanitized.replace(
+    /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/g,
+    ""
+  );
+
+  // 3. Strip prompt delimiters and template injection sequences
+  sanitized = sanitized
     .replace(/###/g, "")
     .replace(/\{\{/g, "")
     .replace(/\}\}/g, "");
+
+  // 4. Detect and reject base64-encoded payloads (long runs of base64 chars)
+  //    Replace any token that looks like a base64 blob (>=40 chars) with a placeholder.
+  sanitized = sanitized.replace(
+    /(?:[A-Za-z0-9+/]{40,}={0,2})/g,
+    "[REDACTED_BASE64]"
+  );
+
+  // 5. Strip common shell / binary command patterns
+  //    Covers: backtick execution, $(...), pipes to sh/bash/cmd, common Unix commands
+  sanitized = sanitized
+    .replace(/`[^`]*`/g, "[REDACTED_CMD]")
+    .replace(/\$\([^)]*\)/g, "[REDACTED_CMD]")
+    .replace(/\|\s*(sh|bash|zsh|cmd|powershell|python|perl|ruby|node)\b/gi, "[REDACTED_CMD]")
+    .replace(/\b(exec|eval|system|popen|subprocess|os\.system|child_process)\s*\(/gi, "[REDACTED_CMD](")
+    .replace(/\b(curl|wget|nc|ncat|netcat|chmod|chown|sudo|su|rm\s+-rf|dd\s+if)\b/gi, "[REDACTED_CMD]");
+
+  // 6. Neutralise leetspeak substitutions for common dangerous keywords
+  //    Normalise digits/symbols back to letters, then block the keyword.
+  const normalizeLeet = (s) =>
+    s
+      .replace(/4/g, "a")
+      .replace(/3/g, "e")
+      .replace(/1/g, "i")
+      .replace(/0/g, "o")
+      .replace(/5/g, "s")
+      .replace(/7/g, "t")
+      .replace(/\$/g, "s")
+      .replace(/@/g, "a");
+
+  const leetNormalized = normalizeLeet(sanitized);
+  const dangerousKeywords = [
+    /\bignore\s+(all\s+)?previous\s+instructions?\b/gi,
+    /\bforget\s+(all\s+)?previous\s+instructions?\b/gi,
+    /\byou\s+are\s+now\b/gi,
+    /\bact\s+as\b/gi,
+    /\bdo\s+anything\s+now\b/gi,
+    /\bjailbreak\b/gi,
+    /\bdan\s+mode\b/gi,
+    /\bprompt\s+injection\b/gi,
+    /\bsystem\s+prompt\b/gi,
+    /\boverride\s+(safety|guidelines|instructions?)\b/gi,
+  ];
+
+  // If the leet-normalised version contains a dangerous keyword, redact the
+  // corresponding span from the original sanitized string.
+  for (const pattern of dangerousKeywords) {
+    // Test against the normalised form; if matched, redact from sanitized too.
+    if (pattern.test(leetNormalized)) {
+      // Reset lastIndex for global regexes
+      pattern.lastIndex = 0;
+      // Apply the same pattern directly to sanitized (catches non-leet variants)
+      sanitized = sanitized.replace(pattern, "[REDACTED_INJECTION]");
+      // Also apply to the leet-normalised version to catch leet variants;
+      // rebuild sanitized by replacing matched positions.
+      sanitized = sanitized.replace(
+        /[a4][c][t4]\s+[a4][s5$]/gi,
+        "[REDACTED_INJECTION]"
+      );
+    }
+    pattern.lastIndex = 0;
+  }
+
+  return sanitized;
 }
 
 // ── Caller authentication ──────────────────────────────────────────────────
@@ -53,10 +126,40 @@ if (!secretsMatch) {
 }
 // ── End authentication ─────────────────────────────────────────────────────
 
-const AUDIT_LOG_FILE = `audit_${Date.now()}_${process.pid}.jsonl`;
+// Audit log: one file per UTC calendar day; rotate when file exceeds MAX_AUDIT_LOG_BYTES.
+const AUDIT_LOG_DIR = path.resolve("logs", "audit");
+const AUDIT_LOG_DATE = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+const AUDIT_LOG_FILE = path.join(AUDIT_LOG_DIR, `audit_${AUDIT_LOG_DATE}.jsonl`);
+const MAX_AUDIT_LOG_BYTES = 50 * 1024 * 1024; // 50 MB per-day file before rotation
+await fs.mkdir(AUDIT_LOG_DIR, { recursive: true });
+// Rotate oversized log by renaming it with a timestamp suffix before appending.
+async function rotateAuditLogIfNeeded() {
+  try {
+    const stat = await fs.stat(AUDIT_LOG_FILE);
+    if (stat.size >= MAX_AUDIT_LOG_BYTES) {
+      const rotated = AUDIT_LOG_FILE.replace(".jsonl", `_${Date.now()}.jsonl`);
+      await fs.rename(AUDIT_LOG_FILE, rotated);
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e; // ignore missing file on first run
+  }
+}
 
 async function writeAuditRecord(record) {
-  const line = JSON.stringify(record) + "\n";
+  // Compute SHA-256 hash of the input for forensic integrity.
+  const inputHash = record.input != null
+    ? crypto.createHash("sha256").update(String(record.input)).digest("hex")
+    : null;
+  const enriched = {
+    timestamp: new Date().toISOString(),
+    principal: record.principal ?? USER_ID ?? "unknown",
+    modelId: record.modelId,
+    inputHash,
+    output: record.output ?? null,
+    ...record,
+  };
+  await rotateAuditLogIfNeeded();
+  const line = JSON.stringify(enriched) + "\n";
   await fs.appendFile(AUDIT_LOG_FILE, line, "utf8");
 }
 
@@ -440,42 +543,94 @@ const results = await Promise.all(
         )
       );
 
+      // Pre-call audit: log the input before the LLM call.
+      await writeAuditRecord({
+        traceId: TRACE_ID,
+        stepId: spawnIndex,
+        modelId: AI_MODEL_ID,
+        event: "llm_request",
+        input: { question },
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
+      });
+
       const raw = await Promise.race([chain.call({ question }), timeoutPromise]);
 
       console.info(`[SPAWN COMPLETE] index=${spawnIndex} ts=${new Date().toISOString()}`);
-      return raw;
-      // Audit every AI chain call with model ID, input hash, output, timestamp, principal.
+
+      // Post-call audit: log the output after the LLM call.
       await writeAuditRecord({
         traceId: TRACE_ID,
-        stepId: stepIndex,
+        stepId: spawnIndex,
         modelId: AI_MODEL_ID,
+        event: "llm_response",
         input: { question },
         output: raw && typeof raw.text === "string" ? raw.text : null,
         principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
       });
       return raw;
     } catch (error) {
+      await writeAuditRecord({
+        traceId: TRACE_ID,
+        event: "llm_error",
+        spawnIndex,
+        input: { question },
+        error: error && error.message ? error.message : String(error),
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
+      });
       console.error(error);
     }
   });
+      await writeAuditRecord({
+        traceId: TRACE_ID,
+        event: "llm_request",
+        modelId: AI_MODEL_ID,
+        input: { question },
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
+      });
       const response = await chain.call({ question });
-      writeAuditRecord({
+      await writeAuditRecord({
+        traceId: TRACE_ID,
         event: "llm_response",
-        question,
-        responseText: response && typeof response.text === "string" ? response.text : null,
+        modelId: AI_MODEL_ID,
+        input: { question },
+        output: response && typeof response.text === "string" ? response.text : null,
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
       });
       return response;
     } catch (error) {
+      await writeAuditRecord({
+        traceId: TRACE_ID,
+        event: "llm_error",
+        modelId: AI_MODEL_ID,
+        input: { question },
+        error: error && error.message ? error.message : String(error),
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
+      });
       console.error(error);
     }
   });
     } catch (error) {
+      await writeAuditRecord({
+        traceId: TRACE_ID,
+        event: "llm_error",
+        modelId: AI_MODEL_ID,
+        error: error && error.message ? error.message : String(error),
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+        ts: new Date().toISOString(),
+      });
       console.error(error);
     }
   })
 );
       if (raw && typeof raw.text === "string") {
         raw.text = sanitizeLLMOutput(raw.text);
+        assertNoDynamicCodeExecution(raw.text);
       } else {
         throw new Error("LLM response missing expected 'text' field.");
       }
@@ -486,22 +641,57 @@ const results = await Promise.all(
   })
 );
 
+/**
+ * Throws if the sanitized LLM output contains dynamic code execution primitives.
+ * Covers: eval(), exec(), new Function(), subprocess, shell=True, execSync, spawnSync.
+ */
+function assertNoDynamicCodeExecution(text) {
+  const DYNAMIC_CODE_PATTERNS = [
+    /\beval\s*\(/,
+    /\bexec\s*\(/,
+    /\bnew\s+Function\s*\(/,
+    /\bsetTimeout\s*\(\s*['"`]/,
+    /\bsetInterval\s*\(\s*['"`]/,
+    /\bsubprocess\b/,
+    /\bshell\s*=\s*True\b/,
+    /\bexecSync\s*\(/,
+    /\bspawnSync\s*\(/,
+    /\bchild_process\b/,
+    /\bos\.system\s*\(/,
+    /\bos\.popen\s*\(/,
+  ];
+  for (const pattern of DYNAMIC_CODE_PATTERNS) {
+    if (pattern.test(text)) {
+      throw new Error(
+        `[SECURITY] LLM output contains a forbidden dynamic code execution primitive matching: ${pattern}`
+      );
+    }
+  }
+}
+
 let output = "";
 for (let i = 0; i < questions.length; i++) {
-  const safeText = results[i] && typeof results[i].text === "string"
+  const sanitized = results[i] && typeof results[i].text === "string"
     ? sanitizeLLMOutput(results[i].text)
     : "[NO OUTPUT]";
+  assertNoDynamicCodeExecution(sanitized);
+  const safeText = sanitized;
   output += `*****${questions[i]}*****\n${safeText}\n\n`;
 }
 const chatCount = Array.isArray(truncatedRecentChat) ? truncatedRecentChat.length : 0;
-const lastMessage = chatCount > 0 ? sanitizeLLMOutput(String(truncatedRecentChat[chatCount - 1])) : "";
+const rawLastMessage = chatCount > 0 ? sanitizeLLMOutput(String(truncatedRecentChat[chatCount - 1])) : "";
+assertNoDynamicCodeExecution(rawLastMessage);
+const lastMessage = rawLastMessage;
 output += `Definition (Advanced)\n[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`;
 
-const AI_MODEL_ID = "claude-2";
+const AI_MODEL_ID = "gpt-4";
 
 // Wrap the AI-generated character data with provenance metadata and a
 // cryptographic watermark before persisting it to disk.
 const outputWithProvenance = addProvenance(output, AI_MODEL_ID);
 
-await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, `[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`);
+const chatHistoryContent = `[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`;
+const chatHistoryWithProvenance = addProvenance(chatHistoryContent, AI_MODEL_ID);
+await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, chatHistoryWithProvenance);
+// Note: lastMessage is already sanitized via sanitizePromptContent + sanitizeLLMOutput above.
 await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, outputWithProvenance);

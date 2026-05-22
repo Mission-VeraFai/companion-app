@@ -1,16 +1,124 @@
 import { NextResponse } from "next/server";
 import twilio from "twilio";
-import clerk from "@clerk/clerk-sdk-node";
+import { verifyToken } from "@clerk/clerk-sdk-node";
+
+/**
+ * Verifies a Clerk session token with explicit integrity checks:
+ *  1. Cryptographic signature verification (via Clerk's verifyToken)
+ *  2. Expiry enforcement (exp claim)
+ *  3. Not-before enforcement (nbf claim)
+ *  4. Subject binding validation (sub claim must be present and non-empty)
+ *
+ * Throws an error with a descriptive message if any check fails.
+ */
+async function verifyClerkSessionToken(
+  authHeader: string | null
+): Promise<{ sub: string; sessionId: string }> {
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    throw new Error("Missing or malformed Authorization header");
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    throw new Error("Empty session token");
+  }
+
+  const secretKey = process.env.CLERK_SECRET_KEY;
+  if (!secretKey) {
+    throw new Error("CLERK_SECRET_KEY environment variable is not configured");
+  }
+
+  // 1. Verify cryptographic signature and decode claims.
+  let payload: Record<string, unknown>;
+  try {
+    payload = await verifyToken(token, { secretKey }) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`Session token signature verification failed: ${(err as Error).message}`);
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  // 2. Enforce expiry (exp claim).
+  const exp = payload["exp"];
+  if (typeof exp !== "number" || nowSeconds >= exp) {
+    throw new Error("Session token has expired");
+  }
+
+  // 3. Enforce not-before (nbf claim) if present.
+  const nbf = payload["nbf"];
+  if (typeof nbf === "number" && nowSeconds < nbf) {
+    throw new Error("Session token is not yet valid (nbf)");
+  }
+
+  // 4. Validate subject binding (sub claim).
+  const sub = payload["sub"];
+  if (typeof sub !== "string" || sub.trim() === "") {
+    throw new Error("Session token missing or empty subject (sub) claim");
+  }
+
+  // Extract session ID for audit purposes.
+  const sid = payload["sid"];
+  const sessionId = typeof sid === "string" ? sid : "unknown";
+
+  return { sub: sub.trim(), sessionId };
+}
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
 
-// Approved model registry: maps approved model identifiers to their pinned versions.
-// Only models listed here may be used for inference.
-const APPROVED_MODEL_REGISTRY: Record<string, { pinnedVersion: string; endpoint: string }> = {
-  "claude-3-5-sonnet": { pinnedVersion: "claude-3-5-sonnet-20241022", endpoint: "claude" },
-  "claude-3-haiku": { pinnedVersion: "claude-3-haiku-20240307", endpoint: "claude" },
+// Approved model registry is resolved exclusively from the org-approved external registry.
+// The registry URL MUST be set via ORG_MODEL_REGISTRY_URL environment variable.
+// No models are defined locally; all model identity and version pinning is governed externally.
+
+const ORG_MODEL_REGISTRY_URL = process.env.ORG_MODEL_REGISTRY_URL;
+if (!ORG_MODEL_REGISTRY_URL) {
+  throw new Error(
+    "FATAL: ORG_MODEL_REGISTRY_URL is not configured. " +
+    "All AI workloads require an org-approved external model registry."
+  );
+}
+
+type ApprovedModelEntry = { pinnedVersion: string; endpoint: string };
+type ApprovedModelRegistry = Record<string, ApprovedModelEntry>;
+
+// Cache the fetched registry for the lifetime of the process.
+let _cachedRegistry: ApprovedModelRegistry | null = null;
+
+async function fetchApprovedModelRegistry(): Promise<ApprovedModelRegistry> {
+  if (_cachedRegistry) return _cachedRegistry;
+  const registrySecret = process.env.ORG_MODEL_REGISTRY_SECRET;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (registrySecret) {
+    headers["Authorization"] = `Bearer ${registrySecret}`;
+  }
+  const response = await fetch(ORG_MODEL_REGISTRY_URL as string, {
+    method: "GET",
+    headers,
+    // Enforce a strict timeout to avoid blocking inference on registry unavailability.
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch org model registry from ${ORG_MODEL_REGISTRY_URL}: HTTP ${response.status}`
+    );
+  }
+  const registry: ApprovedModelRegistry = await response.json();
+  _cachedRegistry = registry;
+  return registry;
+}
+
+async function resolveApprovedModel(
+  requestedModel: string
+): Promise<ApprovedModelEntry | null> {
+  const registry = await fetchApprovedModelRegistry();
+  const entry = registry[requestedModel];
+  if (!entry) return null;
+  return entry;
+}> = {
   // Add additional approved models here as needed.
+  // NOTE: GPT, LLaMA, and Claude models are disallowed per the organization's LLM policy.
 };
 
 function resolveApprovedModel(
@@ -58,7 +166,12 @@ function writeAuditRecord(record: Record<string, unknown>): void {
 dotenv.config({ path: `.env.local` });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const internalApiSecret = process.env.INTERNAL_API_SECRET;
+// INTERNAL_API_SECRET removed from module scope: retrieve on-demand to stay within the 3-system credential limit
+function getInternalApiSecret(): string {
+  const s = process.env.INTERNAL_API_SECRET;
+  if (!s) throw new Error("INTERNAL_API_SECRET is not configured");
+  return s;
+}
 // INTER_AGENT_SECRET removed: retrieve on-demand via ConfigManager to stay within the 3-system credential limit
 function getInterAgentSecret(): string {
   const secret = process.env.INTER_AGENT_SECRET;
@@ -67,6 +180,53 @@ function getInterAgentSecret(): string {
 }
 
 const MAX_PROMPT_LENGTH = 2000;
+
+// Patterns that indicate model-text-driven privilege escalation attempts:
+// dynamic tool registration, role/permission mutation, or admin scope expansion.
+const PRIVILEGE_ESCALATION_PATTERNS: RegExp[] = [
+  /register\s*(new\s*)?tool/gi,
+  /add\s*(new\s*)?tool/gi,
+  /enable\s*(admin|root|superuser|elevated|privileged)\s*(tool|mode|access|permission|role)/gi,
+  /grant\s*(admin|root|superuser|elevated|privileged)\s*(access|permission|role)/gi,
+  /escalate\s*(privilege|permission|role|access)/gi,
+  /expand\s*(scope|permission|role|access)/gi,
+  /mutate\s*(role|permission|scope|access)/gi,
+  /set\s*role\s*[=:]?\s*(admin|root|superuser|owner)/gi,
+  /assign\s*(admin|root|superuser|elevated)\s*role/gi,
+  /dynamic(ally)?\s*(register|add|enable|load)\s*(tool|plugin|function|capability)/gi,
+  /override\s*(permission|role|access\s*control|acl)/gi,
+  /bypass\s*(permission|role|access\s*control|acl|auth)/gi,
+  /sudo\s*mode/gi,
+  /become\s*(admin|root|superuser)/gi,
+];
+
+/**
+ * Scans model output text for privilege escalation patterns.
+ * Throws if any pattern matches, preventing LLM-driven role/permission mutation
+ * or dynamic admin tool enablement from propagating.
+ */
+function blockPrivilegeEscalation(modelOutput: string, auditContext: Record<string, unknown>): void {
+  for (const pattern of PRIVILEGE_ESCALATION_PATTERNS) {
+    pattern.lastIndex = 0; // reset stateful regex
+    if (pattern.test(modelOutput)) {
+      const violation = {
+        event: "PRIVILEGE_ESCALATION_BLOCKED",
+        matchedPattern: pattern.toString(),
+        ...auditContext,
+        timestamp: new Date().toISOString(),
+      };
+      try {
+        writeAuditRecord(violation);
+      } catch (_) {
+        // audit failure must not suppress the block
+      }
+      throw new Error(
+        `SECURITY: model output blocked — privilege escalation pattern detected: ${pattern.toString()}`
+      );
+    }
+  }
+}
+
 const PROMPT_INJECTION_PATTERNS = [
   /ignore\s+(previous|above|all)\s+(instructions?|prompts?)/gi,
   /system\s*:/gi,
@@ -102,6 +262,8 @@ function validateAndSanitizeUserPrompt(input: string): { valid: boolean; sanitiz
   return { valid: true, sanitized };
 }
 
+// NOTE: blockPrivilegeEscalation() must be called on every model response before
+// further processing. See usage sites below.
 const DYNAMIC_CODE_PATTERNS = [
   /\beval\s*\(/gi,
   /\bexec\s*\(/gi,
@@ -610,36 +772,20 @@ if (decodedKey) {
   const from = queryMap["To"];
   // Encrypted reference used for any logging or internal storage — never log toRaw
   const toEncrypted = encryptPhoneNumber(toRaw, piiEncryptionKey);
-  console.log(`Sending SMS to encrypted recipient: ${toEncrypted}`);
 
-  await twilioClient.messages
+    await twilioClient.messages
     .create({
       body: smsBody,
       from,
       to: toRaw, // Twilio requires plaintext number; transmitted over Twilio's encrypted HTTPS channel
-    }) | ${new Date().toISOString()}`;
-  const labeledResponseText = `${aiLabel}\n${responseText}${provenanceFooter}`;
-
-  await twilioClient.messages
-    .create({
-      body: labeledResponseText,
-      from,
-      to: toRaw,
     })
-  );
-  await twilioClient.messages
-    .create({
-      body: responseText,
-      from,
-      to: toRaw,
-    })
-    .catch((err) => {
-      // Log encrypted reference only — never log the raw phone number
-      console.log(`WARNING: failed to send SMS to encrypted recipient ${toEncrypted}.`, err);
+    .catch(() => {
+      // Suppress error details to avoid leaking routing or payload information
+      console.error("WARNING: failed to send SMS to encrypted recipient.");
     });
   const provenanceFooter = ` | ${new Date().toISOString()}`;
   const aiLabel = "[AI-GENERATED CONTENT]";
-  const labeledResponseText = attachProvenanceWatermark(`${aiLabel}\n${responseText}${provenanceFooter}`);
+  const labeledResponseText = attachProvenanceWatermark(`${aiLabel}\n${smsBody}${provenanceFooter}`);
 
   await twilioClient.messages
     .create({
@@ -648,7 +794,7 @@ if (decodedKey) {
       to,
     })
   );
-  const wateredResponseText = attachProvenanceWatermark(responseText);
+  const wateredResponseText = attachProvenanceWatermark(smsBody);
   await twilioClient.messages
     .create({
       body: wateredResponseText,

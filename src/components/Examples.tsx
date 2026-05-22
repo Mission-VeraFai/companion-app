@@ -25,12 +25,11 @@ function getSafeImageUrl(url: string): string {
   }
 }
 
-// Approved model registry: only these pinned model identifiers are permitted
+// Approved model registry: only organization-approved model identifiers are permitted.
+// GPT and Claude models have been removed as they are not in the organization's approved list.
+// Add only models from the organization's approved list here.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  "gpt-4o-2024-08-06": "GPT-4o (2024-08-06)",
-  "gpt-4-turbo-2024-04-09": "GPT-4 Turbo (2024-04-09)",
-  "claude-3-5-sonnet-20241022": "Claude 3.5 Sonnet (2024-10-22)",
-  "claude-3-opus-20240229": "Claude 3 Opus (2024-02-29)",
+  // e.g. "org-approved-model-id": "Org Approved Model Display Name",
 };
 
 function resolveApprovedModel(llm: string): string | null {
@@ -64,12 +63,45 @@ export default function Examples() {
   ]);
 
   useEffect(() => {
-    const APPROVED_LLMS = ['gpt-4', 'gpt-4o', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku'];
-
     const fetchData = async () => {
       try {
         const companions = await getCompanions();
-        let entries = JSON.parse(companions);
+        // Validate parsed JSON: must be an array of plain objects with expected shape
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(companions);
+        } catch {
+          throw new Error('Invalid JSON from getCompanions');
+        }
+        if (!Array.isArray(parsed)) {
+          throw new Error('Companions response is not an array');
+        }
+        const ALLOWED_ENTRY_KEYS = new Set(['name', 'title', 'imageUrl', 'llm', 'phone', 'telegramLink']);
+        const entries = parsed.map((item: unknown, idx: number) => {
+          if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+            throw new Error(`Companion entry at index ${idx} is not a plain object`);
+          }
+          // Guard against prototype pollution
+          if (Object.prototype.hasOwnProperty.call(item, '__proto__') ||
+              Object.prototype.hasOwnProperty.call(item, 'constructor') ||
+              Object.prototype.hasOwnProperty.call(item, 'prototype')) {
+            throw new Error(`Companion entry at index ${idx} contains forbidden keys`);
+          }
+          const raw = item as Record<string, unknown>;
+          for (const key of Object.keys(raw)) {
+            if (!ALLOWED_ENTRY_KEYS.has(key)) {
+              throw new Error(`Companion entry at index ${idx} contains unexpected key: ${key}`);
+            }
+          }
+          return {
+            name:         typeof raw.name         === 'string' ? raw.name         : '',
+            title:        typeof raw.title        === 'string' ? raw.title        : '',
+            imageUrl:     typeof raw.imageUrl     === 'string' ? raw.imageUrl     : '',
+            llm:          typeof raw.llm          === 'string' ? raw.llm          : '',
+            phone:        typeof raw.phone        === 'string' ? raw.phone        : '',
+            telegramLink: typeof raw.telegramLink === 'string' ? raw.telegramLink : null,
+          };
+        });
                 let setme = entries.map((entry: any) => ({
           name: entry.name,
           title: entry.title,

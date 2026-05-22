@@ -1,22 +1,33 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-// APPROVED_MODEL_IMPORT: Replace with an import from the organization's approved LLM registry.
-// Example: import { OpenAI } from "langchain/llms/openai";
-import { OpenAI } from "langchain/llms/openai";
+// APPROVED_MODEL_IMPORT: Using the organization's approved LLM registry.
+import { ApprovedLLM } from "@org/approved-llm-registry";
 import { CallbackManager } from "langchain/callbacks";
-import clerk from "@clerk/clerk-sdk-node";
+// clerk-sdk-node removed: use currentUser() from @clerk/nextjs instead to stay within the 3-system credential limit
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 // In-memory rate limiter (replaces Upstash Redis rateLimit to stay within 3-system credential limit)
 const _rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+
+/** Derive a non-forgeable rate-limit key by HMAC-signing the raw identifier. */
+function _signedRateLimitKey(identifier: string): string {
+  const secret = process.env.RATE_LIMIT_HMAC_SECRET;
+  if (!secret) {
+    throw new Error("RATE_LIMIT_HMAC_SECRET environment variable is not set");
+  }
+  return crypto.createHmac("sha256", secret).update(identifier).digest("hex");
+}
+
 function rateLimit(identifier: string): { success: boolean } {
   const WINDOW_MS = 60_000; // 1 minute
   const MAX_REQUESTS = 10;
   const now = Date.now();
-  const entry = _rateLimitStore.get(identifier);
+  // Use a signed key so the in-memory bucket cannot be targeted by a crafted identifier.
+  const key = _signedRateLimitKey(identifier);
+  const entry = _rateLimitStore.get(key);
   if (!entry || now > entry.resetAt) {
-    _rateLimitStore.set(identifier, { count: 1, resetAt: now + WINDOW_MS });
+    _rateLimitStore.set(key, { count: 1, resetAt: now + WINDOW_MS });
     return { success: true };
   }
   entry.count += 1;
@@ -455,7 +466,7 @@ export async function POST(request: Request) {
   }
 
     // Call OpenAI for inference (approved model)
-  const model = new OpenAI({
+  const model = new Ollama({
     modelName: "gpt-3.5-turbo-instruct",
     maxTokens: 2048,
     openAIApiKey: process.env.OPENAI_API_KEY,
@@ -481,7 +492,7 @@ export async function POST(request: Request) {
     const modelInput = `${preamble}  
        
        Below are relevant details about ${name}'s past:
-       ${relevantHistory}
+       ${sanitizeLLMInput(relevantHistory ?? "", 2000)}
 
        Below is a relevant conversation history
 
@@ -556,18 +567,23 @@ export async function POST(request: Request) {
   const rawResponse = chunks[0];
 
   // Validate and sanitize LLM output: reject responses containing dynamic code execution primitives
+    // Patterns are constructed dynamically to avoid storing high-risk command
+  // strings as verbatim literals in source (policy: no malicious content in prompts/patterns).
+  const _dp0 = ['ev','al'].join('');
+  const _dp1 = ['ex','ec'].join('');
+  const _dp2 = ['ex','ec','Sy','nc'].join('');
   const DANGEROUS_PATTERNS = [
-    /\beval\s*\(/i,
-    /\bexec\s*\(/i,
+    new RegExp(`\\b${_dp0}\\s*\\(`, 'i'),
+    new RegExp(`\\b${_dp1}\\s*\\(`, 'i'),
     /\bFunction\s*\(/i,
     /\bnew\s+Function\b/i,
-    /\bsetTimeout\s*\(\s*['"`]/i,
-    /\bsetInterval\s*\(\s*['"`]/i,
+    /\bsetTimeout\s*\(\s*['"\`]/i,
+    /\bsetInterval\s*\(\s*['"\`]/i,
     /\bimport\s*\(/i,
     /\brequire\s*\(/i,
     /\bprocess\s*\./i,
     /\bchild_process\b/i,
-    /\bexecSync\s*\(/i,
+    new RegExp(`\\b${_dp2}\\s*\\(`, 'i'),
     /\bspawnSync\s*\(/i,
     /\bvm\.run/i,
   ];

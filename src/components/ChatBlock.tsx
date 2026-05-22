@@ -204,7 +204,69 @@ function sanitizeBlock(block: any): { text?: string; mimeType?: string; url?: st
     return sanitized;
 }
 
+// ---------------------------------------------------------------------------
+// Audit / decision-log helpers
+// ---------------------------------------------------------------------------
+
+/** Stable, non-cryptographic fingerprint of the raw completion value. */
+function hashInput(value: unknown): string {
+    const raw = typeof value === 'string' ? value : JSON.stringify(value);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < raw.length; i++) {
+        h ^= raw.charCodeAt(i);
+        h = (Math.imul(h, 0x01000193) >>> 0);
+    }
+    return h.toString(16).padStart(8, '0');
+}
+
+/**
+ * Writes an append-only audit record to sessionStorage under the key
+ * `ai_decision_log`.  Each entry captures:
+ *   - timestamp  : ISO-8601 wall-clock time
+ *   - principal  : authenticated user identifier (falls back to 'anonymous')
+ *   - modelId    : model identifier when available on the completion object
+ *   - inputHash  : FNV-1a fingerprint of the raw completion payload
+ *   - action     : the operation being audited
+ */
+function writeAuditRecord(action: string, completion: unknown): void {
+    try {
+        const record = {
+            timestamp: new Date().toISOString(),
+            principal:
+                (typeof window !== 'undefined' &&
+                    (window as any).__currentUser?.id) ??
+                'anonymous',
+            modelId:
+                (completion !== null &&
+                    typeof completion === 'object' &&
+                    !Array.isArray(completion) &&
+                    typeof (completion as any).model === 'string')
+                    ? (completion as any).model
+                    : 'unknown',
+            inputHash: hashInput(completion),
+            action,
+        };
+
+        // Append to the in-session log (survives page navigation within the tab).
+        const existing = sessionStorage.getItem('ai_decision_log');
+        const log: unknown[] = existing ? JSON.parse(existing) : [];
+        log.push(record);
+        sessionStorage.setItem('ai_decision_log', JSON.stringify(log));
+
+        // Also emit a structured console entry so server-side log aggregators
+        // (e.g. Datadog browser SDK) can capture it.
+        console.info('[AI_AUDIT]', JSON.stringify(record));
+    } catch (err) {
+        // Never let audit failures break the rendering path.
+        console.error('[AI_AUDIT] Failed to write audit record', err);
+    }
+}
+// ---------------------------------------------------------------------------
+
 export function responseToChatBlocks(completion: any) {
+    // Emit a forensic audit record before any processing occurs.
+    writeAuditRecord('responseToChatBlocks', completion);
+
     // First we try to parse completion as JSON in case we're dealing with an object.
     console.log("got completoin", completion, typeof completion)
     if (typeof completion == "string") {

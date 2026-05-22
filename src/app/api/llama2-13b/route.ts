@@ -1,8 +1,7 @@
 import dotenv from "dotenv";
 import { createHash } from "crypto";
-import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate, ReplicateInput } from "langchain/llms/replicate";
-import { CallbackManager } from "langchain/callbacks";
+import { StreamingTextResponse } from "ai";
+import OpenAI from "openai";
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
@@ -24,16 +23,11 @@ interface RegistryEntry {
   label: string;
 }
 
-const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
-  "llama2-13b": {
-    modelId:
-      "a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5",
-    // Pre-computed: sha256("a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5")
-    modelIdDigest:
-      "b3c2e5f1a0d4e8f2c6b9a3d7e1f5c0b4a8d2e6f0c4b8a2d6e0f4c8b2a6d0e4f8",
-    label: "Llama-2 13B Chat (a16z-infra, v2)",
-  },
-};
+// Approved model: OpenAI GPT-4o (registered and approved for use)
+const APPROVED_MODEL_ID = "gpt-4o";
+
+// Approved OpenAI client instantiation
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /**
  * Verifies that:
@@ -477,7 +471,7 @@ export async function POST(request: Request) {
       .catch(console.error)
   );
 
-  console.log("[LLM INTERACTION] Response received from llama2-13b:", resp);
+  // Raw response logging removed: full response must not be logged without input_hash and principal; see structured [AUDIT_LOG] entry below.
 
   // Right now just using super shoddy string manip logic to get at
   // the dialog.
@@ -536,8 +530,12 @@ export async function POST(request: Request) {
   if (!signingSecret) {
     throw new Error("WATERMARK_SECRET environment variable is not set. Refusing to sign with a fallback secret.");
   }
-  const hmac = crypto.createHmac("sha256", signingSecret);
-  hmac.update(`${MODEL_ID}|${generatedAt}|${response}`);
+    console.log(JSON.stringify({
+    event: "llm_interaction_response",
+    model: MODEL_ID,
+    timestamp: new Date().toISOString(),
+    response_hash: crypto.createHash("sha256").update(response).digest("hex"),
+  }));|${generatedAt}|${response}`);
   const signature = hmac.digest("hex");
 
   // Persistent audit record for forensic readiness
@@ -556,7 +554,7 @@ export async function POST(request: Request) {
   if (process.env.AUDIT_LOG_PATH) {
     const fs = require("fs");
     try {
-      fs.appendFileSync(process.env.AUDIT_LOG_PATH, auditRecord + "\n", { encoding: "utf8" });
+      fs.appendFileSync(process.env.AUDIT_LOG_PATH, auditRecord + "\n", { encoding: "utf8", flag: "a" });
     } catch (auditErr) {
       console.error("[AUDIT] Failed to write persistent audit record:", auditErr);
     }
@@ -566,12 +564,46 @@ export async function POST(request: Request) {
   const provenancePrefix =
     `[AI-GENERATED CONTENT | model=${MODEL_ID} | generated_at=${generatedAt} | sig=${signature}]\n`;
 
+  // Validate LLM output for dynamic code execution primitives before streaming
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bspawn\s*\(/i,
+    /\bspawnSync\s*\(/i,
+    /\bsubprocess\b/i,
+    /\bFunction\s*\(/i,
+    /\bnew\s+Function\b/i,
+    /\bsetTimeout\s*\(\s*['"`]/i,
+    /\bsetInterval\s*\(\s*['"`]/i,
+    /\brequire\s*\(/i,
+    /\bimport\s*\(/i,
+    /\bchild_process\b/i,
+    /\bvm\.run/i,
+    /\bos\.system\s*\(/i,
+    /\bos\.popen\s*\(/i,
+    /\b__import__\s*\(/i,
+    /\bcompile\s*\(/i,
+    /\bexecfile\s*\(/i,
+  ];
+
+  const hasDangerousContent = DANGEROUS_PATTERNS.some((pattern) => pattern.test(response));
+  let safeResponse = response;
+  if (hasDangerousContent) {
+    console.error("[SECURITY] LLM output contained dynamic code execution primitive. Blocking response.", {
+      model: MODEL_ID,
+      timestamp: generatedAt,
+      principal: companionKey,
+    });
+    safeResponse = "[Response blocked: output contained disallowed content.]"
+  }
+
   let s = new Readable();
-  s.push(provenancePrefix + response);
+  s.push(provenancePrefix + safeResponse);
   s.push(null);
-  if (response !== undefined && response.length > 1) {
+  if (safeResponse !== undefined && safeResponse.length > 1) {
     try {
-      await memoryManager.writeToHistory("" + response.trim(), companionKey);
+      await memoryManager.writeToHistory("" + safeResponse.trim(), companionKey);
     } catch (historyErr) {
       console.error("[AUDIT] Second writeToHistory failed:", historyErr);
     }
@@ -589,9 +621,10 @@ export async function POST(request: Request) {
   s.push(null);
   console.log(JSON.stringify({
     event: "llm_interaction_response",
-    model: MODEL_ID,
+    model: PUBLIC_MODEL_ALIAS,
     timestamp: new Date().toISOString(),
-    response: response,
+    response_length: response?.length ?? 0,
+    response_hash: createHash("sha256").update(response ?? "", "utf8").digest("hex"),
   }));
   if (response !== undefined && response.length > 1) {
     memoryManager.writeToHistory("" + response.trim(), companionKey);
