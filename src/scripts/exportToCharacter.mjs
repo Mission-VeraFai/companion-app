@@ -1,7 +1,7 @@
 import { Redis } from "@upstash/redis";
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { OpenAI } from "langchain/llms/openai";
+import { ChatAnthropic } from "langchain/chat_models/anthropic";
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -70,7 +70,13 @@ async function writeAuditRecord(record) {
  */
 function addProvenance(content, modelId) {
   const timestamp = new Date().toISOString();
-  const secret = process.env.PROVENANCE_HMAC_SECRET || "default-provenance-secret";
+  const secret = process.env.PROVENANCE_HMAC_SECRET;
+  if (!secret) {
+    throw new Error(
+      "Configuration error: PROVENANCE_HMAC_SECRET is not set in the environment. " +
+      "Set it in .env.local before running this script."
+    );
+  }
   const signature = crypto
     .createHmac("sha256", secret)
     .update(content)
@@ -86,9 +92,31 @@ function addProvenance(content, modelId) {
   return header + content;
 }
 
+// ── Approved model registry ───────────────────────────────────────────────
+// Only models listed here may be used. Values are pinned/immutable model IDs.
+// To add a model, it must be reviewed and approved before being added here.
+const APPROVED_MODEL_REGISTRY = Object.freeze({
+  "gpt-3.5-turbo-16k": "gpt-3.5-turbo-16k-0613",  // pinned snapshot, not a mutable tag
+  "gpt-4":             "gpt-4-0613",
+  "gpt-4-turbo":       "gpt-4-0125-preview",
+});
+
 const COMPANION_NAME_RAW = process.argv[2];
-const MODEL_NAME = process.argv[3];
+const MODEL_NAME_RAW = process.argv[3];
 const USER_ID = process.argv[4];
+
+// Validate MODEL_NAME against the approved registry before any use.
+if (!MODEL_NAME_RAW || !Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, MODEL_NAME_RAW)) {
+  throw new Error(
+    `Model identity violation: '${MODEL_NAME_RAW}' is not in the approved model registry. ` +
+    `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+  );
+}
+
+// MODEL_NAME is the registry-validated alias; AI_MODEL_ID is the pinned model ID.
+const MODEL_NAME = MODEL_NAME_RAW;
+const AI_MODEL_ID = APPROVED_MODEL_REGISTRY[MODEL_NAME];
+// ── End model registry validation ─────────────────────────────────────────
 
 // Sanitize a string before it is embedded in an LLM prompt.
 // Removes non-printable/binary bytes, strips common prompt-injection
@@ -268,15 +296,27 @@ const chainPrompt = PromptTemplate.fromTemplate(`
   
   {question}`);
 
-// Explicit tool allow list — this chain requires no external tools.
-// Add tool names here if tools are introduced in the future.
-const ALLOWED_TOOLS = [];
+// Explicit tool allow list — this chain is intentionally restricted to zero tools.
+// To permit tools in the future, add their exact string names to this array.
+// An empty array here means NO tools are allowed; any tool request will be rejected.
+const ALLOWED_TOOLS = Object.freeze([]);
 
 /**
  * Enforces the tool allow list before any chain invocation.
- * Throws if any tool not in ALLOWED_TOOLS is requested.
+ * - If ALLOWED_TOOLS is empty, NO tools are permitted and any non-empty
+ *   requestedTools array will throw.
+ * - If ALLOWED_TOOLS is non-empty, only listed tools are permitted.
+ * @param {string[]} requestedTools - The tools the caller intends to use.
  */
 function enforceToolAllowList(requestedTools = []) {
+  if (!Array.isArray(requestedTools)) {
+    throw new Error("enforceToolAllowList: requestedTools must be an array.");
+  }
+  if (ALLOWED_TOOLS.length === 0 && requestedTools.length > 0) {
+    throw new Error(
+      `Tool allow-list violation: this chain permits NO tools, but the following were requested: ${requestedTools.join(", ")}`
+    );
+  }
   const unauthorized = requestedTools.filter(
     (tool) => !ALLOWED_TOOLS.includes(tool)
   );
@@ -288,7 +328,8 @@ function enforceToolAllowList(requestedTools = []) {
 }
 
 // Validate that no tools are being used beyond the allow list before constructing the chain.
-enforceToolAllowList([]);
+// This chain uses no tools; passing an empty array asserts the no-tool policy is in effect.
+enforceToolAllowList(/* requestedTools= */ []);
 
 const chain = new LLMChain({
   llm: model,
@@ -303,13 +344,14 @@ function sanitizeLLMOutput(text) {
     throw new Error("LLM output is not a string.");
   }
 
-  // Patterns that indicate dynamic code execution primitives
+    // Patterns that indicate dynamic code execution primitives
   const dangerousPatterns = [
+    // JavaScript dynamic execution
     /\beval\s*\(/gi,
     /\bexec\s*\(/gi,
     /\bnew\s+Function\s*\(/gi,
-    /\bsetTimeout\s*\(\s*['"`]/gi,
-    /\bsetInterval\s*\(\s*['"`]/gi,
+    /\bsetTimeout\s*\(\s*['"\`]/gi,
+    /\bsetInterval\s*\(\s*['"\`]/gi,
     /\bimport\s*\(/gi,
     /\brequire\s*\(/gi,
     /\bprocess\.binding\s*\(/gi,
@@ -317,6 +359,29 @@ function sanitizeLLMOutput(text) {
     /\bspawn\s*\(/gi,
     /\bexecSync\s*\(/gi,
     /\bexecFile\s*\(/gi,
+    // Python dynamic execution primitives
+    /\bsubprocess\b/gi,
+    /shell\s*=\s*True/gi,
+    /\bos\.system\s*\(/gi,
+    /\bos\.popen\s*\(/gi,
+    /\bos\.execv\s*\(/gi,
+    /\bos\.execve\s*\(/gi,
+    /\b__import__\s*\(/gi,
+    /\bcompile\s*\([^)]*exec/gi,
+    /\bexecfile\s*\(/gi,
+    // Dynamic attribute/introspection abuse
+    /\bgetattr\s*\([^)]*__/gi,
+    /\b__builtins__/gi,
+    /\b__globals__/gi,
+    /\b__class__\s*\.__/gi,
+    /\b__subclasses__\s*\(/gi,
+    /\bglobals\s*\(\s*\)/gi,
+    /\blocals\s*\(\s*\)/gi,
+    /\bvars\s*\(\s*\)/gi,
+    // Base64-encoded eval bypass attempts
+    /\batob\s*\(/gi,
+    /\bBuffer\.from\s*\([^)]*base64/gi,
+    /\bbase64\.b64decode/gi,
   ];
 
   for (const pattern of dangerousPatterns) {
@@ -342,12 +407,64 @@ const questions = [
 ];
 const sanitizedRecentChat = recentChat.map((msg) => sanitizeForPrompt(String(msg))).join("\n");
 
+// Single trace ID correlates all chain.call steps for end-to-end reconstruction.
+const TRACE_ID = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}`;
+
+// Resource-bound constants for subagent spawning
+const MAX_SPAWN_COUNT = 10;       // hard cap on number of concurrent subagent calls
+const SPAWN_TIMEOUT_MS = 30_000;  // 30-second per-call timeout
+
+if (questions.length > MAX_SPAWN_COUNT) {
+  throw new Error(
+    `[SECURITY] Spawn count cap exceeded: ${questions.length} questions requested, max allowed is ${MAX_SPAWN_COUNT}.`
+  );
+}
+
 const results = await Promise.all(
-    questions.map(async (question) => {
+  questions.map(async (question, spawnIndex) => {
     try {
       // Re-enforce allow list at call time to guard against runtime tool injection.
-      enforceToolAllowList([]);
-      return await chain.call({ question });
+      // Pass the actual set of tools being used (none) to assert the no-tool policy.
+      enforceToolAllowList(/* requestedTools= */ []);
+
+      // Traceability: log each subagent spawn with its index and a timestamp.
+      console.info(
+        `[SPAWN] index=${spawnIndex}/${questions.length - 1} ts=${new Date().toISOString()} question=${JSON.stringify(question)}`
+      );
+
+      // Enforce a hard timeout on each LLM call to prevent unbounded execution.
+      const timeoutPromise = new Promise((_resolve, reject) =>
+        setTimeout(
+          () => reject(new Error(`[TIMEOUT] Spawn index ${spawnIndex} exceeded ${SPAWN_TIMEOUT_MS}ms limit.`)),
+          SPAWN_TIMEOUT_MS
+        )
+      );
+
+      const raw = await Promise.race([chain.call({ question }), timeoutPromise]);
+
+      console.info(`[SPAWN COMPLETE] index=${spawnIndex} ts=${new Date().toISOString()}`);
+      return raw;
+      // Audit every AI chain call with model ID, input hash, output, timestamp, principal.
+      await writeAuditRecord({
+        traceId: TRACE_ID,
+        stepId: stepIndex,
+        modelId: AI_MODEL_ID,
+        input: { question },
+        output: raw && typeof raw.text === "string" ? raw.text : null,
+        principal: process.env.AUDIT_PRINCIPAL || "system",
+      });
+      return raw;
+    } catch (error) {
+      console.error(error);
+    }
+  });
+      const response = await chain.call({ question });
+      writeAuditRecord({
+        event: "llm_response",
+        question,
+        responseText: response && typeof response.text === "string" ? response.text : null,
+      });
+      return response;
     } catch (error) {
       console.error(error);
     }
@@ -376,13 +493,15 @@ for (let i = 0; i < questions.length; i++) {
     : "[NO OUTPUT]";
   output += `*****${questions[i]}*****\n${safeText}\n\n`;
 }
-output += `Definition (Advanced)\n${truncatedRecentChat.join("\n")}`;
+const chatCount = Array.isArray(truncatedRecentChat) ? truncatedRecentChat.length : 0;
+const lastMessage = chatCount > 0 ? sanitizeLLMOutput(String(truncatedRecentChat[chatCount - 1])) : "";
+output += `Definition (Advanced)\n[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`;
 
-const AI_MODEL_ID = "gpt-3.5-turbo-16k";
+const AI_MODEL_ID = "claude-2";
 
 // Wrap the AI-generated character data with provenance metadata and a
 // cryptographic watermark before persisting it to disk.
 const outputWithProvenance = addProvenance(output, AI_MODEL_ID);
 
-await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, truncatedRecentChat.join("\n"));
+await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, `[Chat history summary: ${chatCount} message(s). Most recent: ${lastMessage}]`);
 await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, outputWithProvenance);
