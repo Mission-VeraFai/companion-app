@@ -39,7 +39,7 @@ export default function Examples() {
         }));
         setExamples(setme);
       } catch (err) {
-        console.log(err);
+        console.error('Failed to fetch companions data');
       }
     };
 
@@ -83,8 +83,8 @@ export default function Examples() {
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
                   {example.title}. Running on <b>{example.llm}</b>.
-                  {example.telegramLink && (
-                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault}} href={example.telegramLink}>Chat on <b>Telegram</b></a>.</span>
+                  {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
+                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}
                 </dd>
               </dl>
@@ -96,7 +96,7 @@ export default function Examples() {
                       data-tip="Helpful tip goes here"
                       className="text-sm text-slate-400 inline-block"
                     >
-                      📱Text me at: <b>{example.phone}</b>
+                      📱Text me at: <b>{maskPhone(example.phone)}</b>
                       &nbsp;
                       <svg
                         data-tooltip-id="help-tooltip"
@@ -128,4 +128,42 @@ export default function Examples() {
 function isPhoneNumber(input: string): boolean {
   const phoneNumberRegex = /^\+\d{1,11}$/;
   return phoneNumberRegex.test(input);
+}
+
+function sanitizeTelegramLink(url: string): string | undefined {
+  if (!url || typeof url !== 'string') return undefined;
+  const trimmed = url.trim();
+  const allowedPrefixes = ['https://t.me/', 'https://telegram.me/'];
+  if (allowedPrefixes.some((prefix) => trimmed.startsWith(prefix))) {
+    return trimmed;
+  }
+  return undefined;
+}
+
+const ALLOWED_TELEGRAM_HOSTNAMES = ['t.me', 'telegram.me'];
+
+function isSafeTelegramUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      ALLOWED_TELEGRAM_HOSTNAMES.includes(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function maskPhone(phone: string): string {
+  if (!phone || phone.length < 4) return "****";
+  const visible = phone.slice(-4);
+  const masked = phone.slice(0, phone.length - 4).replace(/\d/g, "*");
+  return masked + visible;
+}
+
+function maskPhone(phone: string): string {
+  if (!phone || phone.length <= 4) return phone;
+  const visible = phone.slice(-4);
+  const masked = phone.slice(0, phone.length - 4).replace(/\d/g, '*');
+  return masked + visible;
 }
