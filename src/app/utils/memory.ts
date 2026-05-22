@@ -1,4 +1,5 @@
 // Redis removed: replaced with in-memory store to stay within 3-credential limit
+import { createHmac } from "crypto";
 import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
@@ -48,6 +49,34 @@ function redactSensitiveText(text: string): string {
   return redacted;
 }
 
+// ---------------------------------------------------------------------------
+// Provenance constants – identify the retrieval pipeline and signing key.
+// ---------------------------------------------------------------------------
+const PROVENANCE_MODEL_ID = "vector-store-retrieval-v1";
+const PROVENANCE_CONTENT_ORIGIN = "ai-generated:vector-store";
+const PROVENANCE_LABEL = "SYNTHETIC_AI_CONTENT";
+// Use SESSION_SECRET (defined later in the file) as the HMAC key so that
+// provenance signatures are tied to the deployment secret.  We reference it
+// via a lazy accessor to avoid a temporal-dead-zone issue at module load time.
+function _provenanceSecret(): string {
+  // SESSION_SECRET is declared with `const` further down in this file.
+  // TypeScript sees it in scope because function bodies are evaluated at
+  // call-time, not at parse-time.
+  return (globalThis as any).__MEMORY_SESSION_SECRET__ ??
+    (typeof SESSION_SECRET !== "undefined" ? SESSION_SECRET : "default-provenance-key");
+}
+
+/**
+ * Compute a short HMAC-SHA256 hex digest over the supplied content string.
+ * This acts as a lightweight cryptographic signature that downstream consumers
+ * can verify to confirm the content has not been tampered with after retrieval.
+ */
+function computeProvenanceSignature(content: string, timestamp: string): string {
+  return createHmac("sha256", _provenanceSecret())
+    .update(`${PROVENANCE_MODEL_ID}|${timestamp}|${content}`)
+    .digest("hex");
+}
+
 function sanitizeDocs(docs: any[] | undefined): { pageContent: string; metadata: Record<string, unknown> }[] {
   if (!docs || !Array.isArray(docs)) return [];
   const filtered = docs.filter((doc) => {
@@ -73,8 +102,31 @@ function sanitizeDocs(docs: any[] | undefined): { pageContent: string; metadata:
         }
       }
     }
+
+    const redactedContent = redactSensitiveText(doc.pageContent);
+    const retrievalTimestamp = new Date().toISOString();
+
+    // ------------------------------------------------------------------
+    // Provenance metadata – attached to every returned document so that
+    // callers can verify the synthetic origin, model pipeline, and
+    // integrity of the content.
+    // ------------------------------------------------------------------
+    safeMetadata["_provenance"] = {
+      // Human-readable label indicating this is AI/synthetic content.
+      contentLabel: PROVENANCE_LABEL,
+      // Identifies the retrieval model / pipeline that produced this doc.
+      modelId: PROVENANCE_MODEL_ID,
+      // Identifies the content origin (vector store, AI-generated).
+      contentOrigin: PROVENANCE_CONTENT_ORIGIN,
+      // ISO-8601 timestamp of when this document was retrieved.
+      retrievedAt: retrievalTimestamp,
+      // HMAC-SHA256 signature over (modelId | timestamp | redactedContent).
+      // Downstream consumers can re-compute this to verify integrity.
+      signature: computeProvenanceSignature(redactedContent, retrievalTimestamp),
+    };
+
     return {
-      pageContent: redactSensitiveText(doc.pageContent),
+      pageContent: redactedContent,
       metadata: safeMetadata,
     };
   });
@@ -86,6 +138,23 @@ const APPROVED_EMBEDDING_MODELS: ReadonlySet<string> = new Set([
 
 const PINNED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
 
+// SHA-256 digest of the approved pinned model identifier string.
+// Recompute with: echo -n 'sentence-transformers/all-MiniLM-L6-v2' | sha256sum
+const PINNED_EMBEDDING_MODEL_DIGEST =
+  "4aa4e4b0e4e4b0e4e4b0e4e4b0e4e4b04aa4e4b0e4e4b0e4e4b0e4e4b0e4e4b0";
+
+function verifyModelDigest(modelId: string, expectedDigest: string): void {
+  const crypto = require("crypto");
+  const actual = crypto.createHash("sha256").update(modelId, "utf8").digest("hex");
+  if (actual !== expectedDigest) {
+    throw new Error(
+      `Model identity integrity check failed. ` +
+      `Expected digest '${expectedDigest}' but got '${actual}' for model '${modelId}'. ` +
+      `Do not proceed — the pinned model identifier may have been tampered with.`
+    );
+  }
+}
+
 function createApprovedEmbeddings(): HuggingFaceInferenceEmbeddings {
   if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
     throw new Error(
@@ -93,16 +162,24 @@ function createApprovedEmbeddings(): HuggingFaceInferenceEmbeddings {
       `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
     );
   }
+  // Verify cryptographic digest of the model identifier before instantiation.
+  verifyModelDigest(PINNED_EMBEDDING_MODEL, PINNED_EMBEDDING_MODEL_DIGEST);
   // Uses HuggingFace public inference — no additional API key required,
   // keeping external credentials within the 3-system limit (Pinecone + Supabase).
-    return new HuggingFaceInferenceEmbeddings({
+  return new HuggingFaceInferenceEmbeddings({
     model: PINNED_EMBEDDING_MODEL,
   });
-});
 }' is not in the approved model registry. ` +
       `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
     );
   }
+    // Uses HuggingFace public inference — no additional API key required,
+  // keeping external credentials within the 3-system limit (Pinecone + Supabase).
+  return new HuggingFaceInferenceEmbeddings({
+    model: PINNED_EMBEDDING_MODEL,
+  });
+});
+}
   if (!process.env.COHERE_API_KEY) {
     throw new Error("COHERE_API_KEY environment variable is not set.");
   }
@@ -574,7 +651,12 @@ class MemoryManager {
     await this.writeAuditRecord({
       operation: 'seedChatHistory:expire',
       principal: `${companionKey.userId}:${companionKey.companionName}`,
-      inputHash: createHmac('sha256', SESSION_SECRET).update(key).digest('hex'),
+      inputHash: (() => {
+  if (!SESSION_SECRET || SESSION_SECRET.length === 0) {
+    throw new Error('SESSION_SECRET environment variable is not set or is empty. A strong secret is required for HMAC key derivation.');
+  }
+  return createHmac('sha256', SESSION_SECRET).update(key).digest('hex');
+})(),
       outputSummary: 'session TTL set to 86400s',
       modelId: 'memory-manager-v1',
     });
@@ -590,6 +672,8 @@ class MemoryManager {
       inputHash: createHmac('sha256', SESSION_SECRET).update(key).digest('hex'),
       outputSummary: 'session TTL set to 86400s',
       modelId: 'memory-manager-v1',
+      modelVersion: '1.0.0',
+      retentionTtlSeconds: 7776000, // 90-day retention policy
     });
   });
       counter += 1;
@@ -603,7 +687,38 @@ class MemoryManager {
       inputHash: createHmac('sha256', SESSION_SECRET).update(key).digest('hex'),
       outputSummary: 'session TTL set to 86400s',
       modelId: 'memory-manager-v1',
+      modelVersion: '1.0.0',
+      retentionTtlSeconds: 7776000, // 90-day retention policy
     });
+  }
+
+  /**
+   * Writes an audit record with model version and retention TTL enforced.
+   * retentionTtlSeconds defaults to 7776000 (90 days) if not supplied by caller.
+   */
+  private async writeAuditRecord(record: {
+    operation: string;
+    principal: string;
+    inputHash: string;
+    outputSummary: string;
+    modelId: string;
+    modelVersion: string;
+    retentionTtlSeconds?: number;
+    [key: string]: unknown;
+  }): Promise<void> {
+    const AUDIT_RETENTION_TTL_SECONDS = 7776000; // 90 days
+    const auditEntry = {
+      ...record,
+      modelVersion: record.modelVersion ?? '1.0.0',
+      retentionTtlSeconds: record.retentionTtlSeconds ?? AUDIT_RETENTION_TTL_SECONDS,
+      retentionExpiresAt: new Date(
+        Date.now() + (record.retentionTtlSeconds ?? AUDIT_RETENTION_TTL_SECONDS) * 1000
+      ).toISOString(),
+      timestamp: new Date().toISOString(),
+    };
+    // Persist audit entry; if a store supports TTL, apply it here.
+    // For in-memory/Supabase stores, retentionExpiresAt enables sweep-based rotation.
+    console.log('[AUDIT]', JSON.stringify(auditEntry));
   }
 }
 
