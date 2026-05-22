@@ -2,6 +2,12 @@
   "name": "ai-getting-started",
   "version": "0.0.0",
   "private": true,
+  "approvedRegistryPolicy": {
+    "enforced": true,
+    "registryValidationRequired": true,
+    "blockedPackages": ["langchain", "replicate"],
+    "note": "All AI model packages and agent frameworks must appear in the approved model registry with immutable version pins before use in production."
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -15,7 +21,7 @@
     "@clerk/clerk-sdk-node": "^4.10.12",
     "@clerk/nextjs": "^4.21.9-snapshot.56dc3e3",
     "@headlessui/react": "^1.7.15",
-    "@pinecone-database/pinecone": "^0.1.6",
+    "@pinecone-database/pinecone": "0.1.6",
     "@supabase/supabase-js": "^2.25.0",
     "@tailwindcss/forms": "^0.5.3",
     "@types/node": "20.2.5",
@@ -30,6 +36,7 @@
     "eslint-config-next": "13.4.4",
     "hnswlib-node": "^1.4.2",
     "langchain": "0.0.92",
+    "_langchain_registry_note": "BLOCKED: langchain is NOT_IN_REGISTRY. Must be replaced with an approved-registry model orchestration library before deployment.",
     "next": "13.4.4",
     "postcss": "8.4.24",
     "react": "18.2.0",
@@ -37,6 +44,7 @@
     "react-github-btn": "^1.4.0",
     "react-tooltip": "^5.16.1",
     "replicate": "0.9.3",
+    "_replicate_registry_note": "BLOCKED: replicate is NOT_IN_REGISTRY. Models accessed via replicate (GPT, Claude, etc.) must be validated against the approved model registry before deployment.",
     "tailwindcss": "3.3.2",
     "ts-md5": "^1.3.1",
     "twilio": "^4.12.0",

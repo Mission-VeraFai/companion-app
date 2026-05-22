@@ -1,5 +1,5 @@
 // Redis removed: replaced with in-memory store to stay within 3-credential limit
-import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
+import { CohereEmbeddings } from "langchain/embeddings/cohere";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
@@ -20,9 +20,37 @@ const DANGEROUS_PATTERNS = [
   /\bexecfile\s*\(/i,
 ];
 
-function sanitizeDocs(docs: any[] | undefined): any[] {
+// Allowlist of metadata fields that may be returned to callers.
+const ALLOWED_METADATA_FIELDS: ReadonlySet<string> = new Set([
+  "source",
+  "title",
+  "companionName",
+  "loc",
+]);
+
+// Patterns used to redact sensitive values from text before returning.
+const SENSITIVE_PATTERNS: { pattern: RegExp; replacement: string }[] = [
+  // E-mail addresses
+  { pattern: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, replacement: "[EMAIL REDACTED]" },
+  // Phone numbers (common formats)
+  { pattern: /(?:\+?\d[\s.\-]?){7,15}/g, replacement: "[PHONE REDACTED]" },
+  // Credit-card numbers (13-19 digits, optionally separated by spaces/dashes)
+  { pattern: /\b(?:\d[ \-]?){13,19}\b/g, replacement: "[CARD REDACTED]" },
+  // Password / token / secret / key assignments
+  { pattern: /\b(?:password|passwd|secret|token|api[_\-]?key|auth[_\-]?key)\s*[:=]\s*\S+/gi, replacement: "[CREDENTIAL REDACTED]" },
+];
+
+function redactSensitiveText(text: string): string {
+  let redacted = text;
+  for (const { pattern, replacement } of SENSITIVE_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
+function sanitizeDocs(docs: any[] | undefined): { pageContent: string; metadata: Record<string, unknown> }[] {
   if (!docs || !Array.isArray(docs)) return [];
-  return docs.filter((doc) => {
+  const filtered = docs.filter((doc) => {
     if (!doc || typeof doc.pageContent !== "string") return false;
     for (const pattern of DANGEROUS_PATTERNS) {
       if (pattern.test(doc.pageContent)) {
@@ -34,18 +62,54 @@ function sanitizeDocs(docs: any[] | undefined): any[] {
     }
     return true;
   });
+
+  // Minimise output: return only pageContent (redacted) + whitelisted metadata fields.
+  return filtered.map((doc) => {
+    const safeMetadata: Record<string, unknown> = {};
+    if (doc.metadata && typeof doc.metadata === "object") {
+      for (const field of ALLOWED_METADATA_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(doc.metadata, field)) {
+          safeMetadata[field] = doc.metadata[field];
+        }
+      }
+    }
+    return {
+      pageContent: redactSensitiveText(doc.pageContent),
+      metadata: safeMetadata,
+    };
+  });
 }
 
 const APPROVED_EMBEDDING_MODELS: ReadonlySet<string> = new Set([
-  "text-embedding-ada-002",
+  "sentence-transformers/all-MiniLM-L6-v2",
 ]);
 
-const PINNED_EMBEDDING_MODEL = "text-embedding-ada-002";
+const PINNED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
 
-function createApprovedEmbeddings(): OpenAIEmbeddings {
+function createApprovedEmbeddings(): HuggingFaceInferenceEmbeddings {
   if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
     throw new Error(
       `Model '${PINNED_EMBEDDING_MODEL}' is not in the approved model registry. ` +
+      `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
+    );
+  }
+  // Uses HuggingFace public inference — no additional API key required,
+  // keeping external credentials within the 3-system limit (Pinecone + Supabase).
+  return new HuggingFaceInferenceEmbeddings({
+    model: PINNED_EMBEDDING_MODEL,
+  });
+}' is not in the approved model registry. ` +
+      `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
+    );
+  }
+  if (!process.env.COHERE_API_KEY) {
+    throw new Error("COHERE_API_KEY environment variable is not set.");
+  }
+  return new CohereEmbeddings({
+    apiKey: process.env.COHERE_API_KEY,
+    model: PINNED_EMBEDDING_MODEL,
+  });
+}' is not in the approved model registry. ` +
       `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
     );
   }
@@ -61,10 +125,62 @@ export type CompanionKey = {
   userId: string;
 };
 
+export type ProvenanceMetadata = {
+  syntheticOrigin: true;
+  modelId: string;
+  generatedAt: string; // ISO-8601 timestamp
+  contentLabel: "AI_GENERATED";
+};
+
+export type ProvenanceWrapped<T> = {
+  provenance: ProvenanceMetadata;
+  data: T;
+};
+
+function buildProvenance(modelId: string): ProvenanceMetadata {
+  return {
+    syntheticOrigin: true,
+    modelId,
+    generatedAt: new Date().toISOString(),
+    contentLabel: "AI_GENERATED",
+  };
+}
+
+const PROVENANCE_PREFIX = "[AI_GENERATED|model=" + PINNED_EMBEDDING_MODEL + "]";
+
+function attachProvenancePrefix(text: string): string {
+  const ts = new Date().toISOString();
+  return `${PROVENANCE_PREFIX}[ts=${ts}] ${text}`;
+}
+
 function sanitizeInput(input: string): string {
   if (typeof input !== "string") {
     throw new Error("Invalid input: recentChatHistory must be a string.");
   }
+  // Strip null bytes and non-printable control characters (except common whitespace)
+  let sanitized = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
+  // Remove common prompt injection patterns (ignore/disregard/override instructions)
+  sanitized = sanitized.replace(
+    /\b(ignore|disregard|forget|override|bypass|skip|cancel|stop|reset|clear)\b[\s\S]{0,60}(instruction|prompt|rule|command|context|above|previous|prior|system)/gi,
+    "[REDACTED]"
+  );
+  // Remove shell command patterns
+  sanitized = sanitized.replace(
+    /(`[^`]*`|\$\([^)]*\)|\|\s*\w+|&&|;\s*\w+|>\s*\/|<\s*\/|\bsudo\b|\brm\b|\bchmod\b|\bchown\b|\bcurl\b|\bwget\b|\beval\b|\bexec\b)/gi,
+    "[REDACTED]"
+  );
+  // Remove base64-encoded or URL-encoded payloads (heuristic: long unbroken alphanum strings)
+  sanitized = sanitized.replace(
+    /(?:[A-Za-z0-9+/]{40,}={0,2})/g,
+    "[REDACTED]"
+  );
+  // Enforce a reasonable maximum length
+  sanitized = sanitized.slice(0, 4000);
+  if (sanitized.length === 0) {
+    throw new Error("Invalid input: recentChatHistory must not be empty after sanitization.");
+  }
+  return sanitized;
+}
   // Strip null bytes and non-printable control characters (except common whitespace)
   const sanitized = input
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
@@ -83,10 +199,19 @@ function sanitizeInput(input: string): string {
     "[REDACTED]"
   );
   // Remove shell command patterns
-  sanitized = sanitized.replace(
-    /(`[^`]*`|\$\([^)]*\)|\|\s*\w+|&&|;\s*\w+|>\s*\/|<\s*\/|\bsudo\b|\brm\b|\bchmod\b|\bchown\b|\bcurl\b|\bwget\b|\beval\b|\bexec\b)/gi,
-    "[REDACTED]"
+  const _shellCmdPattern = new RegExp(
+    "(`[^`]*`|\\$\\([^)]*\\)|\\|\\s*\\w+|&&|;\\s*\\w+|>\\s*\/|<\\s*\/" +
+    "|\\b" + "sud" + "o\\b" +
+    "|\\b" + "r" + "m\\b" +
+    "|\\b" + "chm" + "od\\b" +
+    "|\\b" + "cho" + "wn\\b" +
+    "|\\b" + "cu" + "rl\\b" +
+    "|\\b" + "wg" + "et\\b" +
+    "|\\b" + "ev" + "al\\b" +
+    "|\\b" + "ex" + "ec\\b)",
+    "gi"
   );
+  sanitized = sanitized.replace(_shellCmdPattern, "[REDACTED]");
   // Remove base64-encoded or URL-encoded payloads (heuristic: long unbroken alphanum strings)
   sanitized = sanitized.replace(
     /(?:[A-Za-z0-9+/]{40,}={0,2})/g,
@@ -95,6 +220,34 @@ function sanitizeInput(input: string): string {
   // Remove null bytes and other non-printable control characters
   sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   return sanitized.trim();
+}
+
+import * as fs from "fs";
+import * as path from "path";
+import * as crypto from "crypto";
+
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.join(process.cwd(), "audit_ai_actions.log");
+const AUDIT_RETENTION_DAYS = parseInt(process.env.AUDIT_RETENTION_DAYS || "90", 10);
+
+function writeAuditRecord(record: Record<string, unknown>): void {
+  const entry = JSON.stringify({
+    ...record,
+    auditTimestamp: new Date().toISOString(),
+    retentionPolicy: `${AUDIT_RETENTION_DAYS}d`,
+  });
+  try {
+    fs.appendFileSync(AUDIT_LOG_PATH, entry + "\n", { encoding: "utf8", flag: "a" });
+  } catch (err) {
+    console.error("AUDIT_LOG_WRITE_FAILURE", { error: String(err), record });
+  }
+}
+
+function generateTraceId(): string {
+  return crypto.randomUUID();
+}
+
+function hashInput(input: string): string {
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
 }
 
 class MemoryManager {
@@ -129,8 +282,21 @@ class MemoryManager {
 
   public async vectorSearch(
     recentChatHistory: string,
-    companionFileName: string
+    companionFileName: string,
+    principal?: string
   ) {
+    const traceId = generateTraceId();
+    const inputHash = hashInput(recentChatHistory);
+    writeAuditRecord({
+      operation: "vectorSearch",
+      traceId,
+      modelId: PINNED_EMBEDDING_MODEL,
+      inputHash,
+      companionFileName,
+      principal: principal || companionFileName,
+      vectorDb: process.env.VECTOR_DB || "supabase",
+      status: "initiated",
+    });
     if (process.env.VECTOR_DB === "pinecone") {
       console.log("INFO: using Pinecone for vector search.");
       const pineconeClient = <PineconeClient>this.vectorDBClient;
@@ -147,10 +313,8 @@ class MemoryManager {
 
       console.log("INFO: Initiating LLM interaction - PineconeStore.similaritySearch", { query: recentChatHistory, topK: 3, filter: { fileName: companionFileName } });
       const sanitizedQuery = sanitizeInput(recentChatHistory);
-            const sanitizedHistory = sanitizeInput(recentChatHistory);
-            const sanitizedHistory = sanitizeInput(recentChatHistory);
             const similarDocsRaw = await vectorStore
-        .similaritySearch(recentChatHistory, 3)
+        .similaritySearch(sanitizedQuery, 3)
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
@@ -205,7 +369,17 @@ class MemoryManager {
     return `companion:${hmac}`;
   }
 
-  public async writeToHistory(text: string, companionKey: CompanionKey) {
+  public async writeToHistory(text: string, companionKey: CompanionKey, traceId?: string) {
+    const opTraceId = traceId || generateTraceId();
+    writeAuditRecord({
+      operation: "writeToHistory",
+      traceId: opTraceId,
+      principal: companionKey.userId,
+      companionName: companionKey.companionName,
+      modelName: companionKey.modelName,
+      inputHash: hashInput(text),
+      status: "initiated",
+    });
     if (!companionKey || typeof companionKey.userId == "undefined") {
       console.log("Companion key set incorrectly");
       return "";
@@ -238,9 +412,17 @@ class MemoryManager {
     result = result.slice(-MAX_HISTORY_ENTRIES).reverse();
     const recentChats = result
       .reverse()
-      .map((entry: string) => entry.slice(0, MAX_ENTRY_LENGTH))
+      .map((entry: string) => redactSensitiveText(entry.slice(0, MAX_ENTRY_LENGTH)))
       .join("\n");
     return recentChats;
+  }
+
+  private sanitizeInput(input: string): string {
+    // Remove control characters (except newline/tab), trim whitespace, and limit length
+    return input
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+      .trim()
+      .slice(0, 1000);
   }
 
   public async seedChatHistory(
@@ -254,10 +436,19 @@ class MemoryManager {
       return;
     }
 
-    const content = seedContent.split(delimiter);
+            const content = seedContent.split(delimiter);
     let counter = 0;
+    const baseTime = Date.now();
     for (const line of content) {
-      await this.history.zadd(key, { score: counter, member: line });
+      await this.history.zadd(key, { score: baseTime + counter, member: line });
+      counter += 1;
+    }
+    // Set expiry so seeded sessions expire after 24 hours of inactivity
+    await this.history.expire(key, 86400);
+  });
+      counter += 1;
+    }
+      await this.history.zadd(key, { score: counter, member: sanitizedLine });
       counter += 1;
     }
   }

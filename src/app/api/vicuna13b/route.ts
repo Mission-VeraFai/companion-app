@@ -1,17 +1,62 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate } from "langchain/llms/replicate";
+// APPROVED_MODEL_IMPORT: Replace with an import from the organization's approved LLM registry.
+// Example: import { OpenAI } from "langchain/llms/openai";
+import { OpenAI } from "langchain/llms/openai";
 import { CallbackManager } from "langchain/callbacks";
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
-import { rateLimit } from "@/app/utils/rateLimit";
+// In-memory rate limiter (replaces Upstash Redis rateLimit to stay within 3-system credential limit)
+const _rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(identifier: string): { success: boolean } {
+  const WINDOW_MS = 60_000; // 1 minute
+  const MAX_REQUESTS = 10;
+  const now = Date.now();
+  const entry = _rateLimitStore.get(identifier);
+  if (!entry || now > entry.resetAt) {
+    _rateLimitStore.set(identifier, { count: 1, resetAt: now + WINDOW_MS });
+    return { success: true };
+  }
+  entry.count += 1;
+  return { success: entry.count <= MAX_REQUESTS };
+}
 import crypto from "crypto";
 import fsSync from "fs";
 import path from "path";
 
 const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit", "ai_audit.jsonl");
+const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MB per file
+const MAX_AUDIT_LOG_ROTATIONS = 10;           // keep at most 10 rotated archives
+
+/** Rotate the audit log when it exceeds MAX_AUDIT_LOG_BYTES and prune old archives. */
+async function rotateAuditLogIfNeeded(): Promise<void> {
+  const dir = path.dirname(AUDIT_LOG_PATH);
+  let stat: fsSync.Stats | null = null;
+  try {
+    stat = await fsSync.promises.stat(AUDIT_LOG_PATH);
+  } catch {
+    // File does not exist yet — nothing to rotate.
+    return;
+  }
+  if (stat.size < MAX_AUDIT_LOG_BYTES) return;
+
+  // Rename current log to a timestamped archive.
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const archived = path.join(dir, `ai_audit.${ts}.jsonl`);
+  await fsSync.promises.rename(AUDIT_LOG_PATH, archived);
+
+  // Prune oldest archives beyond the retention cap.
+  const entries = await fsSync.promises.readdir(dir);
+  const archives = entries
+    .filter((f) => f.startsWith("ai_audit.") && f.endsWith(".jsonl") && f !== "ai_audit.jsonl")
+    .sort(); // ISO timestamps sort lexicographically oldest-first
+  if (archives.length > MAX_AUDIT_LOG_ROTATIONS) {
+    const toDelete = archives.slice(0, archives.length - MAX_AUDIT_LOG_ROTATIONS);
+    await Promise.all(toDelete.map((f) => fsSync.promises.unlink(path.join(dir, f))));
+  }
+}
 
 async function writeAuditRecord(record: {
   timestamp: string;
@@ -22,11 +67,126 @@ async function writeAuditRecord(record: {
   companionName: string;
 }): Promise<void> {
   const line = JSON.stringify(record) + "\n";
-  await fsSync.promises.mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+  const dir = path.dirname(AUDIT_LOG_PATH);
+  await fsSync.promises.mkdir(dir, { recursive: true });
+  await rotateAuditLogIfNeeded();
   await fsSync.promises.appendFile(AUDIT_LOG_PATH, line, { encoding: "utf8" });
 }
 
+/**
+ * Safe wrapper — guarantees the audit write never silently drops a record.
+ * On failure the error is emitted to stderr and a best-effort fallback entry
+ * is written so the failure itself is traceable.
+ */
+async function safeWriteAuditRecord(
+  record: Parameters<typeof writeAuditRecord>[0]
+): Promise<void> {
+  try {
+    await writeAuditRecord(record);
+  } catch (auditErr) {
+    // Emit to stderr so the failure is visible in host logs / SIEM.
+    process.stderr.write(
+      `[AUDIT ERROR] Failed to write audit record: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}\n` +
+      `[AUDIT ERROR] Dropped record: ${JSON.stringify(record)}\n`
+    );
+    // Best-effort fallback: write a failure marker so the gap is forensically visible.
+    try {
+      const fallback = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: "AUDIT_WRITE_FAILURE",
+        error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+        droppedRecord: record,
+      }) + "\n";
+      await fsSync.promises.appendFile(AUDIT_LOG_PATH, fallback, { encoding: "utf8" });
+    } catch {
+      // If even the fallback fails, stderr is the last resort — already written above.
+    }
+  }
+}
+
 dotenv.config({ path: `.env.local` });
+
+// ---------------------------------------------------------------------------
+// Approved Model Registry – only models listed here (with exact pinned IDs)
+// may be instantiated. Any model not in this registry will cause a hard error.
+// ---------------------------------------------------------------------------
+const APPROVED_MODEL_REGISTRY: Record<string, { provider: string; version: string }> = {
+  "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b": {
+    provider: "replicate",
+    version: "6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b",
+  },
+};
+
+function assertModelApproved(modelId: string): void {
+  if (!APPROVED_MODEL_REGISTRY[modelId]) {
+    throw new Error(
+      `Model '${modelId}' is NOT_IN_REGISTRY. Only approved, version-pinned models may be used. ` +
+      `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session token integrity – HMAC-signed, expiry-bound, subject-bound tokens
+// ---------------------------------------------------------------------------
+const SESSION_TOKEN_SECRET = process.env.SESSION_TOKEN_SECRET ?? "change-me-session-secret";
+const SESSION_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function createSessionToken(userId: string, companionName: string, modelName: string): string {
+  const expiry = (Date.now() + SESSION_TOKEN_TTL_MS).toString();
+  const payload = `${userId}:${companionName}:${modelName}:${expiry}`;
+  const sig = crypto
+    .createHmac("sha256", SESSION_TOKEN_SECRET)
+    .update(payload)
+    .digest("hex");
+  // Encode as base64url: payload|sig
+  return Buffer.from(`${payload}|${sig}`).toString("base64url");
+}
+
+function verifySessionToken(
+  token: string,
+  expectedUserId: string,
+  expectedCompanionName: string,
+  expectedModelName: string
+): void {
+  let decoded: string;
+  try {
+    decoded = Buffer.from(token, "base64url").toString("utf8");
+  } catch {
+    throw new Error("Session token is malformed.");
+  }
+
+  const lastPipe = decoded.lastIndexOf("|");
+  if (lastPipe === -1) throw new Error("Session token structure invalid.");
+
+  const payload = decoded.slice(0, lastPipe);
+  const providedSig = decoded.slice(lastPipe + 1);
+
+  // Recompute HMAC and compare in constant time
+  const expectedSig = crypto
+    .createHmac("sha256", SESSION_TOKEN_SECRET)
+    .update(payload)
+    .digest("hex");
+  const sigBuf = Buffer.from(providedSig, "hex");
+  const expSigBuf = Buffer.from(expectedSig, "hex");
+  if (sigBuf.length !== expSigBuf.length || !crypto.timingSafeEqual(sigBuf, expSigBuf)) {
+    throw new Error("Session token signature verification failed.");
+  }
+
+  // Parse and validate fields
+  const parts = payload.split(":");
+  if (parts.length !== 4) throw new Error("Session token payload malformed.");
+  const [tokenUserId, tokenCompanionName, tokenModelName, expiryStr] = parts;
+
+  // Subject binding
+  if (tokenUserId !== expectedUserId) throw new Error("Session token subject mismatch.");
+  if (tokenCompanionName !== expectedCompanionName) throw new Error("Session token companion binding mismatch.");
+  if (tokenModelName !== expectedModelName) throw new Error("Session token model binding mismatch.");
+
+  // Expiry check
+  const expiry = parseInt(expiryStr, 10);
+  if (isNaN(expiry) || Date.now() > expiry) throw new Error("Session token has expired.");
+}
 
 // ---------------------------------------------------------------------------
 // Prompt sanitization – blocks common prompt-injection / command-injection
@@ -340,7 +500,7 @@ export async function POST(request: Request) {
     await model
       .call(modelInput)
       .catch(async (err: unknown) => {
-        await writeAuditRecord({
+        await safeWriteAuditRecord({
           timestamp: new Date().toISOString(),
           principal: clerkUserId!,
           modelId,
@@ -439,7 +599,11 @@ export async function POST(request: Request) {
 
   // Cryptographic HMAC watermark so downstream consumers can verify
   // the output originated from this service.
-  const watermarkSecret = process.env.WATERMARK_SECRET ?? "change-me-in-env";
+  const watermarkSecret = process.env.WATERMARK_SECRET;
+  if (!watermarkSecret) {
+    console.error("[SECURITY] WATERMARK_SECRET environment variable is not set. Refusing to generate HMAC with a weak or absent secret.");
+    return new Response("Service misconfiguration: content signing unavailable.", { status: 503 });
+  }
   const hmac = crypto
     .createHmac("sha256", watermarkSecret)
     .update(response + generatedAt + MODEL_ID)
@@ -449,6 +613,16 @@ export async function POST(request: Request) {
   const labeledResponse =
     `[AI-GENERATED | model=${MODEL_ID} | generated_at=${generatedAt} | sig=${hmac}]\n` +
     response;
+
+  // Re-validate the fully assembled labeled response before streaming
+  const containsDangerousCodeInLabeled = DANGEROUS_PATTERNS.some((pattern) =>
+    pattern.test(labeledResponse)
+  );
+
+  if (containsDangerousCodeInLabeled) {
+    console.warn("[SECURITY] Labeled LLM response contained dynamic code execution primitive. Response blocked.");
+    return new Response("Response blocked due to policy violation.", { status: 400 });
+  }
 
   let s = new Readable();
   s.push(labeledResponse);

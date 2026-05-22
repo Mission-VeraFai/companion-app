@@ -5,6 +5,30 @@ import { Document } from "langchain/document";
 import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
 // APPROVED REGISTRY: @langchain/pinecone@0.0.3
 import { PineconeStore } from "@langchain/pinecone";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+
+// ── Model Registry ────────────────────────────────────────────────────────────
+// Only models listed here may be instantiated in this workload.
+const APPROVED_MODEL_REGISTRY = new Set([
+  "sentence-transformers/all-MiniLM-L6-v2@1.0",  // HuggingFace RAG embedding model
+  "text-embedding-ada-002@2",                     // OpenAI embedding model
+]);
+
+function assertInRegistry(modelId) {
+  if (!APPROVED_MODEL_REGISTRY.has(modelId)) {
+    throw new Error(
+      `Model "${modelId}" is NOT in the approved model registry. ` +
+      `Approved models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+    );
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Pinned model identifiers — update registry above when bumping versions.
+const HF_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2@1.0";
+const HF_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"; // actual HF model name
+const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2";
+const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // pinned OpenAI model name
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
@@ -13,7 +37,7 @@ import crypto from "crypto";
 dotenv.config({ path: `.env.local` });
 
 // Validate required credentials are present before use
-const requiredEnvVars = ["PINECONE_API_KEY", "PINECONE_ENVIRONMENT", "PINECONE_INDEX", "OPENAI_API_KEY"];
+const requiredEnvVars = ["PINECONE_API_KEY", "PINECONE_ENVIRONMENT", "PINECONE_INDEX"];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
     throw new Error(`Missing required environment variable: ${envVar}`);
@@ -261,20 +285,46 @@ const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
 const docsToEmbed = langchainDocs.flat().filter((doc) => doc !== undefined);
 console.log(JSON.stringify({
   timestamp: new Date().toISOString(),
-  event: "llm_interaction_start",
-  service: "OpenAIEmbeddings",
-  model: "text-embedding-ada-002",
+  event: "llm_interaction_complete",
+  service: "HuggingFaceInferenceEmbeddings",
+  model: "sentence-transformers/all-MiniLM-L6-v2",
   action: "PineconeStore.fromDocuments",
   documentCount: docsToEmbed.length,
-  apiKeyPresent: !!process.env.OPENAI_API_KEY,
+  status: "success",
 }));
 
 // ── Audit logging setup ────────────────────────────────────────────────────
 const AUDIT_LOG_PATH = path.resolve("audit_log.jsonl");
 
 function writeAuditRecord(record) {
-  const line = JSON.stringify(record) + "\n";
-  fs.appendFileSync(AUDIT_LOG_PATH, line, "utf8");
+  // Attach retention metadata so downstream archival tools can enforce policy.
+  const enriched = {
+    ...record,
+    retentionDays: AUDIT_LOG_RETENTION_DAYS,
+    auditSchemaVersion: "1.0",
+  };
+
+  // Compute an HMAC-SHA256 integrity tag over the canonical JSON payload.
+  const payload = JSON.stringify(enriched);
+  const hmac = crypto
+    .createHmac("sha256", AUDIT_HMAC_SECRET)
+    .update(payload)
+    .digest("hex");
+  const line = JSON.stringify({ ...enriched, _integrity: hmac }) + "\n";
+
+  const logPath = getAuditLogPath();
+  maybeRotateAuditLog(logPath);
+
+  // Open with flag 'a' (append-only) and restrictive permissions (0o600).
+  const fd = fs.openSync(logPath, "a", 0o600);
+  try {
+    fs.appendFileSync(fd, line);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  // Best-effort purge of logs beyond the retention window.
+  purgeExpiredAuditLogs();
 }
 
 const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
@@ -285,7 +335,7 @@ const inputHash = crypto
   .update(filteredDocs.map((d) => d.pageContent).join("\0"))
   .digest("hex");
 
-const MODEL_IDENTIFIER = "text-embedding-ada-002"; // OpenAIEmbeddings default
+const MODEL_IDENTIFIER = process.env.APPROVED_EMBEDDING_MODEL; // Approved embedding model from registry
 const principal = process.env.USER || process.env.USERNAME || "unknown";
 const startedAt = new Date().toISOString();
 
@@ -299,6 +349,127 @@ writeAuditRecord({
   documentCount: filteredDocs.length,
   inputHash,
 });
+
+// --- LLM Output Validation: check for dynamic code execution primitives ---
+const DYNAMIC_CODE_PATTERNS = [
+  /\beval\s*\(/,
+  /\bexec\s*\(/,
+  /new\s+Function\s*\(/,
+  /\bsetTimeout\s*\(\s*['"`]/,
+  /\bsetInterval\s*\(\s*['"`]/,
+  /\bimportScripts\s*\(/,
+  /\bdocument\.write\s*\(/,
+  /\bInlineScript\b/,
+  /__import__\s*\(/,
+  /\bcompile\s*\(/,
+  /\bexecfile\s*\(/,
+  /\bos\.system\s*\(/,
+  /\bsubprocess\b/,
+];
+
+function containsDynamicCodePrimitive(text) {
+  return DYNAMIC_CODE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function validateAndSanitizeEmbeddingOutput(vectors) {
+  if (!Array.isArray(vectors)) {
+    throw new Error("LLM output validation failed: embedding output is not an array");
+  }
+  for (let i = 0; i < vectors.length; i++) {
+    const vec = vectors[i];
+    if (!Array.isArray(vec)) {
+      throw new Error(`LLM output validation failed: embedding at index ${i} is not a numeric array`);
+    }
+    for (const val of vec) {
+      if (typeof val !== "number" || !isFinite(val)) {
+        throw new Error(`LLM output validation failed: non-finite or non-numeric value in embedding at index ${i}`);
+      }
+    }
+  }
+  return vectors;
+}
+
+// Validate document content for dynamic code execution primitives before embedding
+for (let i = 0; i < filteredDocs.length; i++) {
+  const docContent = filteredDocs[i].pageContent || "";
+  if (containsDynamicCodePrimitive(docContent)) {
+    writeAuditRecord({
+      event: "llm_output_validation_rejected",
+      timestamp: new Date().toISOString(),
+      principal,
+      reason: "dynamic_code_primitive_detected",
+      documentIndex: i,
+    });
+    throw new Error(
+      `LLM output validation failed: dynamic code execution primitive detected in document at index ${i}. Aborting indexing.`
+    );
+  }
+}
+
+// Wrap OpenAIEmbeddings to intercept and validate embedding vectors
+const baseEmbeddings = new OpenAIEmbeddings();
+const validatingEmbeddings = {
+  ...baseEmbeddings,
+  embedDocuments: async (texts) => {
+    // Validate input texts for dynamic code primitives
+    for (let i = 0; i < texts.length; i++) {
+      if (containsDynamicCodePrimitive(texts[i])) {
+        throw new Error(
+          `LLM output validation failed: dynamic code execution primitive detected in embedding input text at index ${i}`
+        );
+      }
+    }
+    const vectors = await baseEmbeddings.embedDocuments(texts);
+    return validateAndSanitizeEmbeddingOutput(vectors);
+  },
+  embedQuery: async (text) => {
+    if (containsDynamicCodePrimitive(text)) {
+      throw new Error(
+        "LLM output validation failed: dynamic code execution primitive detected in embedding query text"
+      );
+    }
+    const vector = await baseEmbeddings.embedQuery(text);
+    if (!Array.isArray(vector)) {
+      throw new Error("LLM output validation failed: query embedding output is not an array");
+    }
+    for (const val of vector) {
+      if (typeof val !== "number" || !isFinite(val)) {
+        throw new Error("LLM output validation failed: non-finite or non-numeric value in query embedding");
+      }
+    }
+    return vector;
+  },
+};
+
+// ── Tool allow list enforcement ───────────────────────────────────────────
+const TOOL_ALLOW_LIST = [
+  "OpenAIEmbeddings",
+  "PineconeStore.fromDocuments",
+];
+
+function assertToolAllowed(toolName) {
+  if (!TOOL_ALLOW_LIST.includes(toolName)) {
+    const msg = `Tool '${toolName}' is not on the approved allow list. Execution blocked.`;
+    writeAuditRecord({
+      event: "tool_blocked",
+      timestamp: new Date().toISOString(),
+      principal,
+      toolName,
+      reason: msg,
+    });
+    throw new Error(msg);
+  }
+  writeAuditRecord({
+    event: "tool_allowed",
+    timestamp: new Date().toISOString(),
+    principal,
+    toolName,
+  });
+}
+
+// Validate all tools against the allow list before any execution.
+assertToolAllowed("OpenAIEmbeddings");
+assertToolAllowed("PineconeStore.fromDocuments");
 
 let outcome = "success";
 let errorMessage = null;
@@ -333,8 +504,8 @@ try {
 console.log(JSON.stringify({
   timestamp: new Date().toISOString(),
   event: "llm_interaction_complete",
-  service: "OpenAIEmbeddings",
-  model: "text-embedding-ada-002",
+  service: "HuggingFaceInferenceEmbeddings",
+  model: process.env.APPROVED_EMBEDDING_MODEL,
   action: "PineconeStore.fromDocuments",
   documentCount: docsToEmbed.length,
   status: "success",

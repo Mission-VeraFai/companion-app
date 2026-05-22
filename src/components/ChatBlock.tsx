@@ -46,11 +46,31 @@ function MediaWatermark() {
     );
 }
 
+function sanitizeMimeType(mime: string | undefined): string {
+    if (!mime) return '';
+    // Only allow safe 'type/subtype' format, strip parameters and special chars
+    const match = mime.match(/^([a-zA-Z0-9][a-zA-Z0-9!#$&\-^_]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&\-^_.+]*)/);
+    return match ? match[1] : '';
+}
+
+function sanitizeUrl(url: string | undefined): string {
+    if (!url) return '';
+    try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+        return url;
+    } catch {
+        return '';
+    }
+}
+
 export function ChatBlock({text, mimeType, url} : {
     text?: string,
     mimeType?: string,
     url?: string
 }) {
+    const safeUrl = sanitizeUrl(url);
+    const safeMimeType = sanitizeMimeType(mimeType);
     let internalComponent = <></>
     if (text) {
         internalComponent = (
@@ -64,7 +84,7 @@ export function ChatBlock({text, mimeType, url} : {
             </span>
         )
     } else if (mimeType && url) {
-        if (mimeType.startsWith("audio")) {
+        if (safeMimeType.startsWith("audio") && safeUrl) {
             internalComponent = (
                 <span
                     style={{ position: "relative", display: "inline-block" }}
@@ -73,11 +93,11 @@ export function ChatBlock({text, mimeType, url} : {
                     aria-label="AI-generated audio"
                 >
                     <AIProvenanceBadge />
-                    <audio controls={true} src={url} />
+                    <audio controls={true} src={safeUrl} />
                     <MediaWatermark />
                 </span>
             )
-        } else if (mimeType.startsWith("video")) {
+        } else if (safeMimeType.startsWith("video") && safeUrl) {
             internalComponent = (
                 <span
                     style={{ position: "relative", display: "inline-block" }}
@@ -87,13 +107,13 @@ export function ChatBlock({text, mimeType, url} : {
                 >
                     <AIProvenanceBadge />
                     <video controls width="250">
-                        <source src={url} type={mimeType} />
-                        Download the <a href={url}>video</a>
+                        <source src={safeUrl} type={safeMimeType} />
+                        Download the <a href={safeUrl}>video</a>
                     </video>
                     <MediaWatermark />
                 </span>
             )
-        } else if (mimeType.startsWith("image")) {
+        } else if (safeMimeType.startsWith("image") && safeUrl) {
             internalComponent = (
                 <span
                     style={{ position: "relative", display: "inline-block" }}
@@ -102,12 +122,12 @@ export function ChatBlock({text, mimeType, url} : {
                     aria-label="AI-generated image"
                 >
                     <AIProvenanceBadge />
-                    <img src={url} alt="AI-generated image" />
+                    <img src={safeUrl} alt="AI-generated image" />
                     <MediaWatermark />
                 </span>
             )
         }
-    } else if (url) {
+    } else if (safeUrl) {
         internalComponent = (
             <span
                 data-provenance="ai-generated"
@@ -115,7 +135,7 @@ export function ChatBlock({text, mimeType, url} : {
                 aria-label="AI-generated link"
             >
                 <AIProvenanceBadge />
-                <a href={url}>Link</a>
+                <a href={safeUrl}>Link</a>
             </span>
         )
     }
@@ -198,7 +218,11 @@ export function responseToChatBlocks(completion: any) {
     let blocks = []
     if (typeof completion == "string") {
         console.log("still string")
-        blocks.push(<ChatBlock text={completion} />)
+        if (DYNAMIC_CODE_PATTERN.test(completion)) {
+            console.warn('Blocked dangerous content in LLM output (plain string)');
+        } else {
+            blocks.push(<ChatBlock text={completion} />);
+        }
     } else if (Array.isArray(completion)) {
         console.log("Is array")
         for (let block of completion) {

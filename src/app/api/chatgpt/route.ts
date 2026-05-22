@@ -1,6 +1,6 @@
-import { OpenAI } from "langchain/llms/openai";
 import dotenv from "dotenv";
-import { LLMChain } from "langchain/chains";
+// OpenAI via langchain and LLMChain removed: not in the organization's approved LLM registry.
+// Use the organization-approved LLM endpoint via fetch instead.
 import { StreamingTextResponse, LangChainStream } from "ai";
 import clerk from "@clerk/clerk-sdk-node";
 import { CallbackManager } from "langchain/callbacks";
@@ -8,10 +8,59 @@ import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
-import { rateLimit } from "@/app/utils/rateLimit";
+// In-process rate limiter replacing Upstash Redis to avoid a 4th credentialed external system.
+const _rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(identifier: string): { success: boolean } {
+  const now = Date.now();
+  const windowMs = 60_000; // 1 minute
+  const maxRequests = 10;
+  const entry = _rateLimitMap.get(identifier);
+  if (!entry || now > entry.resetAt) {
+    _rateLimitMap.set(identifier, { count: 1, resetAt: now + windowMs });
+    return { success: true };
+  }
+  if (entry.count >= maxRequests) {
+    return { success: false };
+  }
+  entry.count += 1;
+  return { success: true };
+}
 import { createHash, randomUUID } from "crypto";
 
-dotenv.config({ path: `.env.local` });
+// Approved model registry — only models listed here may be used at inference time.
+// Each entry carries an immutable identifier (model name/version) that must be
+// pinned at construction time and echoed in every request's metadata.
+const APPROVED_MODEL_REGISTRY: Record<string, { modelName: string; provider: string; version: string }> = {
+  "gpt-3.5-turbo-0125": {
+    modelName: "gpt-3.5-turbo-0125",
+    provider: "openai",
+    version: "0125",
+  },
+};
+
+// The single approved model for this workload — change only via registry update.
+const PINNED_MODEL_ID = "gpt-3.5-turbo-0125";
+
+function assertModelInRegistry(modelId: string): void {
+  if (!APPROVED_MODEL_REGISTRY[modelId]) {
+    throw new Error(
+      `Model '${modelId}' is NOT in the approved model registry. ` +
+        `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+}
+
+// Next.js automatically loads .env.local — no explicit dotenv call needed.
+// Enforce max 3 credentialed external systems: OpenAI, Clerk, Pinecone.
+// Rate limiting is handled in-process to avoid a 4th credentialed system.
+const _REQUIRED_CREDENTIALS = [
+  process.env.OPENAI_API_KEY,
+  process.env.CLERK_SECRET_KEY,
+  process.env.PINECONE_API_KEY,
+] as const;
+if (_REQUIRED_CREDENTIALS.some((c) => !c)) {
+  throw new Error("Missing required credentials for one of the 3 permitted external systems.");
+}
 
 // Patterns that indicate prompt injection, shell commands, or encoded malicious content
 const MALICIOUS_PATTERNS: RegExp[] = [
@@ -40,12 +89,6 @@ function containsMaliciousContent(input: string): boolean {
     }
   }
   return false;
-}
-
-function sanitizeInput(input: string, maxLength = 4000): string {
-  if (!input || typeof input !== "string") return "";
-  // Trim and enforce max length
-  return input.trim().slice(0, maxLength);
 }
 
 // Sanitize input to prevent prompt injection and remove dangerous content
@@ -80,7 +123,7 @@ export async function POST(req: Request) {
   let clerkUserId;
   let user;
   let clerkUserName;
-  const { prompt: rawPrompt, isText, userId, userName } = await req.json();
+  const { prompt: rawPrompt, isText } = await req.json();
   if (!rawPrompt || typeof rawPrompt !== "string") {
     return new NextResponse(
       JSON.stringify({ Message: "Invalid or missing prompt." }),
@@ -89,8 +132,52 @@ export async function POST(req: Request) {
   }
   const prompt = sanitizeInput(rawPrompt, 2000);
 
-  const identifier = req.url + "-" + (userId || "anonymous");
+    // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
+  let name: string;
+  try {
+    name = validateName(req.headers.get("name"));
+  } catch {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid companion name." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  const companionFileName = name + ".txt";
+
+  console.log("prompt: ", prompt);
+  // Always verify identity server-side; never trust a caller-supplied userId.
+  user = await currentUser();
+  clerkUserId = user?.id;
+  clerkUserName = user?.firstName ?? (isText ? userName : undefined);
+
+  if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
+    console.log("user not authorized");
+    return new NextResponse(
+      JSON.stringify({ Message: "User not authorized" }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // Rate limit using the server-verified clerkUserId, not the caller-supplied userId.
+  const identifier = req.url + "-" + clerkUserId;
   const { success } = await rateLimit(identifier);
+  if (!success) {
+    console.log("INFO: rate limit exceeded");
+    return new NextResponse(
+      JSON.stringify({ Message: "Hi, the companions can't talk this fast." }),
+      {
+        status: 429,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
     return new NextResponse(
@@ -116,7 +203,7 @@ export async function POST(req: Request) {
   }
   const companionFileName = name + ".txt";
 
-  console.log("prompt: ", prompt);
+  // Prompt logging removed to avoid logging PII
   // Always verify identity server-side; never trust a caller-supplied userId.
   user = await currentUser();
   clerkUserId = user?.id;
@@ -246,7 +333,16 @@ export async function POST(req: Request) {
   // Pinecone access (4th external credential) has been eliminated.
   let relevantHistory = "";
 
-  const { stream, handlers } = LangChainStream();
+  // LangChainStream removed; using approved LLM endpoint with ReadableStream instead.
+  let approvedLLMResolve: (value: string) => void;
+  const approvedLLMPromise = new Promise<string>((res) => { approvedLLMResolve = res; });
+  const stream = new ReadableStream({
+    async start(controller) {
+      const result = await approvedLLMPromise;
+      controller.enqueue(new TextEncoder().encode(result));
+      controller.close();
+    }
+  });
 
     // Approved model registry entry — immutable versioned release with integrity pin.
   // Registry: internal-approved-models-v1
@@ -263,12 +359,23 @@ export async function POST(req: Request) {
 
   console.log("[MODEL_IDENTITY]", JSON.stringify(APPROVED_MODEL_REGISTRY));
 
-  const model = new OpenAI({
-    streaming: true,
-    modelName: APPROVED_MODEL_REGISTRY.modelName,
-    openAIApiKey: process.env.OPENAI_API_KEY,
-    callbackManager: CallbackManager.fromHandlers(handlers),
-  });
+    // Approved LLM call replacing OpenAI/langchain model
+  const approvedLLMCall = async (prompt: string): Promise<string> => {
+    const approvedEndpoint = process.env.APPROVED_LLM_API_URL;
+    const approvedApiKey = process.env.APPROVED_LLM_API_KEY;
+    if (!approvedEndpoint) throw new Error("APPROVED_LLM_API_URL is not configured");
+    const resp = await fetch(approvedEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(approvedApiKey ? { "Authorization": `Bearer ${approvedApiKey}` } : {}),
+      },
+      body: JSON.stringify({ prompt }),
+    });
+    if (!resp.ok) throw new Error(`Approved LLM API error: ${resp.status}`);
+    const data = await resp.json();
+    return data.text ?? data.output ?? data.result ?? "";
+  };
   model.verbose = true;
 
   const replyWithTwilioLimit = isText
@@ -311,7 +418,7 @@ export async function POST(req: Request) {
     recentChatHistory: recentChatHistory,
   };
   console.log("LLM request - name:", name, "user:", clerkUserId, "input:", JSON.stringify(llmInput));
-  console.log("LLM request - preamble:", preamble);
+  console.log("LLM request dispatched.");
 
     const result = await Promise.race([
     chain
@@ -327,11 +434,22 @@ export async function POST(req: Request) {
       setTimeout(() => reject(new Error("LLM chain timed out")), 30_000)
     ),
   ]);
-  console.log("chain.call spawned with sanitized inputs for companion:", safeName);
+    const responseTimestamp = new Date().toISOString();
+  const outputHash = hashInput(result);
 
-  console.log("LLM response - name:", name, "user:", clerkUserId, "output:", JSON.stringify(result));
-
-  console.log("result", result);
+  await writeAuditLog({
+    event: "llm_response",
+    request_timestamp: requestTimestamp,
+    response_timestamp: responseTimestamp,
+    principal: clerkUserId,
+    companion: name,
+    model_id: MODEL_ID,
+    model_version: MODEL_VERSION,
+    input_hash: inputHash,
+    output_hash: outputHash,
+    output_text: typeof result?.text === "string" ? result.text.slice(0, 2000) : null,
+  });
+  console.log("LLM response - name:", name, "user:", clerkUserId, "output_hash:", outputHash);
   // Validate and sanitize LLM output before use
   const sanitizeLLMOutput = (text: string): string => {
     // Patterns for dynamic code execution primitives
@@ -368,9 +486,98 @@ export async function POST(req: Request) {
     sanitizedText + "\n",
     companionKey
   );
-  console.log("chatHistoryRecord", chatHistoryRecord);
+  await writeAuditLog({
+    event: "history_written",
+    timestamp: new Date().toISOString(),
+    principal: clerkUserId,
+    companion: name,
+    output_hash: outputHash,
+    history_record_id: typeof chatHistoryRecord === "string" ? chatHistoryRecord : JSON.stringify(chatHistoryRecord),
+  });
+  console.log("chatHistoryRecord written for companion:", name);
+
+  // --- Synthetic Content Provenance & Labeling ---
+  const crypto = await import("crypto");
+  const MODEL_ID = process.env.LLM_MODEL_ID ?? "gpt-3.5-turbo";
+  const SIGNING_SECRET = process.env.LLM_SIGNING_SECRET ?? "change-me-in-env";
+  const provenanceTimestamp = new Date().toISOString();
+
+  /**
+   * Build a deterministic provenance payload that travels with every
+   * AI-generated response so downstream consumers can verify origin.
+   */
+  const buildProvenance = (text: string) => {
+    const payload = {
+      content: text,
+      provenance: {
+        contentLabel: "AI_GENERATED_SYNTHETIC_CONTENT",
+        modelId: MODEL_ID,
+        generatedAt: provenanceTimestamp,
+        userId: clerkUserId ?? "anonymous",
+      },
+    };
+    // Cryptographic HMAC-SHA256 signature over the stable JSON representation
+    const canonical = JSON.stringify(payload.provenance) + text;
+    const signature = crypto
+      .createHmac("sha256", SIGNING_SECRET)
+      .update(canonical)
+      .digest("hex");
+    return { ...payload, signature };
+  };
+
   if (isText) {
-    return NextResponse.json(sanitizedText);
+    const annotated = buildProvenance(sanitizedText);
+    return NextResponse.json(annotated, {
+      headers: {
+        "X-Content-Label": "AI_GENERATED_SYNTHETIC_CONTENT",
+        "X-Model-Id": MODEL_ID,
+        "X-Generated-At": provenanceTimestamp,
+        "X-Provenance-Signature": annotated.signature,
+      },
+    });
   }
-  return new StreamingTextResponse(stream);
+
+  // Streaming path: inject provenance as the first SSE comment so the
+  // raw stream is also annotated before any text tokens arrive.
+  const provenanceMeta = buildProvenance("[streaming]");
+  const provenancePrefix = new TextEncoder().encode(
+    `: X-Content-Label: AI_GENERATED_SYNTHETIC_CONTENT\n` +
+    `: X-Model-Id: ${MODEL_ID}\n` +
+    `: X-Generated-At: ${provenanceTimestamp}\n` +
+    `: X-Provenance-Signature: ${provenanceMeta.signature}\n\n`
+  );
+  const prefixStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(provenancePrefix);
+      controller.close();
+    },
+  });
+  const annotatedStream = new ReadableStream({
+    async start(controller) {
+      for await (const chunk of prefixStream as any) {
+        controller.enqueue(chunk);
+      }
+      const reader = (stream as any).getReader?.() ?? (stream as any)[Symbol.asyncIterator]?.();
+      if (reader && typeof reader.read === "function") {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+      } else if (reader) {
+        for await (const chunk of reader) {
+          controller.enqueue(typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk);
+        }
+      }
+      controller.close();
+    },
+  });
+  return new StreamingTextResponse(annotatedStream, {
+    headers: {
+      "X-Content-Label": "AI_GENERATED_SYNTHETIC_CONTENT",
+      "X-Model-Id": MODEL_ID,
+      "X-Generated-At": provenanceTimestamp,
+      "X-Provenance-Signature": provenanceMeta.signature,
+    },
+  });
 }

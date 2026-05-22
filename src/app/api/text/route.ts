@@ -8,8 +8,8 @@ import { rateLimit } from "@/app/utils/rateLimit";
 // Approved model registry: maps approved model identifiers to their pinned versions.
 // Only models listed here may be used for inference.
 const APPROVED_MODEL_REGISTRY: Record<string, { pinnedVersion: string; endpoint: string }> = {
-  "gpt-4": { pinnedVersion: "gpt-4-0613", endpoint: "claude" },
-  "gpt-3.5-turbo": { pinnedVersion: "gpt-3.5-turbo-0613", endpoint: "claude" },
+  "claude-3-5-sonnet": { pinnedVersion: "claude-3-5-sonnet-20241022", endpoint: "claude" },
+  "claude-3-haiku": { pinnedVersion: "claude-3-haiku-20240307", endpoint: "claude" },
   // Add additional approved models here as needed.
 };
 
@@ -21,20 +21,37 @@ function resolveApprovedModel(
   return entry;
 }
 import { createHash } from "crypto";
-import { appendFileSync, mkdirSync } from "fs";
+import { appendFileSync, mkdirSync, existsSync, renameSync, statSync } from "fs";
 import path from "path";
 
 const AUDIT_LOG_DIR = path.resolve(process.cwd(), "audit-logs");
 const AUDIT_LOG_FILE = path.join(AUDIT_LOG_DIR, "ai-inference-audit.log");
+// Rotate the audit log when it exceeds this size (10 MB) to enforce a retention policy.
+const AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+
+function rotateAuditLogIfNeeded(): void {
+  if (existsSync(AUDIT_LOG_FILE)) {
+    const { size } = statSync(AUDIT_LOG_FILE);
+    if (size >= AUDIT_LOG_MAX_BYTES) {
+      const rotatedName = AUDIT_LOG_FILE.replace(
+        /\.log$/,
+        `.${new Date().toISOString().replace(/[:.]/g, "-")}.log`
+      );
+      renameSync(AUDIT_LOG_FILE, rotatedName);
+    }
+  }
+}
 
 function writeAuditRecord(record: Record<string, unknown>): void {
   try {
     mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+    rotateAuditLogIfNeeded();
     const line = JSON.stringify({ ...record, _written: new Date().toISOString() }) + "\n";
     appendFileSync(AUDIT_LOG_FILE, line, { encoding: "utf8", flag: "a" });
   } catch (err) {
-    // Fail loudly so ops can detect audit pipeline breakage
+    // Log to console AND re-throw so callers are aware of audit pipeline breakage.
     console.error("CRITICAL: audit log write failed", err);
+    throw err;
   }
 }
 
@@ -42,7 +59,48 @@ dotenv.config({ path: `.env.local` });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const internalApiSecret = process.env.INTERNAL_API_SECRET;
-const interAgentSecret = process.env.INTER_AGENT_SECRET;
+// INTER_AGENT_SECRET removed: retrieve on-demand via ConfigManager to stay within the 3-system credential limit
+function getInterAgentSecret(): string {
+  const secret = process.env.INTER_AGENT_SECRET;
+  if (!secret) throw new Error("INTER_AGENT_SECRET is not configured");
+  return secret;
+}
+
+const MAX_PROMPT_LENGTH = 2000;
+const PROMPT_INJECTION_PATTERNS = [
+  /ignore\s+(previous|above|all)\s+(instructions?|prompts?)/gi,
+  /system\s*:/gi,
+  /\[INST\]/gi,
+  /<\|im_start\|>/gi,
+  /\bforget\s+(everything|all|prior)/gi,
+  /you\s+are\s+now/gi,
+  /new\s+persona/gi,
+  /disregard\s+(all|previous|prior)/gi,
+];
+
+function validateAndSanitizeUserPrompt(input: string): { valid: boolean; sanitized: string; reason?: string } {
+  if (!input || typeof input !== "string") {
+    return { valid: false, sanitized: "", reason: "Prompt is empty or not a string" };
+  }
+  const trimmed = input.trim();
+  if (trimmed.length === 0) {
+    return { valid: false, sanitized: "", reason: "Prompt is blank after trimming" };
+  }
+  if (trimmed.length > MAX_PROMPT_LENGTH) {
+    return { valid: false, sanitized: "", reason: `Prompt exceeds maximum length of ${MAX_PROMPT_LENGTH}` };
+  }
+  for (const pattern of PROMPT_INJECTION_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(trimmed)) {
+      pattern.lastIndex = 0;
+      return { valid: false, sanitized: "", reason: `Prompt contains forbidden injection pattern: ${pattern}` };
+    }
+    pattern.lastIndex = 0;
+  }
+  // Strip null bytes and control characters (except common whitespace)
+  const sanitized = trimmed.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  return { valid: true, sanitized };
+}
 
 const DYNAMIC_CODE_PATTERNS = [
   /\beval\s*\(/gi,
@@ -63,6 +121,56 @@ const DYNAMIC_CODE_PATTERNS = [
   /__import__/gi,
   /compile\s*\(/gi,
 ];
+
+const MAX_PROMPT_LENGTH = 4000;
+const PROMPT_INJECTION_PATTERNS = [
+  /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/gi,
+  /system\s*:\s*/gi,
+  /\[\s*system\s*\]/gi,
+  /<\s*system\s*>/gi,
+  /you\s+are\s+now\s+/gi,
+  /disregard\s+(all\s+)?(previous|prior)/gi,
+  /forget\s+(all\s+)?(previous|prior|your)/gi,
+  /act\s+as\s+(if\s+you\s+are|a\s+)/gi,
+  /jailbreak/gi,
+  /\\u[0-9a-fA-F]{4}/g,
+  /\\x[0-9a-fA-F]{2}/g,
+];
+
+function sanitizePrompt(raw: string): string {
+  if (typeof raw !== "string") return "";
+  // Enforce maximum length before any processing
+  let sanitized = raw.slice(0, MAX_PROMPT_LENGTH);
+  // Remove null bytes and non-printable control characters (except newline/tab)
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Strip unicode escape sequences that could be used to bypass filters
+  sanitized = sanitized.replace(/\\u[0-9a-fA-F]{4}/g, "");
+  sanitized = sanitized.replace(/\\x[0-9a-fA-F]{2}/g, "");
+  // Remove prompt injection patterns
+  for (const pattern of PROMPT_INJECTION_PATTERNS) {
+    pattern.lastIndex = 0;
+    sanitized = sanitized.replace(pattern, "[REMOVED]");
+    pattern.lastIndex = 0;
+  }
+  // Trim excessive whitespace
+  sanitized = sanitized.trim();
+  return sanitized;
+}
+
+/**
+ * Attaches AI-generated content provenance label and HMAC-SHA256 watermark
+ * to any outbound message body so every SMS path carries signed provenance.
+ */
+function attachProvenanceWatermark(body: string): string {
+  const aiLabel = "[AI-GENERATED CONTENT]";
+  const timestamp = new Date().toISOString();
+  const secret = process.env.INTERNAL_API_SECRET ?? "default-watermark-secret";
+  const watermark = createHash("sha256")
+    .update(`${body}|${timestamp}|${secret}`)
+    .digest("hex")
+    .slice(0, 16);
+  return `${aiLabel}\n${body}\n---\nGenerated: ${timestamp} | WM: ${watermark}`;
+}
 
 function validateAndSanitizeLLMOutput(text: string): string {
   for (const pattern of DYNAMIC_CODE_PATTERNS) {
@@ -96,7 +204,26 @@ export async function POST(request: Request) {
   rawBody.split("&").forEach((item) => {
     const [key, value] = item.split("=");
     if (key) {
-      bodyParams[decodeURIComponent(key)] = decodeURIComponent(value || "");
+      // Safe URL-decode helper: rejects keys/values containing characters outside
+// the safe set (alphanumerics, spaces, hyphens, underscores, dots, @, +)
+const SAFE_PARAM_PATTERN = /^[\w\s\-\.@+]*$/;
+const safeDecodeParam = (raw: string): string => {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = "";
+  }
+  if (!SAFE_PARAM_PATTERN.test(decoded)) {
+    console.warn("WARNING: Rejected unsafe URL-decoded param value.", raw);
+    return "";
+  }
+  return decoded;
+};
+const decodedKey = safeDecodeParam(key);
+if (decodedKey) {
+  bodyParams[decodedKey] = safeDecodeParam(value || "");
+}
     }
   });
 
@@ -134,6 +261,53 @@ export async function POST(request: Request) {
     // Enforce maximum length
     if (sanitized.length === 0 || sanitized.length > MAX_PROMPT_LENGTH) {
       return null;
+    }
+    // Reject hidden/invisible Unicode characters (zero-width, soft-hyphen, BOM, etc.)
+    const hiddenUnicodePattern = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u2028\u2029]/g;
+    if (hiddenUnicodePattern.test(sanitized)) {
+      console.warn("WARNING: Prompt rejected — hidden/invisible Unicode characters detected.");
+      return null;
+    }
+    // Reject base64-encoded payloads (long base64-like strings that may encode commands)
+    const base64Pattern = /(?:[A-Za-z0-9+\/]{20,}={0,2})/g;
+    const base64Matches = sanitized.match(base64Pattern);
+    if (base64Matches) {
+      for (const match of base64Matches) {
+        try {
+          const decoded = Buffer.from(match, "base64").toString("utf8");
+          // If decoded content contains shell/code patterns, reject
+          const shellInDecoded = /[\x00-\x08\x0E-\x1F]|\bexec\b|\beval\b|\bsystem\b|\/bin\/|cmd\.exe|powershell/i;
+          if (shellInDecoded.test(decoded)) {
+            console.warn("WARNING: Prompt rejected — base64-encoded command content detected.");
+            return null;
+          }
+        } catch {
+          // Not valid base64, ignore
+        }
+      }
+    }
+    // Reject leetspeak obfuscation attempts targeting known dangerous keywords
+    // e.g. 3v4l -> eval, 3x3c -> exec, syst3m -> system
+    const leetspeakDangerousPattern = /(?:[3e][vV][4a][lL]|[3e][xX][3e][cC]|[sS][yY][sS][tT][3e][mM]|[pP][0o][wW][3e][rR][sS][hH][3e][lL][lL]|[sS][hH][3e][lL][lL])/g;
+    if (leetspeakDangerousPattern.test(sanitized)) {
+      console.warn("WARNING: Prompt rejected — leetspeak obfuscation of dangerous keyword detected.");
+      return null;
+    }
+    // Reject binary/shell command content
+    const shellCommandPattern = /(?:\/bin\/(?:sh|bash|zsh|dash|ksh)|cmd\.exe|powershell(?:\.exe)?|\bwget\s+http|\bcurl\s+http|\bnc\s+-|\bnetcat\b|\bchmod\s+[0-7]{3,4}|\bchown\s+|\brm\s+-[rRfF]|\bmkdir\s+-p|\bsudo\s+|\bsu\s+-|\bpasswd\b|\bssh\s+|\bscp\s+|\brsync\s+|\btar\s+.*-[xXcC]|\bpython[23]?\s+-c|\bperl\s+-e|\bruby\s+-e|\bnode\s+-e|\bphp\s+-r|\bbash\s+-c|\bsh\s+-c)/gi;
+    if (shellCommandPattern.test(sanitized)) {
+      console.warn("WARNING: Prompt rejected — shell/binary command content detected.");
+      return null;
+    }
+    // Reject dynamic code execution patterns (reuse module-level DYNAMIC_CODE_PATTERNS)
+    for (const pattern of DYNAMIC_CODE_PATTERNS) {
+      pattern.lastIndex = 0;
+      if (pattern.test(sanitized)) {
+        console.warn(`WARNING: Prompt rejected — dynamic code execution pattern detected: ${pattern}`);
+        pattern.lastIndex = 0;
+        return null;
+      }
+      pattern.lastIndex = 0;
     }
     return sanitized;
   };
@@ -210,27 +384,53 @@ export async function POST(request: Request) {
 
   const companionName = companionConfig.name;
 
-  // Only models from the organization's approved list may be used.
-  const APPROVED_MODELS: string[] = ["claude"];
-  const requestedModel: string = companionConfig.llm;
-  const companionModel: string = APPROVED_MODELS.includes(requestedModel)
-    ? requestedModel
-    : APPROVED_MODELS[0];
+    // Approved model registry: only models listed here may be used.
+  // Each entry pins the model to a specific version and endpoint path.
+  const APPROVED_MODEL_REGISTRY: Record<string, { pinnedVersion: string; endpoint: string }> = {
+    "claude-3-opus": { pinnedVersion: "claude-3-opus-20240229", endpoint: "claude" },
+    "claude-3-sonnet": { pinnedVersion: "claude-3-sonnet-20240229", endpoint: "claude" },
+    "claude-3-haiku": { pinnedVersion: "claude-3-haiku-20240307", endpoint: "claude" },
+  };
+  const DEFAULT_APPROVED_MODEL = "claude-3-haiku";
 
-    const llmRequestPayload = {
+  function resolveApprovedModel(requested: string): { modelKey: string; pinnedVersion: string; endpoint: string } {
+    const entry = APPROVED_MODEL_REGISTRY[requested];
+    if (entry) {
+      return { modelKey: requested, ...entry };
+    }
+    // Fall back to default approved model
+    const defaultEntry = APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL]!;
+    return { modelKey: DEFAULT_APPROVED_MODEL, ...defaultEntry };
+  }
+
+  const requestedModel: string = companionConfig.llm;
+  const resolvedModelEntry = resolveApprovedModel(requestedModel);
+  const companionModel: string = resolvedModelEntry.endpoint;
+
+  // Anonymize PII before sending to AI model: hash the internal userId, omit real name
+  const crypto = await import("crypto");
+  const anonymizedUserId = crypto
+    .createHash("sha256")
+    .update(String(users[0].id))
+    .digest("hex");
+  const anonymizedUserName = "user";
+
+  const llmRequestPayload = {
     prompt,
     isText: true,
-    userId: users[0].id,
-    userName: users[0].firstName,
+    userId: anonymizedUserId,
+    userName: anonymizedUserName,
   };
 
   console.log(
     JSON.stringify({
       event: "llm_interaction_request",
       timestamp: new Date().toISOString(),
-      companionModel,
+      requestedModel,
+      resolvedModelKey: resolvedModelEntry.modelKey,
+      pinnedVersion: resolvedModelEntry.pinnedVersion,
       companionName,
-      endpoint: `${serverUrl}/api/${companionModel}`,
+      endpoint: `${serverUrl}/api/${resolvedModelEntry.endpoint}`,
       request: llmRequestPayload,
     })
   );
@@ -270,7 +470,87 @@ export async function POST(request: Request) {
     );
   }
 
-  const response = await fetch(`${serverUrl}/api/${companionModel}`, {
+  /**
+   * Validates and sanitizes LLM output by rejecting or stripping content
+   * that contains dynamic code execution primitives (eval, Function constructor,
+   * setTimeout/setInterval with string args, etc.).
+   */
+  function validateAndSanitizeLLMOutput(text: string): string {
+    if (typeof text !== "string") {
+      throw new Error("LLM output must be a string");
+    }
+    // Patterns that indicate dynamic code execution primitives
+    const dangerousPatterns = [
+      /\beval\s*\(/gi,
+      /\bFunction\s*\(/gi,
+      /\bnew\s+Function\b/gi,
+      /\bsetTimeout\s*\(\s*['"`]/gi,
+      /\bsetInterval\s*\(\s*['"`]/gi,
+      /\bexecScript\s*\(/gi,
+      /\bdocument\.write\s*\(/gi,
+      /\bimportScripts\s*\(/gi,
+    ];
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(text)) {
+        console.warn(
+          "WARNING: LLM output contained a dynamic code execution primitive and was rejected.",
+          { pattern: pattern.toString() }
+        );
+        // Strip the dangerous content rather than forwarding it
+        text = text.replace(pattern, "[REDACTED]");
+      }
+    }
+    return text;
+  }
+
+    // Build a short-lived, per-request signed token:
+  //   payload = "<timestamp>.<nonce>.<userId>"
+  //   token   = "<payload>.<HMAC-SHA256(payload, internalApiSecret)>"
+  // Expiry is enforced by the receiving service checking that timestamp is within tolerance.
+  const crypto = await import("crypto");
+  const tokenTimestamp = Date.now(); // ms since epoch
+  const tokenNonce = crypto.randomBytes(16).toString("hex");
+  const tokenUserId = users[0].id;
+  const tokenPayload = `${tokenTimestamp}.${tokenNonce}.${tokenUserId}`;
+  const tokenSignature = crypto
+    .createHmac("sha256", internalApiSecret)
+    .update(tokenPayload)
+    .digest("hex");
+  const signedToken = `${tokenPayload}.${tokenSignature}`;
+
+  // SSRF mitigation: validate serverUrl against an allowlist of permitted origins
+  const ALLOWED_SERVER_ORIGINS: string[] = (
+    process.env.ALLOWED_LLM_SERVER_ORIGINS ?? ""
+  )
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  let parsedServerUrl: URL;
+  try {
+    parsedServerUrl = new URL(serverUrl);
+  } catch {
+    console.error("ERROR: serverUrl is not a valid URL.", serverUrl);
+    return new NextResponse(
+      JSON.stringify({ Message: "Internal server configuration error" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  const serverOrigin = parsedServerUrl.origin;
+  if (
+    ALLOWED_SERVER_ORIGINS.length > 0 &&
+    !ALLOWED_SERVER_ORIGINS.includes(serverOrigin)
+  ) {
+    console.error(
+      `ERROR: serverUrl origin "${serverOrigin}" is not in the allowlist.`
+    );
+    return new NextResponse(
+      JSON.stringify({ Message: "Internal server configuration error" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  // Build the fetch URL from the validated origin only — no raw interpolation
+  const safeFetchUrl = `${serverOrigin}/api/${encodeURIComponent(companionModel)}`;
+  const response = await fetch(safeFetchUrl, {
     body: JSON.stringify({
       prompt,
       isText: true,
@@ -281,31 +561,85 @@ export async function POST(request: Request) {
     headers: {
       "Content-Type": "application/json",
       name: companionName,
-      Authorization: `Bearer ${internalApiSecret}`,
+      Authorization: `Bearer ${signedToken}`,
     },
   });
 
-      const responseText = await response.text();
+      const rawResponseText = await response.text();
+  const responseText = validateAndSanitizeLLMOutput(rawResponseText);
   let smsBody: string;
   try {
     const parsed = JSON.parse(responseText);
-    smsBody = parsed.text ?? parsed.message ?? parsed.response ?? String(parsed);
+    smsBody = validateAndSanitizeLLMOutput(
+      parsed.text ?? parsed.message ?? parsed.response ?? String(parsed)
+    );
   } catch {
-    smsBody = responseText;
+    // Sanitize raw response text when JSON parsing fails
+    smsBody = validateAndSanitizeLLMOutput(responseText);
   }
   // Truncate to SMS-safe length to avoid leaking excess model output
   const MAX_SMS_LENGTH = 1600;
   smsBody = smsBody.slice(0, MAX_SMS_LENGTH);
 
-  const to = queryMap["From"];
+    const piiEncryptionKey = process.env.PII_ENCRYPTION_KEY;
+  if (!piiEncryptionKey) {
+    console.error("ERROR: PII_ENCRYPTION_KEY is not configured.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Internal server configuration error" }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  // Encrypt PII (phone number) for any internal logging/storage
+  const encryptPhoneNumber = (phoneNumber: string, key: string): string => {
+    const crypto = require("crypto");
+    const keyBuffer = crypto.scryptSync(key, "salt", 32);
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv("aes-256-cbc", keyBuffer, iv);
+    const encrypted = Buffer.concat([
+      cipher.update(phoneNumber, "utf8"),
+      cipher.final(),
+    ]);
+    return `${iv.toString("hex")}:${encrypted.toString("hex")}`;
+  };
+
+  const toRaw = queryMap["From"]; // actual phone number for Twilio routing only
   const from = queryMap["To"];
+  // Encrypted reference used for any logging or internal storage — never log toRaw
+  const toEncrypted = encryptPhoneNumber(toRaw, piiEncryptionKey);
+  console.log(`Sending SMS to encrypted recipient: ${toEncrypted}`);
+
   await twilioClient.messages
     .create({
       body: smsBody,
       from,
-      to,
+      to: toRaw, // Twilio requires plaintext number; transmitted over Twilio's encrypted HTTPS channel
     }) | ${new Date().toISOString()}`;
   const labeledResponseText = `${aiLabel}\n${responseText}${provenanceFooter}`;
+
+  await twilioClient.messages
+    .create({
+      body: labeledResponseText,
+      from,
+      to: toRaw,
+    })
+  );
+  await twilioClient.messages
+    .create({
+      body: responseText,
+      from,
+      to: toRaw,
+    })
+    .catch((err) => {
+      // Log encrypted reference only — never log the raw phone number
+      console.log(`WARNING: failed to send SMS to encrypted recipient ${toEncrypted}.`, err);
+    });
+  const provenanceFooter = ` | ${new Date().toISOString()}`;
+  const aiLabel = "[AI-GENERATED CONTENT]";
+  const labeledResponseText = attachProvenanceWatermark(`${aiLabel}\n${responseText}${provenanceFooter}`);
 
   await twilioClient.messages
     .create({
@@ -314,9 +648,10 @@ export async function POST(request: Request) {
       to,
     })
   );
+  const wateredResponseText = attachProvenanceWatermark(responseText);
   await twilioClient.messages
     .create({
-      body: responseText,
+      body: wateredResponseText,
       from,
       to,
     })

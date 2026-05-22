@@ -6,12 +6,51 @@ import { Tooltip } from "react-tooltip";
 
 import { getCompanions } from "./actions";
 
+const ALLOWED_IMAGE_HOSTS = [
+  'res.cloudinary.com',
+  'lh3.googleusercontent.com',
+  'avatars.githubusercontent.com',
+  's3.amazonaws.com',
+];
+
+function getSafeImageUrl(url: string): string {
+  if (!url) return '/placeholder.png';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return '/placeholder.png';
+    if (!ALLOWED_IMAGE_HOSTS.includes(parsed.hostname)) return '/placeholder.png';
+    return url;
+  } catch {
+    return '/placeholder.png';
+  }
+}
+
+// Approved model registry: only these pinned model identifiers are permitted
+const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+  "gpt-4o-2024-08-06": "GPT-4o (2024-08-06)",
+  "gpt-4-turbo-2024-04-09": "GPT-4 Turbo (2024-04-09)",
+  "claude-3-5-sonnet-20241022": "Claude 3.5 Sonnet (2024-10-22)",
+  "claude-3-opus-20240229": "Claude 3 Opus (2024-02-29)",
+};
+
+function resolveApprovedModel(llm: string): string | null {
+  const normalized = (llm || "").trim().toLowerCase();
+  for (const [pinnedId, displayName] of Object.entries(APPROVED_MODEL_REGISTRY)) {
+    if (normalized === pinnedId.toLowerCase()) {
+      return displayName;
+    }
+  }
+  return null;
+}
+
 export default function Examples() {
   const [QAModalOpen, setQAModalOpen] = useState(false);
   const [CompParam, setCompParam] = useState({
     name: "",
     title: "",
     imageUrl: "",
+    llm: "",
+    telegramLink: null as string | null,
   });
   const [examples, setExamples] = useState([
     {
@@ -19,22 +58,24 @@ export default function Examples() {
       title: "",
       imageUrl: "",
       llm: "",
-      phone: "",
-      telegramLink: null
+      maskedPhone: "",
+      telegramLink: null as string | null,
     },
   ]);
 
   useEffect(() => {
+    const APPROVED_LLMS = ['gpt-4', 'gpt-4o', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku'];
+
     const fetchData = async () => {
       try {
         const companions = await getCompanions();
         let entries = JSON.parse(companions);
-        let setme = entries.map((entry: any) => ({
+                let setme = entries.map((entry: any) => ({
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          llm: entry.llm,
-          phone: entry.phone,
+          llm: resolveApprovedModel(entry.llm) ?? "[unregistered model]",
+          maskedPhone: isPhoneNumber(entry.phone) ? maskPhone(entry.phone) : "",
           telegramLink: entry.telegramLink
         }));
         setExamples(setme);
@@ -61,7 +102,7 @@ export default function Examples() {
           <li
             key={example.name}
             onClick={() => {
-              setCompParam(example);
+              setCompParam({ name: example.name, title: example.title, imageUrl: example.imageUrl, llm: example.llm, telegramLink: example.telegramLink });
               setQAModalOpen(true);
             }}
             className="col-span-2 flex flex-col rounded-lg bg-slate-800  text-center shadow relative ring-1 ring-white/10 cursor-pointer hover:ring-sky-300/70 transition"
@@ -73,7 +114,7 @@ export default function Examples() {
                 height={0}
                 sizes="100vw"
                 className="mx-auto h-32 w-32 flex-shrink-0 rounded-full"
-                src={example.imageUrl}
+                src={getSafeImageUrl(example.imageUrl)}
                 alt=""
               />
               <h3 className="mt-6 text-sm font-medium text-white">
@@ -82,7 +123,7 @@ export default function Examples() {
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
-                  {example.title}. Running on <b>{example.llm}</b>.
+                  {example.title}.{example.llm ? <> Running on <b>{example.llm}</b>.</> : null}
                   {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
                     <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}
@@ -90,13 +131,13 @@ export default function Examples() {
               </dl>
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
-                {isPhoneNumber(example.phone) && (
+                {example.maskedPhone && (
                   <>
                     <dd
                       data-tip="Helpful tip goes here"
                       className="text-sm text-slate-400 inline-block"
                     >
-                      📱Text me at: <b>{maskPhone(example.phone)}</b>
+                      📱Text me at: <b>{example.maskedPhone}</b>
                       &nbsp;
                       <svg
                         data-tooltip-id="help-tooltip"
@@ -146,7 +187,7 @@ function isSafeTelegramUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     return (
-      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      (parsed.protocol === 'https:') &&
       ALLOWED_TELEGRAM_HOSTNAMES.includes(parsed.hostname)
     );
   } catch {

@@ -1,6 +1,7 @@
 "use client";
 
 import {Fragment, useEffect, useRef, useState} from "react";
+import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import { useCompletion } from "ai/react";
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
@@ -13,39 +14,95 @@ async function sha256Hex(message: string): Promise<string> {
     .join("");
 }
 
+async function computeProvenanceSignature(text: string, modelId: string, timestamp: string): Promise<string> {
+  const payload = `${modelId}|${timestamp}|${text}`;
+  return sha256Hex(payload);
+}
+
 async function writeAuditLog(entry: Record<string, unknown>): Promise<void> {
+  // Enrich entry with required forensic fields if not already present.
+  const sessionId =
+    (typeof window !== "undefined" && (sessionStorage.getItem("sessionId") || localStorage.getItem("sessionId"))) ||
+    "anonymous";
+
+  const enrichedEntry: Record<string, unknown> = {
+    ...entry,
+    // Principal / session identifier (forensic requirement)
+    principalId: sessionId,
+    sessionId,
+    // Timestamp (ISO-8601, always overwrite to guarantee server-side ordering)
+    timestamp: new Date().toISOString(),
+  };
+
+  // Compute input hash if an `input` field is present and hash not already supplied.
+  if (typeof enrichedEntry.input === "string" && !enrichedEntry.inputHash) {
+    try {
+      enrichedEntry.inputHash = await sha256Hex(enrichedEntry.input as string);
+    } catch {
+      enrichedEntry.inputHash = "hash-unavailable";
+    }
+  }
+
+  // Ensure modelVersion is recorded.
+  if (!enrichedEntry.modelVersion && enrichedEntry.model) {
+    enrichedEntry.modelVersion = resolveApprovedModel(enrichedEntry.model as string);
+  }
+
+  let response: Response;
   try {
-    await fetch("/api/audit", {
+    response = await fetch("/api/audit", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(entry),
+      headers: {
+        "Content-Type": "application/json",
+        // Signal append-only / immutable retention intent to the server.
+        "X-Audit-Append-Only": "true",
+        "X-Audit-Retention-Policy": "immutable",
+      },
+      body: JSON.stringify(enrichedEntry),
     });
   } catch (err) {
-    console.error("[audit] failed to write audit log", err);
+    // Network-level failure: log and re-throw so callers can handle / alert.
+    console.error("[audit] network error writing audit log", err);
+    throw new Error(`[audit] Failed to reach audit endpoint: ${(err as Error).message}`);
+  }
+
+  if (!response.ok) {
+    const msg = `[audit] Audit endpoint returned HTTP ${response.status}`;
+    console.error(msg);
+    throw new Error(msg);
   }
 }
 
 var last_name = "";
 
-// Approved model registry: only these pinned model identifiers are permitted.
+// Approved model registry: only models from the organization's approved list are permitted.
+// IMPORTANT: Populate this registry exclusively with model identifiers and pinned versions
+// that appear in the organization's official approved model registry.
+// Do NOT add any model that has not been reviewed and approved by the security team.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  "gpt-4": "gpt-4@2024-04-09",
-  "gpt-3.5-turbo": "gpt-3.5-turbo@2024-01-25",
-  "claude-3-opus": "claude-3-opus@20240229",
-  "claude-3-sonnet": "claude-3-sonnet@20240229",
-  "llama-3-70b": "llama-3-70b@v1.0",
+  // Example (replace with actual org-approved entries):
+  // "org-approved-model-v1": "org-approved-model-v1@2024-01-01",
 };
 
-const DEFAULT_APPROVED_MODEL = "gpt-4";
+// Set this to a key that exists in APPROVED_MODEL_REGISTRY above.
+const DEFAULT_APPROVED_MODEL = Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? "";
 
 function resolveApprovedModel(llmIdentifier: string): string {
-  if (!llmIdentifier || !(llmIdentifier in APPROVED_MODEL_REGISTRY)) {
+  // Normalize bare model names to namespaced registry keys
+  const normalize = (id: string): string => {
+    if (id.startsWith("gpt-")) return `openai/${id}`;
+    if (id.startsWith("claude-")) return `anthropic/${id}`;
+    if (id.startsWith("llama-")) return `meta/${id}`;
+    return id;
+  };
+  const normalized = normalize(llmIdentifier);
+  if (!normalized || !(normalized in APPROVED_MODEL_REGISTRY)) {
     console.warn(
-      `Model "${llmIdentifier}" is not in the approved registry. Falling back to default: ${DEFAULT_APPROVED_MODEL}`
+      `Model "${llmIdentifier}" (normalized: "${normalized}") is not in the approved registry. Falling back to default: ${DEFAULT_APPROVED_MODEL}`
     );
     return APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL];
   }
-  return APPROVED_MODEL_REGISTRY[llmIdentifier];
+  return APPROVED_MODEL_REGISTRY[normalized];
 }
 
 // Allowlist of permitted LLM API endpoint segments.
@@ -78,6 +135,104 @@ function getAllowedLlmPath(llm: string): string {
     return llm;
   }
   return "";
+}
+
+// Sanitize user input before sending to the LLM
+function sanitizeUserInput(text: string): string {
+  if (!text || typeof text !== "string") return "";
+  // Trim whitespace
+  let sanitized = text.trim();
+  // Enforce maximum prompt length (4000 chars)
+  const MAX_PROMPT_LENGTH = 4000;
+  if (sanitized.length > MAX_PROMPT_LENGTH) {
+    sanitized = sanitized.slice(0, MAX_PROMPT_LENGTH);
+  }
+  // Remove null bytes and non-printable control characters (except newlines/tabs)
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Strip prompt injection attempts: remove sequences that try to override system instructions
+  sanitized = sanitized.replace(/ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/gi, "[removed]");
+  sanitized = sanitized.replace(/system\s*:\s*/gi, "");
+  return sanitized;
+}
+
+/**
+ * Sanitize user-supplied prompt input before sending to the LLM.
+ * Returns the cleaned string, or null if the input should be blocked entirely.
+ */
+function sanitizeUserInput(text: string): string | null {
+  if (!text || typeof text !== "string") return "";
+
+  // 1. Block binary/non-printable content (potential binary executables)
+  // Allow common whitespace (\t, \n, \r) but block other control characters
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(text)) {
+    console.warn("[security] Input blocked: binary or non-printable characters detected.");
+    return null;
+  }
+
+  // 2. Block base64-encoded blobs (long base64 strings are a common smuggling vector)
+  // Heuristic: 60+ char base64-looking token with no spaces
+  if (/(?:[A-Za-z0-9+/]{60,}={0,2})/.test(text)) {
+    console.warn("[security] Input blocked: suspected base64-encoded content detected.");
+    return null;
+  }
+
+  // 3. Block shell command patterns
+  const shellPatterns: RegExp[] = [
+    /`[^`]*`/,                          // backtick execution
+    /\$\([^)]*\)/,                      // $(command) substitution
+    /;\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su|exec|eval)\b/i,
+    /&&\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su|exec|eval)\b/i,
+    /\|\s*(bash|sh|python|perl|ruby|nc|ncat|netcat|exec|eval)\b/i,
+    /\b(rm\s+-rf|mkfifo|mknod|dd\s+if=|wget\s+http|curl\s+http)\b/i,
+  ];
+  for (const pattern of shellPatterns) {
+    if (pattern.test(text)) {
+      console.warn("[security] Input blocked: shell command pattern detected.");
+      return null;
+    }
+  }
+
+  // 4. Block hidden/invisible prompt injection characters
+  // Zero-width spaces, direction overrides, and other invisible Unicode
+  if (/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/.test(text)) {
+    console.warn("[security] Input blocked: hidden/invisible Unicode characters detected.");
+    return null;
+  }
+
+  // 5. Block leetspeak-obfuscated dangerous keywords
+  // Normalize common leet substitutions and check for dangerous terms
+  const leetNormalized = text
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/5/g, "s")
+    .replace(/7/g, "t")
+    .replace(/@/g, "a")
+    .replace(/\$/g, "s")
+    .toLowerCase();
+  const blockedLeetTerms: RegExp[] = [
+    /\bignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?|constraints?)\b/,
+    /\bforget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?|constraints?)\b/,
+    /\bact\s+as\s+(if\s+you\s+are|a)\b/,
+    /\byou\s+are\s+now\b/,
+    /\bdan\s+mode\b/,
+    /\bjailbreak\b/,
+    /\bprompt\s+injection\b/,
+    /\bsystem\s+prompt\b/,
+    /\boverride\s+(your\s+)?(instructions?|rules?|constraints?)\b/,
+  ];
+  for (const pattern of blockedLeetTerms) {
+    if (pattern.test(leetNormalized)) {
+      console.warn("[security] Input blocked: suspected prompt injection or jailbreak attempt detected.");
+      return null;
+    }
+  }
+
+  // 6. Strip any remaining suspicious HTML/script tags that could affect rendering
+  const stripped = text.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, "");
+
+  return stripped.trim();
 }
 
 // Sanitize LLM output by removing/neutralizing dynamic code execution primitives
@@ -125,20 +280,53 @@ export default function QAModal({
 }) {
   const { data: session, status } = useSession();
 
+  // Session integrity validation: verify expiry and subject binding before trusting session data.
+  const validateSession = (sess: typeof session): boolean => {
+    if (!sess) return false;
+    // Check expiry: next-auth sessions expose `expires` as an ISO string.
+    if (sess.expires) {
+      const expiryTime = new Date(sess.expires).getTime();
+      if (isNaN(expiryTime) || Date.now() >= expiryTime) {
+        console.warn("[QAModal] Session token has expired.");
+        return false;
+      }
+    } else {
+      // No expiry field — reject to be safe.
+      console.warn("[QAModal] Session token missing expiry field.");
+      return false;
+    }
+    // Subject binding: ensure a stable user identifier is present.
+    const subject = sess.user?.email ?? (sess as any).sub ?? (sess as any).userId;
+    if (!subject || typeof subject !== "string" || subject.trim() === "") {
+      console.warn("[QAModal] Session token missing or invalid subject binding.");
+      return false;
+    }
+    return true;
+  };
+
+  const isSessionValid = status === "authenticated" && validateSession(session);
+  const trustedSession = isSessionValid ? session : null;
+
+  if (status === 'loading') {
+    return null;
+  }
+
+  if (status !== 'authenticated') {
+    return (
+      <div className="p-4 text-center">
+        <p>You must be signed in to use the AI Agent.</p>
+      </div>
+    );
+  }
+
+  if (status === "unauthenticated") {
+    return null;
+  }
+
   if (!example) {
     // create a dummy so the completion doesn't croak during init.
     example = new Object();
     example.llm = "";
-    example.name = "";
-  }: {
-  open: boolean;
-  setOpen: any;
-  example: any;
-}) {
-  if (!example) {
-    // create a dummy so the completion doesn't croak during init.
-    example = new Object();
-    example.llm = "approved-llm";
     example.name = "";
   }
 

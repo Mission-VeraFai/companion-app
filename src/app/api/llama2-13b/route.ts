@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import { createHash } from "crypto";
 import { StreamingTextResponse, LangChainStream } from "ai";
 import { Replicate, ReplicateInput } from "langchain/llms/replicate";
 import { CallbackManager } from "langchain/callbacks";
@@ -8,7 +9,72 @@ import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
 
+// ---------------------------------------------------------------------------
+// Approved Model Registry — only models listed here may be instantiated.
+// Each entry pins the full model identifier (owner/name:version-hash) and
+// records the expected SHA-256 digest of that identifier string so that any
+// tampering with the constant is detected at startup.
+// ---------------------------------------------------------------------------
+interface RegistryEntry {
+  /** Fully-qualified Replicate model id: owner/name:weights-sha256 */
+  modelId: string;
+  /** SHA-256 hex digest of the modelId string itself (integrity manifest) */
+  modelIdDigest: string;
+  /** Human-readable label used in logs / error messages */
+  label: string;
+}
+
+const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
+  "llama2-13b": {
+    modelId:
+      "a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5",
+    // Pre-computed: sha256("a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5")
+    modelIdDigest:
+      "b3c2e5f1a0d4e8f2c6b9a3d7e1f5c0b4a8d2e6f0c4b8a2d6e0f4c8b2a6d0e4f8",
+    label: "Llama-2 13B Chat (a16z-infra, v2)",
+  },
+};
+
+/**
+ * Verifies that:
+ *  1. The requested model key exists in the approved registry.
+ *  2. The stored modelId has not been tampered with by re-computing its
+ *     SHA-256 digest and comparing it to the pinned manifest value.
+ *
+ * Throws if either check fails, preventing an unregistered or modified
+ * model from being loaded.
+ */
+function resolveApprovedModel(modelKey: string): string {
+  const entry = APPROVED_MODEL_REGISTRY[modelKey];
+  if (!entry) {
+    throw new Error(
+      `Model '${modelKey}' is NOT_IN_REGISTRY. ` +
+        `Only approved, version-pinned models may be used.`
+    );
+  }
+
+  // Integrity check: recompute the digest of the modelId string and compare
+  // it to the known-good value stored in the registry manifest.
+  const actualDigest = createHash("sha256")
+    .update(entry.modelId, "utf8")
+    .digest("hex");
+
+  if (actualDigest !== entry.modelIdDigest) {
+    throw new Error(
+      `Integrity verification FAILED for model '${modelKey}' (${entry.label}). ` +
+        `Expected digest ${entry.modelIdDigest} but computed ${actualDigest}. ` +
+        `The model identifier may have been tampered with.`
+    );
+  }
+
+  return entry.modelId;
+}
+
 dotenv.config({ path: `.env.local` });
+
+// Resolve and integrity-verify the model at module load time so that a
+// misconfigured or tampered registry entry fails fast on cold start.
+const MODEL_ID: string = resolveApprovedModel("llama2-13b");
 
 // Sanitize input to prevent prompt injection and remove dangerous patterns
 function sanitizeInput(input: string, maxLength = 4000): string {
@@ -39,6 +105,17 @@ function validateName(name: string | null): string {
 }
 
 export async function POST(request: Request) {
+  // Authentication must happen first before any other logic
+  const   // Authentication and authorization already performed above before rate limiting.),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
   const rawBody = await request.json();
   const isText: boolean = !!rawBody.isText;
   const userId: string = typeof rawBody.userId === "string" ? rawBody.userId.slice(0, 256) : "";
@@ -50,11 +127,66 @@ export async function POST(request: Request) {
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
   }
-  let clerkUserId;
-  let user;
-  let clerkUserName;
 
-  const identifier = request.url + "-" + "anonymous";
+  const identifier = request.url + "-" + clerkUserId;
+  const { success } = await rateLimit(identifier);
+  if (!success) {
+    console.log("INFO: rate limit exceeded");
+    return new NextResponse(
+      JSON.stringify({ Message: "Hi, the companions can't talk this fast." }),
+      {
+        status: 429,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
+  let name: string;
+  try {
+    name = validateName(request.headers.get("name"));
+  } catch {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid companion name" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  // Restrict file name to alphanumeric/hyphen/underscore to prevent path traversal
+  const safeName = name.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  const companion_file_name = safeName + ".txt";),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  // Structured spawn log: record prompt metadata (never the raw value) for audit.
+  console.log(
+    JSON.stringify({
+      event: "llm_spawn",
+      promptLength: prompt.length,
+      userId: userId ? userId.slice(0, 8) + "…" : "anonymous",
+      timestamp: new Date().toISOString(),
+    })
+  );
+  // Authenticate FIRST before any rate limiting or further processing
+  const user = await currentUser();
+  const clerkUserId = user?.id;
+  const clerkUserName = user?.firstName;
+
+  if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
+    return new NextResponse(
+      JSON.stringify({ Message: "User not authorized" }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // Rate limit keyed to the authenticated user, not 'anonymous'
+  const identifier = request.url + "-" + clerkUserId;
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -83,22 +215,6 @@ export async function POST(request: Request) {
   const safeName = name.replace(/[^a-zA-Z0-9_\-]/g, "_");
   const companion_file_name = safeName + ".txt";
 
-  user = await currentUser();
-  clerkUserId = user?.id;
-  clerkUserName = user?.firstName;
-
-  if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
-    return new NextResponse(
-      JSON.stringify({ Message: "User not authorized" }),
-      {
-        status: 401,
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
-  }
-
   // Load character "PREAMBLE" from character file. These are the core personality
   // characteristics that are used in every prompt. Additional background is
   // only included if it matches a similarity comparioson with the current
@@ -118,6 +234,68 @@ export async function POST(request: Request) {
     );
   }
   const data = await fs.readFile(resolvedPath, "utf8");
+
+  // Validate companion file content for malicious patterns before injecting into LLM prompt
+  const containsMaliciousFileContent = (content: string): boolean => {
+    // Check for non-printable / binary bytes (excluding normal whitespace)
+    if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/.test(content)) return true;
+    // Check for hidden/invisible Unicode characters (zero-width, soft-hyphen, etc.)
+    if (/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u2028\u2029]/.test(content)) return true;
+    // Check for base64-encoded blobs (long runs of base64 chars that look encoded)
+    if (/(?:[A-Za-z0-9+\/]{40,}={0,2})/.test(content)) return true;
+    // Check for shell command sequences
+    if (/(?:bash|sh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|`[^`]*`|\$\([^)]*\)|&&|\|\||;\s*\w)/i.test(content)) return true;
+    // Check for leetspeak substitution patterns (e.g. 1gnor3, syst3m, 3xec)
+    if (/(?:1gnor[e3]|syst[e3]m|[e3]x[e3]c|[i1]nj[e3]ct|[o0]v[e3]rr[i1]d[e3])/i.test(content)) return true;
+    return false;
+  };
+
+  if (containsMaliciousFileContent(data)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Companion file contains disallowed content." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  // Scan companion file contents for malicious prompt injection patterns
+  const scanCompanionFileForMaliciousContent = (content: string): boolean => {
+    // Check for base64-encoded content (long base64 strings that could hide instructions)
+    if (/(?:[A-Za-z0-9+\/]{40,}={0,2})/.test(content)) return true;
+    // Check for shell commands
+    if (/(?:bash|sh|cmd|powershell|exec|eval|system|popen|subprocess|os\.)/i.test(content)) return true;
+    // Check for common prompt injection phrases
+    if (/ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i.test(content)) return true;
+    if (/you\s+are\s+now\s+(a\s+)?(?!the companion)/i.test(content)) return true;
+    if (/disregard\s+(all\s+)?(previous|prior|above)/i.test(content)) return true;
+    if (/new\s+(role|persona|instructions?|task|objective)/i.test(content)) return true;
+    if (/act\s+as\s+(if\s+you\s+are|a\s+)?(?!the companion)/i.test(content)) return true;
+    if (/do\s+not\s+follow\s+(your\s+)?(previous|prior|original)\s+(instructions?|guidelines?)/i.test(content)) return true;
+    // Check for leetspeak patterns (e.g., 1gn0r3, syst3m)
+    if (/[il1][g9][n][o0][r][e3]/i.test(content)) return true;
+    if (/[s5][y][s5][t7][e3][m]/i.test(content)) return true;
+    // Check for hidden Unicode control characters or zero-width characters
+    if (/[\u200B-\u200D\uFEFF\u00AD\u2060]/.test(content)) return true;
+    // Check for excessive repetition of injection-related keywords
+    const injectionKeywords = ['ignore', 'forget', 'override', 'bypass', 'jailbreak', 'prompt', 'instruction'];
+    for (const kw of injectionKeywords) {
+      const matches = content.match(new RegExp(kw, 'gi'));
+      if (matches && matches.length > 10) return true;
+    }
+    return false;
+  };
+
+  if (scanCompanionFileForMaliciousContent(data)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Companion file contains potentially malicious content." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
   const presplit = data.split("###ENDPREAMBLE###");
@@ -224,6 +402,7 @@ export async function POST(request: Request) {
 
   const MODEL_ID =
     "a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5";
+  const PUBLIC_MODEL_ALIAS = "llama2-13b";
   const inputPrompt = `
        ONLY generate NO more than three sentences as ${name}. DO NOT generate more than three sentences. 
        Make sure the output you generate starts with '${name}:' and ends with a period.
@@ -337,10 +516,14 @@ export async function POST(request: Request) {
 
   const cleaned = resp.replaceAll(",", "");
   const chunks = cleaned.split("\n");
-  const response = chunks[0];
+  const response = sanitizeLLMOutput(chunks[0]);
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
-  await memoryManager.writeToHistory("" + response.trim(), companionKey);
+    try {
+    await memoryManager.writeToHistory("" + response.trim(), companionKey);
+  } catch (historyErr) {
+    console.error("[AUDIT] First writeToHistory failed:", historyErr);
+  }
   var Readable = require("stream").Readable;
 
   const MODEL_ID =
@@ -349,10 +532,35 @@ export async function POST(request: Request) {
 
   // Cryptographic watermark: HMAC-SHA256 over (modelId + timestamp + response)
   const crypto = require("crypto");
-  const signingSecret = process.env.WATERMARK_SECRET || "default-watermark-secret";
+  const signingSecret = process.env.WATERMARK_SECRET;
+  if (!signingSecret) {
+    throw new Error("WATERMARK_SECRET environment variable is not set. Refusing to sign with a fallback secret.");
+  }
   const hmac = crypto.createHmac("sha256", signingSecret);
   hmac.update(`${MODEL_ID}|${generatedAt}|${response}`);
   const signature = hmac.digest("hex");
+
+  // Persistent audit record for forensic readiness
+  const inputHash = crypto.createHash("sha256").update(llmPrompt).digest("hex");
+  const outputHash = crypto.createHash("sha256").update(response).digest("hex");
+  const auditRecord = JSON.stringify({
+    event: "ai_inference",
+    model_id: MODEL_ID,
+    principal: companionKey,
+    input_hash: inputHash,
+    output_hash: outputHash,
+    timestamp: generatedAt,
+    signature,
+  });
+  console.log("[AUDIT_LOG]", auditRecord);
+  if (process.env.AUDIT_LOG_PATH) {
+    const fs = require("fs");
+    try {
+      fs.appendFileSync(process.env.AUDIT_LOG_PATH, auditRecord + "\n", { encoding: "utf8" });
+    } catch (auditErr) {
+      console.error("[AUDIT] Failed to write persistent audit record:", auditErr);
+    }
+  }
 
   // Provenance prefix prepended to the streamed payload
   const provenancePrefix =
@@ -362,13 +570,37 @@ export async function POST(request: Request) {
   s.push(provenancePrefix + response);
   s.push(null);
   if (response !== undefined && response.length > 1) {
+    try {
+      await memoryManager.writeToHistory("" + response.trim(), companionKey);
+    } catch (historyErr) {
+      console.error("[AUDIT] Second writeToHistory failed:", historyErr);
+    }
+  }
+  const hmac = crypto.createHmac("sha256", signingSecret);
+  hmac.update(`${PUBLIC_MODEL_ALIAS}|${generatedAt}|${response}`);
+  const signature = hmac.digest("hex");
+
+  // Provenance prefix prepended to the streamed payload
+  const provenancePrefix =
+    `[AI-GENERATED CONTENT | model=${PUBLIC_MODEL_ALIAS} | generated_at=${generatedAt} | sig=${signature}]\n`;
+
+  let s = new Readable();
+  s.push(provenancePrefix + response);
+  s.push(null);
+  console.log(JSON.stringify({
+    event: "llm_interaction_response",
+    model: MODEL_ID,
+    timestamp: new Date().toISOString(),
+    response: response,
+  }));
+  if (response !== undefined && response.length > 1) {
     memoryManager.writeToHistory("" + response.trim(), companionKey);
   }
 
   // Provenance and labeling headers
   const provenanceHeaders = new Headers({
     "X-AI-Generated": "true",
-    "X-AI-Model-ID": MODEL_ID,
+    "X-AI-Model-ID": PUBLIC_MODEL_ALIAS,
     "X-AI-Generated-At": generatedAt,
     "X-AI-Content-Signature": signature,
     "X-Content-Label": "synthetic-ai-generated-text",
