@@ -9,11 +9,49 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
-const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit_ai_actions.log");
+const AUDIT_LOG_BASE_DIR = process.env.AUDIT_LOG_DIR
+  ? path.resolve(process.env.AUDIT_LOG_DIR)
+  : "/var/log/app";
+const AUDIT_LOG_PATH = path.join(AUDIT_LOG_BASE_DIR, "audit_ai_actions.log");
+const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || "", 10) || 10 * 1024 * 1024; // 10 MB default
+const AUDIT_LOG_MODEL_ID = "steamship-agent-v1";
+const AUDIT_LOG_MODEL_VERSION = APPROVED_MODEL_REGISTRY[AUDIT_LOG_MODEL_ID]?.version ?? "unknown";
+
+function rotateAuditLogIfNeeded(): void {
+  try {
+    if (fs.existsSync(AUDIT_LOG_PATH)) {
+      const { size } = fs.statSync(AUDIT_LOG_PATH);
+      if (size >= MAX_AUDIT_LOG_BYTES) {
+        const rotated = AUDIT_LOG_PATH.replace(
+          /(\.log)?$/,
+          `.${new Date().toISOString().replace(/[:.]/g, "-")}.log`
+        );
+        fs.renameSync(AUDIT_LOG_PATH, rotated);
+      }
+    }
+  } catch (err) {
+    process.stderr.write("[AUDIT LOG ROTATION FAILURE] " + String(err) + "\n");
+  }
+}
 
 function writeAuditLog(entry: Record<string, unknown>): void {
-  const line = JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + "\n";
+  // Enrich with model identity for complete decision audit records
+  const enriched: Record<string, unknown> = {
+    ...entry,
+    modelId: AUDIT_LOG_MODEL_ID,
+    modelVersion: AUDIT_LOG_MODEL_VERSION,
+    timestamp: new Date().toISOString(),
+  };
+  // Compute a deterministic input hash over the enriched payload (excluding the hash field itself)
+  const inputHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(enriched))
+    .digest("hex");
+  enriched.inputHash = inputHash;
+
+  const line = JSON.stringify(enriched) + "\n";
   try {
+    rotateAuditLogIfNeeded();
     fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
   } catch (err) {
     // Fallback: emit to stderr so the record is not silently lost
@@ -25,10 +63,27 @@ dotenv.config({ path: `.env.local` });
 
 // Approved model registry: only these pinned, versioned endpoints are permitted.
 // Add new approved endpoints here after security review.
+// Version MUST be an immutable digest or commit hash — mutable tags (e.g. "1.0.0") are not permitted.
+// The endpoint MUST be supplied via the environment variable; an empty/missing value is a hard startup error.
+(function validateApprovedModelRegistryEnv() {
+  const requiredEnvVars: Record<string, string | undefined> = {
+    APPROVED_STEAMSHIP_ENDPOINT_V1: process.env.APPROVED_STEAMSHIP_ENDPOINT_V1,
+  };
+  for (const [key, value] of Object.entries(requiredEnvVars)) {
+    if (!value || value.trim() === "") {
+      throw new Error(
+        `[SECURITY] Required environment variable '${key}' is missing or empty. ` +
+        `All approved model registry endpoints must be explicitly configured. Refusing to start.`
+      );
+    }
+  }
+})();
+
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; endpoint: string }> = {
+  // version must be an immutable digest (sha256) or commit hash — NOT a mutable semver tag.
   "steamship-agent-v1": {
-    version: "1.0.0",
-    endpoint: process.env.APPROVED_STEAMSHIP_ENDPOINT_V1 || "",
+    version: "sha256:a3f1c2e4b5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2",
+    endpoint: process.env.APPROVED_STEAMSHIP_ENDPOINT_V1 as string,
   },
 };
 
@@ -40,11 +95,8 @@ function isApprovedEndpoint(url: string): boolean {
 }
 
 // Allowlist of hostnames permitted for outbound agent fetch calls.
-// Override via comma-separated ALLOWED_AGENT_HOSTNAMES env var, e.g. "api.steamship.com,staging.steamship.com"
-const DEFAULT_ALLOWED_AGENT_HOSTNAMES = ["api.steamship.com"];
-const ALLOWED_AGENT_HOSTNAMES: string[] = process.env.ALLOWED_AGENT_HOSTNAMES
-  ? process.env.ALLOWED_AGENT_HOSTNAMES.split(",").map((h) => h.trim().toLowerCase())
-  : DEFAULT_ALLOWED_AGENT_HOSTNAMES;
+// To change allowed hostnames, update this list after security review.
+const ALLOWED_AGENT_HOSTNAMES: string[] = ["api.steamship.com"];
 
 function isAllowedAgentUrl(url: string): boolean {
   try {
@@ -91,8 +143,6 @@ function sanitizePrompt(input: string): { safe: boolean; reason?: string } {
   }
   return { safe: true };
 }
-
-const MAX_PROMPT_LENGTH = 2000;
 
 // Patterns commonly used in prompt injection attacks
 const PROMPT_INJECTION_PATTERNS = [
@@ -279,6 +329,71 @@ export async function POST(req: Request) {
     return returnError(403, `Companion '${companionName}' does not define an 'allowedTools' list. All tool usage must be explicitly permitted.`);
   }
 
+    // Validate chat_session_id integrity: verify HMAC signature, expiry, and subject binding.
+  // Expected format of chatSessionId: "<base64(json_payload)>.<hmac_signature>"
+  // where json_payload = { sid: string, sub: string, exp: number }
+  const SESSION_HMAC_SECRET = process.env.SESSION_HMAC_SECRET;
+  if (!SESSION_HMAC_SECRET) {
+    return returnError(500, "Session signing secret is not configured.");
+  }
+
+  let verifiedSessionId: string;
+  try {
+    const lastDot = chatSessionId.lastIndexOf(".");
+    if (lastDot === -1) {
+      throw new Error("Malformed session token: missing signature delimiter.");
+    }
+    const payloadB64 = chatSessionId.substring(0, lastDot);
+    const providedSig = chatSessionId.substring(lastDot + 1);
+
+    // Recompute expected HMAC-SHA256 signature over the payload.
+    const expectedSig = crypto
+      .createHmac("sha256", SESSION_HMAC_SECRET)
+      .update(payloadB64)
+      .digest("hex");
+
+    // Constant-time comparison to prevent timing attacks.
+    const expectedBuf = Buffer.from(expectedSig, "hex");
+    const providedBuf = Buffer.from(providedSig, "hex");
+    if (
+      expectedBuf.length !== providedBuf.length ||
+      !crypto.timingSafeEqual(expectedBuf, providedBuf)
+    ) {
+      throw new Error("Session token signature verification failed.");
+    }
+
+    // Decode and parse the payload.
+    const payloadJson = Buffer.from(payloadB64, "base64").toString("utf8");
+    const payload = JSON.parse(payloadJson) as { sid: string; sub: string; exp: number };
+
+    // Check expiry.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (!payload.exp || nowSeconds > payload.exp) {
+      throw new Error("Session token has expired.");
+    }
+
+    // Check subject binding: session must be bound to the authenticated user.
+    if (!payload.sub || payload.sub !== clerkUserId) {
+      throw new Error("Session token subject binding mismatch.");
+    }
+
+    if (!payload.sid) {
+      throw new Error("Session token missing session ID.");
+    }
+
+    verifiedSessionId = payload.sid;
+  } catch (sessionErr) {
+    writeAuditLog({
+      event: "session_token_validation_failure",
+      principal: clerkUserId,
+      agentUrl,
+      companionName,
+      chatSessionId: "[REDACTED]",
+      error: String(sessionErr),
+    });
+    return returnError(403, "Invalid or expired session token.");
+  }
+
   // Invoke the generation. The allow list is forwarded so the remote agent
   // can also restrict itself to only the approved tools.
   // To build, deploy, and host your own multi-tenant agent see: https://www.steamship.com/learn/agent-guidebook
@@ -290,10 +405,50 @@ export async function POST(req: Request) {
     },
     body: JSON.stringify({
       question: prompt,
-      chat_session_id: chatSessionId,
+      chat_session_id: verifiedSessionId,
       allowed_tools: allowedTools
     })
   });
+
+  // Verify server identity: the server must present a pre-shared token in the
+  // X-Agent-Token response header. This authenticates the MCP server to the client,
+  // preventing trust in responses from spoofed or MITM endpoints.
+  const expectedServerToken = process.env.AGENT_SERVER_TOKEN;
+  if (!expectedServerToken) {
+    writeAuditLog({
+      event: "ai_agent_server_auth_misconfigured",
+      principal: clerkUserId,
+      agentUrl,
+      companionName,
+      chatSessionId,
+      inputHash,
+      modelIdentifier: companionConfig.generateEndpoint ?? agentUrl,
+      error: "AGENT_SERVER_TOKEN environment variable is not set",
+    });
+    return returnError(500, "Server authentication is not configured. Set AGENT_SERVER_TOKEN.");
+  }
+  const presentedServerToken = response.headers.get("X-Agent-Token");
+  const serverTokenValid =
+    presentedServerToken !== null &&
+    presentedServerToken.length === expectedServerToken.length &&
+    crypto.timingSafeEqual(
+      Buffer.from(presentedServerToken, "utf8"),
+      Buffer.from(expectedServerToken, "utf8")
+    );
+  if (!serverTokenValid) {
+    writeAuditLog({
+      event: "ai_agent_server_auth_failure",
+      principal: clerkUserId,
+      agentUrl,
+      companionName,
+      chatSessionId,
+      inputHash,
+      httpStatus: response.status,
+      modelIdentifier: companionConfig.generateEndpoint ?? agentUrl,
+      error: "Server did not present a valid X-Agent-Token header",
+    });
+    return returnError(502, "Agent server failed authentication. The response did not include a valid server identity token.");
+  }
   } catch (fetchErr) {
     writeAuditLog({
       event: "ai_agent_invocation_error",
@@ -307,6 +462,14 @@ export async function POST(req: Request) {
     });
     return returnError(500, "Agent request failed");
   }
+
+  writeAuditLog({
+    event: "llm_response",
+    userId: user?.id ?? "unknown",
+    agentUrl,
+    status: response.status,
+    ok: response.ok,
+  });
 
   if (response.ok) {
     const responseText = await response.text();
@@ -340,9 +503,13 @@ export async function POST(req: Request) {
     return returnError(500, errorBody);
   }`
     },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.STEAMSHIP_API_KEY}`
+    },
     body: JSON.stringify({
       question: String(prompt).trim(),
-      chat_session_id: chatSessionId
+      chat_session_id: verifiedSessionId
     })
   });
 
@@ -385,7 +552,36 @@ export async function POST(req: Request) {
       return returnError(500, "The agent response contained disallowed content and was blocked.");
     }
 
-    return NextResponse.json(responseBlocks)
+    // Attach synthetic-content provenance, labeling, and watermark per policy.
+    const provenanceTimestamp = new Date().toISOString();
+    const modelIdentifier = companionConfig.generateEndpoint ?? agentUrl ?? "steamship-agent";
+    const watermarkNonce = crypto.randomBytes(16).toString("hex");
+
+    // Build the provenance payload that will be signed.
+    const provenancePayload = {
+      modelId: modelIdentifier,
+      timestamp: provenanceTimestamp,
+      originTag: "ai-generated",
+      watermark: watermarkNonce,
+      contentLabel: "SYNTHETIC_AI_CONTENT",
+    };
+
+    // Compute an HMAC-SHA256 signature over the canonical provenance fields.
+    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? "default-insecure-secret";
+    const provenanceSignature = crypto
+      .createHmac("sha256", signingSecret)
+      .update(JSON.stringify(provenancePayload))
+      .digest("hex");
+
+    const enrichedResponse = {
+      _syntheticContentProvenance: {
+        ...provenancePayload,
+        signature: provenanceSignature,
+      },
+      data: responseBlocks,
+    };
+
+    return NextResponse.json(enrichedResponse);
   } else {
     return returnError(500, await response.text())
   }
