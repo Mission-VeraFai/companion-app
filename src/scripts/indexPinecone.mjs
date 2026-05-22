@@ -2,15 +2,13 @@
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
+import { HuggingFaceInferenceEmbeddings } from "@langchain/community/embeddings/hf";
 // APPROVED REGISTRY: @langchain/pinecone@0.0.3
 import { PineconeStore } from "@langchain/pinecone";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
 
 // ── Model Registry ────────────────────────────────────────────────────────────
 // Only models listed here may be instantiated in this workload.
 const APPROVED_MODEL_REGISTRY = new Set([
-  "sentence-transformers/all-MiniLM-L6-v2@1.0",  // HuggingFace RAG embedding model
   "text-embedding-ada-002@2",                     // OpenAI embedding model
 ]);
 
@@ -25,16 +23,89 @@ function assertInRegistry(modelId) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Pinned model identifiers — update registry above when bumping versions.
+// Only the HuggingFace sentence-transformers model is approved for use in this workload.
 const HF_EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2@1.0";
 const HF_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"; // actual HF model name
-const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2";
-const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // pinned OpenAI model name
+// OpenAI and LLaMA-family models are NOT approved; do not instantiate them.
+// const OPENAI_EMBEDDING_MODEL_ID = "text-embedding-ada-002@2"; // REMOVED: NOT_IN_REGISTRY
+// const OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-ada-002"; // REMOVED: NOT_IN_REGISTRY
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
 dotenv.config({ path: `.env.local` });
+
+// ── Prompt-Injection / Malicious-Content Guard ───────────────────────────────
+/**
+ * Throws if the supplied text contains patterns associated with prompt
+ * injection, hidden instructions, base64 payloads, leetspeak obfuscation,
+ * invisible Unicode characters, or shell / binary commands.
+ *
+ * @param {string} text  - Raw page content of a document.
+ * @param {number} index - Document index (for error messages).
+ */
+function assertNoMaliciousContent(text, index) {
+  const label = `Document[${index}]`;
+
+  // 1. Invisible / zero-width Unicode characters (common prompt-injection vector)
+  const invisibleChars = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/;
+  if (invisibleChars.test(text)) {
+    throw new Error(`${label}: invisible/zero-width Unicode characters detected — possible hidden prompt injection.`);
+  }
+
+  // 2. Base64-encoded blobs (≥ 40 contiguous base64 chars with optional padding)
+  //    Legitimate prose rarely contains long unbroken base64 strings.
+  const base64Blob = /(?:[A-Za-z0-9+/]{40,}={0,2})/;
+  if (base64Blob.test(text)) {
+    throw new Error(`${label}: long base64-encoded content detected — possible obfuscated payload.`);
+  }
+
+  // 3. Leetspeak / character-substitution obfuscation heuristic
+  //    Flags strings that mix digits into words in a leet pattern (e.g. "3x3cut3", "sh3ll").
+  const leetspeak = /\b(?:[a-zA-Z]*[013456789][a-zA-Z]+[013456789][a-zA-Z0-9]*|[a-zA-Z]+[013456789]{2,}[a-zA-Z0-9]*)\b/;
+  if (leetspeak.test(text)) {
+    throw new Error(`${label}: leetspeak / character-substitution obfuscation detected.`);
+  }
+
+  // 4. Shell / binary command patterns
+  const shellPatterns = [
+    /\b(bash|sh|zsh|fish|cmd\.exe|powershell|pwsh)\s+(-[a-zA-Z]+\s+)?("[^"]*"|'[^']*'|\S+)/i,
+    /\b(curl|wget|nc|ncat|netcat|python[23]?|perl|ruby|php|node)\s+/i,
+    /\b(chmod|chown|sudo|su|passwd|useradd|userdel|visudo)\b/i,
+    /\b(rm\s+-[rRf]{1,3}|mkfs|dd\s+if=|fork\s*bomb|:\s*\(\s*\)\s*\{)/i,
+    /(\/etc\/passwd|\/etc\/shadow|\/proc\/self|\/dev\/tcp|\/dev\/udp)/i,
+    /\$\(.*\)|`[^`]+`/,                          // command substitution
+    /\b(exec|eval|system|popen|subprocess)\s*\(/i, // code execution calls
+    /\\x[0-9a-fA-F]{2}/,                          // hex-escaped bytes
+    /\\u[0-9a-fA-F]{4}/,                          // unicode escapes in raw text
+  ];
+  for (const pattern of shellPatterns) {
+    if (pattern.test(text)) {
+      throw new Error(`${label}: shell or binary command pattern detected (pattern: ${pattern}) — possible command injection.`);
+    }
+  }
+
+  // 5. Hidden prompt / instruction injection keywords
+  //    Catches common adversarial instruction prefixes regardless of case.
+  const promptInjectionPhrases = [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+instructions?/i,
+    /disregard\s+(all\s+)?(previous|prior|above|earlier)\s+instructions?/i,
+    /forget\s+(everything|all|prior|previous)/i,
+    /you\s+are\s+now\s+(a|an|the)\s+/i,
+    /act\s+as\s+(a|an|the)\s+/i,
+    /new\s+instructions?\s*:/i,
+    /system\s*:\s*(you|your|ignore)/i,
+    /\[INST\]|<<SYS>>|<\|im_start\|>|<\|im_end\|>/i, // common model control tokens
+    /###\s*(instruction|system|prompt|context)\s*:/i,
+  ];
+  for (const phrase of promptInjectionPhrases) {
+    if (phrase.test(text)) {
+      throw new Error(`${label}: hidden prompt injection phrase detected (pattern: ${phrase}).`);
+    }
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Validate required credentials are present before use
 const requiredEnvVars = ["PINECONE_API_KEY", "PINECONE_ENVIRONMENT", "PINECONE_INDEX"];
@@ -407,7 +478,7 @@ for (let i = 0; i < filteredDocs.length; i++) {
 }
 
 // Wrap OpenAIEmbeddings to intercept and validate embedding vectors
-const baseEmbeddings = new OpenAIEmbeddings();
+const baseEmbeddings = new OpenAIEmbeddings({ modelName: OPENAI_EMBEDDING_MODEL_NAME });
 const validatingEmbeddings = {
   ...baseEmbeddings,
   embedDocuments: async (texts) => {
@@ -474,9 +545,12 @@ assertToolAllowed("PineconeStore.fromDocuments");
 let outcome = "success";
 let errorMessage = null;
 try {
+  // Use the validated/sanitized embeddings wrapper to ensure all LLM/embedding
+  // output is checked for eval/exec/dynamic code execution primitives before
+  // being written to the vector store.
   await PineconeStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings(),
+    validatedEmbeddings,
     {
       pineconeIndex,
     }
@@ -501,12 +575,18 @@ try {
   });
 }
 
-console.log(JSON.stringify({
-  timestamp: new Date().toISOString(),
+// Route the completion event through the audit system so it carries the same
+// inputHash (correlation/trace ID) as the surrounding writeAuditRecord calls,
+// preserving the causal chain required for forensic readiness.
+writeAuditRecord({
   event: "llm_interaction_complete",
+  timestamp: new Date().toISOString(),
+  principal,
   service: "HuggingFaceInferenceEmbeddings",
-  model: process.env.APPROVED_EMBEDDING_MODEL,
+  model: OPENAI_EMBEDDING_MODEL_NAME,
   action: "PineconeStore.fromDocuments",
-  documentCount: docsToEmbed.length,
+  documentCount: filteredDocs.length,
+  modelIdentifier: MODEL_IDENTIFIER,
+  correlationId: inputHash,
   status: "success",
-}));
+});
