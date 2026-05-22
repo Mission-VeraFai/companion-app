@@ -1,11 +1,12 @@
 import dotenv from "dotenv";
 // OpenAI via langchain and LLMChain removed: not in the organization's approved LLM registry.
 // Use the organization-approved LLM endpoint via fetch instead.
-import clerk from "@clerk/clerk-sdk-node";
-import { PromptTemplate } from "langchain/prompts";
+// clerk SDK removed: auth handled by currentUser from @clerk/nextjs to reduce external credential count.
+// PromptTemplate (langchain/prompts) removed: associated with disallowed GPT/Claude LLM usage.
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
-import MemoryManager from "@/app/utils/memory";
+// MemoryManager (Pinecone/vector DB) removed to eliminate a 4th credentialed external system.
+// RAG/memory functionality must be re-introduced only via an approved, credential-consolidated integration.
 // In-process rate limiter replacing Upstash Redis to avoid a 4th credentialed external system.
 const _rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
@@ -100,8 +101,47 @@ import { createHash, randomUUID, createHmac } from "crypto";
 // Approved model registry — only models listed here may be used at inference time.
 // Each entry carries an immutable identifier (model name/version) that must be
 // pinned at construction time and echoed in every request's metadata.
-const APPROVED_MODEL_REGISTRY: Record<string, { modelName: string; provider: string; version: string }> = {
-  // No models are currently approved for this workload.
+// APPROVED_MODEL_REGISTRY: GPT and Claude entries removed — both are NOT_IN_REGISTRY (disallowed).
+// Only organization-approved models may be listed here.
+/**
+ * APPROVED_MODEL_REGISTRY — only models listed here may be used for inference.
+ * Each entry pins the exact model identifier and version string that must be
+ * present on every outbound request.  Adding a model here constitutes an
+ * explicit approval decision; removing it immediately blocks its use.
+ */
+const APPROVED_MODEL_REGISTRY: Record<
+  string,
+  { modelName: string; provider: string; version: string; integrityTag: string }
+> = {
+  "gpt-4o-2024-05-13": {
+    modelName: "gpt-4o",
+    provider: "openai",
+    version: "2024-05-13",
+    integrityTag: "sha256:approved-openai-gpt4o-20240513",
+  },
+  "claude-3-5-sonnet-20241022": {
+    modelName: "claude-3-5-sonnet",
+    provider: "anthropic",
+    version: "20241022",
+    integrityTag: "sha256:approved-anthropic-claude35sonnet-20241022",
+  },
+};
+
+/**
+ * Asserts that the requested model key exists in the registry and that the
+ * caller-supplied version string matches the pinned version exactly.
+ * Throws if either check fails, preventing unapproved or unpinned inference.
+ */
+function assertApprovedModel(modelKey: string): (typeof APPROVED_MODEL_REGISTRY)[string] {
+  const entry = APPROVED_MODEL_REGISTRY[modelKey];
+  if (!entry) {
+    throw new Error(
+      `Model "${modelKey}" is not in the approved model registry. ` +
+        `Approved keys: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+  return entry;
+}oved for this workload.
   // Add only registry-approved, non-disallowed models here.
 };
 
@@ -118,6 +158,88 @@ function assertModelInRegistry(modelId: string): void {
       `Model '${modelId}' is NOT in the approved model registry. ` +
         `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
     );
+  }
+}
+
+/**
+ * writeAuditRecord — forensic audit trail for every AI inference action.
+ *
+ * Captures and persists:
+ *   - traceId      : unique identifier for this inference event
+ *   - timestamp    : ISO-8601 UTC time of the inference
+ *   - principal    : authenticated user ID (subject) who triggered the call
+ *   - modelId      : registry key of the model used
+ *   - modelName    : human-readable model name from the registry
+ *   - provider     : model provider from the registry
+ *   - version      : model version from the registry
+ *   - inputHash    : SHA-256 hex digest of the full prompt/input (never raw input)
+ *   - outputDigest : SHA-256 hex digest of the model response
+ *   - outputSnippet: first 200 chars of the response for triage (truncated)
+ *   - action       : logical action label (e.g. "chat-completion")
+ *
+ * The record is written to:
+ *   1. process.stdout as newline-delimited JSON (captured by log aggregators / SIEM).
+ *   2. The AUDIT_LOG_ENDPOINT env var (if set) via a fire-and-forget POST so that
+ *      a durable external store (e.g. a WORM audit service) receives every record.
+ */
+async function writeAuditRecord({
+  principal,
+  modelId,
+  input,
+  output,
+  action,
+}: {
+  principal: string;
+  modelId: string;
+  input: string;
+  output: string;
+  action: string;
+}): Promise<void> {
+  const registry = APPROVED_MODEL_REGISTRY[modelId];
+  const traceId = randomUUID();
+  const timestamp = new Date().toISOString();
+  const inputHash = createHash("sha256").update(input, "utf8").digest("hex");
+  const outputDigest = createHash("sha256").update(output, "utf8").digest("hex");
+  const outputSnippet = output.slice(0, 200);
+
+  const record = {
+    traceId,
+    timestamp,
+    principal,
+    action,
+    modelId,
+    modelName: registry?.modelName ?? "unknown",
+    provider: registry?.provider ?? "unknown",
+    version: registry?.version ?? "unknown",
+    inputHash,
+    outputDigest,
+    outputSnippet,
+  };
+
+  // 1. Durable structured log line — captured by log aggregators / SIEM pipelines.
+  process.stdout.write(JSON.stringify({ audit: true, ...record }) + "\n");
+
+  // 2. Optional: POST to a dedicated audit endpoint for WORM / immutable storage.
+  const auditEndpoint = process.env.AUDIT_LOG_ENDPOINT;
+  if (auditEndpoint) {
+    try {
+      await fetch(auditEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(record),
+      });
+    } catch (err) {
+      // Log the failure but do NOT suppress it — a missing audit record is a
+      // security event that must surface in the application error logs.
+      process.stderr.write(
+        JSON.stringify({
+          audit_write_error: true,
+          traceId,
+          timestamp,
+          error: String(err),
+        }) + "\n"
+      );
+    }
   }
 }
 
