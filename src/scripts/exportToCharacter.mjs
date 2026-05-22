@@ -1,34 +1,151 @@
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { ChatOpenAI } from "langchain/chat_models/openai";
+import { ChatOllama } from "langchain/chat_models/ollama";
 
 import fs from "fs/promises";
+import fsSync from "fs";
 import path from "path";
+import crypto from "crypto";
 
-// Load only the single required credential — no broad .env.local sweep
-if (!process.env.OPENAI_API_KEY) {
-  throw new Error("OPENAI_API_KEY environment variable must be set");
-}
+// No external API credentials required — model runs locally via Ollama
 
 // In-memory cache replaces Redis to avoid holding a second set of external credentials
 const localCache = new Map();
 
+// Persistent append-only audit log directory and file (rotated daily by ISO date)
+const AUDIT_LOG_DIR = process.env.AUDIT_LOG_DIR || path.join(process.cwd(), "audit_logs");
+
+// Ensure the audit log directory exists (sync so it is ready before any write)
+try {
+  fsSync.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+} catch (e) {
+  // Directory already exists or creation failed — surface the error so it is not silently swallowed
+  if (e.code !== "EEXIST") throw e;
+}
+
+/**
+ * Returns the path to today's audit log file (one file per UTC day for rotation).
+ * Format: audit_logs/llm_audit_YYYY-MM-DD.ndjson
+ */
+function currentAuditLogPath() {
+  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  return path.join(AUDIT_LOG_DIR, `llm_audit_${date}.ndjson`);
+}
+
+/**
+ * Compute a SHA-256 hex digest of an arbitrary value for input fingerprinting.
+ * The value is JSON-serialised before hashing so objects are handled consistently.
+ */
+function sha256Hash(value) {
+  const serialised = typeof value === "string" ? value : JSON.stringify(value);
+  return crypto.createHash("sha256").update(serialised, "utf8").digest("hex");
+}
+
 // LLM interaction logger — records every request and response for audit purposes
-function logLLMInteraction(stage, data) {
+// Captures: timestamp, stage, modelVersion, inputHash, principal, and raw data.
+function logLLMInteraction(stage, data, { modelVersion = "unknown", principal = "system" } = {}) {
+  // Compute a hash of the primary input payload for forensic traceability
+  const inputHash = sha256Hash(data);
+
   const entry = {
     timestamp: new Date().toISOString(),
     stage,          // 'request' | 'response'
+    modelVersion,   // e.g. "gpt-4o-2024-05-13" — set by caller or defaulted
+    inputHash,      // SHA-256 of the serialised data payload
+    principal,      // identity of the initiating user/service
     ...data,
   };
-  // Write to stderr so it does not pollute stdout/file output
-  process.stderr.write("[LLM_AUDIT] " + JSON.stringify(entry) + "\n");
+
+  const line = JSON.stringify(entry) + "\n";
+
+  // appendFileSync guarantees the write is flushed to disk before returning,
+  // providing an append-only, persistent audit trail with no log loss on exit.
+  try {
+    fsSync.appendFileSync(currentAuditLogPath(), line, { encoding: "utf8", flag: "a" });
+  } catch (writeErr) {
+    // Fall back to stderr only if the file write fails, so the audit event is
+    // never silently dropped — but surface the underlying error too.
+    process.stderr.write(`[LLM_AUDIT_FALLBACK] ${line}`);
+    process.stderr.write(`[LLM_AUDIT_ERROR] ${writeErr.message}\n`);
+  }
 }
 
-// Wrapper that logs inputs and outputs around any LLMChain call
-async function runChainWithLogging(chain, inputs) {
-  logLLMInteraction("request", { inputs });
+// ── Tool / chain allow list ──────────────────────────────────────────────────
+// Only chains whose symbolic name appears in this set may be executed.
+// Any attempt to call a chain not on this list is blocked at runtime.
+const ALLOWED_CHAINS = new Set([
+  "characterExportChain",   // the single chain used by this script
+]);
+
+/**
+ * Enforce the allow list before executing a chain.
+ * @param {string} chainName  - Symbolic name that must appear in ALLOWED_CHAINS.
+ * @param {LLMChain} chain    - The LangChain chain instance to run.
+ * @param {object}  inputs    - Inputs forwarded to chain.call().
+ */
+async function runChainWithLogging(chainName, chain, inputs) {
+  // ── Allow-list gate ──────────────────────────────────────────────────────
+  if (!ALLOWED_CHAINS.has(chainName)) {
+    const msg = `[POLICY] Chain "${chainName}" is not on the allow list and was blocked.`;
+    process.stderr.write(msg + "\n");
+    throw new Error(msg);
+  }
+
+  logLLMInteraction("request", { chainName, inputs });
   const result = await chain.call(inputs);
-  logLLMInteraction("response", { outputs: result });
+  logLLMInteraction("response", { chainName, outputs: result });
+  return result;
+}
+
+// ── Model-output policy validation ───────────────────────────────────────────
+// Called on every LLM response before the output is written to disk.
+// Throws if the output fails structural or content policy checks.
+function validateModelOutput(output) {
+  if (output === null || output === undefined) {
+    throw new Error("[POLICY] Model output is null/undefined — refusing to write.");
+  }
+
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+
+  // 1. Reject suspiciously short responses (likely an error or empty reply)
+  if (text.trim().length < 2) {
+    throw new Error("[POLICY] Model output is too short — refusing to write.");
+  }
+
+  // 2. Reject output that contains null bytes (binary / injection artifact)
+  if (/\x00/.test(text)) {
+    throw new Error("[POLICY] Model output contains null bytes — refusing to write.");
+  }
+
+  // 3. Reject output that looks like a prompt-injection echo
+  //    (common patterns: 'Ignore previous instructions', 'SYSTEM:', etc.)
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?previous\s+instructions/i,
+    /\bSYSTEM\s*:/i,
+    /\bUSER\s*:/i,
+    /\bASSISTANT\s*:/i,
+    /<\|.*?\|>/,          // token-boundary injection (e.g. <|endoftext|>)
+  ];
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(text)) {
+      throw new Error(
+        `[POLICY] Model output matches injection pattern ${pattern} — refusing to write.`
+      );
+    }
+  }
+
+  return output; // passes all checks
+} = {}) {
+  // Resolve the model version from the chain's LLM if not explicitly supplied
+  const resolvedModelVersion =
+    modelVersion ??
+    chain?.llm?.modelName ??
+    chain?.llm?.model ??
+    "unknown";
+
+  logLLMInteraction("request", { inputs }, { modelVersion: resolvedModelVersion, principal });
+  const result = await chain.call(inputs);
+  logLLMInteraction("response", { outputs: result }, { modelVersion: resolvedModelVersion, principal });
   return result;
 }
 
@@ -705,20 +822,11 @@ for (let i = 0; i < questions.length; i++) {
 const chatCount = Array.isArray(truncatedRecentChat) ? truncatedRecentChat.length : 0;
 // Data minimisation: only a short, redacted preview of the last message is
 // forwarded to the LLM — never the full content.
-const rawLastMessage = chatCount > 0 ? sanitizeLLMOutput(String(truncatedRecentChat[chatCount - 1])) : "";
-assertNoDynamicCodeExecution(rawLastMessage);
-// Redact common PII patterns before truncating to a 100-char preview.
-const redactedPreview = rawLastMessage
-  .replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, "[EMAIL]")
-  .replace(/\b\d{3}[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, "[PHONE]")
-  .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]")
-  .slice(0, 100);
-const lastMessagePreview = redactedPreview.length < rawLastMessage.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, "[EMAIL]").replace(/\b\d{3}[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, "[PHONE]").replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]").length
-  ? redactedPreview + "…"
-  : redactedPreview;
-output += `Definition (Advanced)\n[Chat history summary: ${chatCount} message(s). Most recent (preview): ${lastMessagePreview}]`;
+output += `Definition (Advanced)\n[Chat history summary: ${chatCount} message(s).]`;
 
-const AI_MODEL_ID = "claude-3-opus-20240229";
+// Use only registry-approved, version-pinned model identifiers.
+const AI_MODEL_ID = "gpt-4-0613";
+verifyModelIdentity(AI_MODEL_ID);
 
 // Wrap the AI-generated character data with provenance metadata and a
 // cryptographic watermark before persisting it to disk.
