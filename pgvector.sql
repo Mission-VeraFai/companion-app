@@ -11,6 +11,16 @@ create table documents (
   embedding vector(1536) -- 1536 works for OpenAI embeddings, change if needed
 );
 
+-- Audit log table for AI-driven vector similarity retrievals
+create table if not exists match_documents_audit_log (
+  id            bigserial primary key,
+  correlation_id uuid        not null default gen_random_uuid(),
+  occurred_at   timestamptz not null default now(),
+  principal     text        not null,
+  match_count   int,
+  filter        jsonb
+);
+
 -- Create a function to search for documents
 create function match_documents (
   query_embedding vector(1536),
@@ -24,6 +34,10 @@ language plpgsql
 as $$
 #variable_conflict use_column
 begin
+  -- Audit: record every invocation with principal, timestamp, and query parameters
+  insert into match_documents_audit_log (principal, match_count, filter)
+  values (current_user, match_count, filter);
+
   return query
   select
     content,
