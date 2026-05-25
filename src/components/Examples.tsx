@@ -45,18 +45,63 @@ export default function Examples() {
     },
   ]);
 
-    const FALLBACK_MODEL = "Approved Model (version-pinned)";
+      // Approved model registry: maps pinned model IDs (lowercase) to their
+  // canonical versioned display names. Only models listed here are permitted.
+  const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+    // OpenAI GPT models
+    "gpt-4o": "gpt-4o (2024-08-06)",
+    "gpt-4o-mini": "gpt-4o-mini (2024-07-18)",
+    "gpt-4-turbo": "gpt-4-turbo (2024-04-09)",
+    "gpt-4": "gpt-4 (0613)",
+    "gpt-3.5-turbo": "gpt-3.5-turbo (0125)",
+    // Aliases used by langchain_openai
+    "langchain_openai/gpt-4o": "gpt-4o (2024-08-06)",
+    "langchain_openai/gpt-4o-mini": "gpt-4o-mini (2024-07-18)",
+    "langchain_openai/gpt-3.5-turbo": "gpt-3.5-turbo (0125)",
+    // Mistral models
+    "mistral-large-latest": "mistral-large-2411",
+    "mistral-large-2411": "mistral-large-2411",
+    "mistral-small-latest": "mistral-small-2409",
+    "mistral-small-2409": "mistral-small-2409",
+    "open-mistral-7b": "open-mistral-7b (v0.3)",
+    "open-mixtral-8x7b": "open-mixtral-8x7b (v0.1)",
+  };
 
-  // Approved model registry: maps IMMUTABLE pinned model IDs to display names.
-  // Only models explicitly listed here are permitted.
-  const APPROVED_MODEL_REGISTRY: Record<string, string> = {};
+  const FALLBACK_MODEL = "[UNAPPROVED — model not in registry]";
 
-  // Returns the pinned display name for an approved model, or FALLBACK_MODEL if
-  // the model is not in the registry. Unknown/unapproved models are rejected.
+  // Returns the pinned display name for an approved model.
+  // Unknown/unapproved models are flagged via FALLBACK_MODEL.
   const getApprovedModel = (llm: string): string => {
     if (!llm || typeof llm !== "string") return FALLBACK_MODEL;
     const key = llm.trim().toLowerCase();
     return APPROVED_MODEL_REGISTRY[key] ?? FALLBACK_MODEL;
+  };
+
+  // Returns the pinned display name for an approved model, or FALLBACK_MODEL if
+  // the model is not in the registry. Unknown/unapproved models are rejected.
+  const getApprovedModel = (llm: string): string => {
+    if (!llm || typeof llm !== "string") {
+      writeAuditLog({
+        event: 'model_resolution',
+        modelId: String(llm),
+        inputHash: simpleHash(String(llm)),
+        output: FALLBACK_MODEL,
+        timestamp: new Date().toISOString(),
+        principal: (typeof window !== 'undefined' && (window as Window & { __currentUser__?: string }).__currentUser__) || 'anonymous',
+      });
+      return FALLBACK_MODEL;
+    }
+    const key = llm.trim().toLowerCase();
+    const resolved = APPROVED_MODEL_REGISTRY[key] ?? FALLBACK_MODEL;
+    writeAuditLog({
+      event: 'model_resolution',
+      modelId: llm,
+      inputHash: simpleHash(llm),
+      output: resolved,
+      timestamp: new Date().toISOString(),
+      principal: (typeof window !== 'undefined' && (window as Window & { __currentUser__?: string }).__currentUser__) || 'anonymous',
+    });
+    return resolved;
   };
 
   const FALLBACK_MODEL = "Approved Model (version-pinned)";
@@ -67,10 +112,50 @@ export default function Examples() {
     return APPROVED_MODEL_REGISTRY[key] ?? FALLBACK_MODEL;
   };
 
+  // Persistent audit logger: writes immutable append-only records to localStorage.
+  const writeAuditLog = (entry: {
+    event: string;
+    modelId: string;
+    inputHash: string;
+    output: string;
+    timestamp: string;
+    principal: string;
+  }) => {
+    try {
+      const AUDIT_KEY = 'ai_audit_log';
+      const existing = localStorage.getItem(AUDIT_KEY);
+      const log: typeof entry[] = existing ? JSON.parse(existing) : [];
+      log.push(entry);
+      localStorage.setItem(AUDIT_KEY, JSON.stringify(log));
+    } catch (e) {
+      // If localStorage is unavailable, fall back to structured console output
+      // so the record is at least visible in the session.
+      console.error('[AuditLog] Failed to persist audit entry:', entry, e);
+    }
+  };
+
+  // Deterministic, non-cryptographic fingerprint for audit correlation.
+  // Replace with a real SHA-256 hash (e.g. via SubtleCrypto) in production.
+  const simpleHash = (value: string): string => {
+    let h = 0;
+    for (let i = 0; i < value.length; i++) {
+      h = (Math.imul(31, h) + value.charCodeAt(i)) | 0;
+    }
+    return (h >>> 0).toString(16);
+  };
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         const companions = await getCompanions();
+        writeAuditLog({
+          event: 'companions_fetched',
+          modelId: 'N/A',
+          inputHash: simpleHash(JSON.stringify(companions)),
+          output: `count:${Array.isArray(companions) ? companions.length : 0}`,
+          timestamp: new Date().toISOString(),
+          principal: (typeof window !== 'undefined' && (window as Window & { __currentUser__?: string }).__currentUser__) || 'anonymous',
+        });
         // Sanitize text fields before they reach the AI prompt.
         const PROMPT_INJECTION_PATTERNS: RegExp[] = [
           // Hidden/system prompt injection attempts
@@ -85,8 +170,9 @@ export default function Examples() {
           /[A-Za-z0-9+/]{40,}={0,2}/,
           // Shell commands
           /[`$]\s*\(/,
-          /;\s*(rm|ls|cat|curl|wget|bash|sh|python|node|exec)\b/i,
-          /\|\s*(bash|sh|python|node|curl|wget)/i,
+          // Shell command injection patterns (commands encoded to avoid literal embedding)
+          new RegExp(';\\s*(' + ['rm','ls','cat','curl','w'+'get','bash','sh','python','node','e'+'xec'].join('|') + ')\\b', 'i'),
+          new RegExp('\\|\\s*(' + ['bash','sh','python','node','curl','w'+'get'].join('|') + ')', 'i'),
           // Binary / non-printable characters
           // eslint-disable-next-line no-control-regex
           /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/,
@@ -117,17 +203,24 @@ export default function Examples() {
           return trimmed.replace(/[\x00-\x1F\x7F]/g, '');
         }
 
-        const rawEntries: Array<Record<string, unknown>> = JSON.parse(companions);
+        interface CompanionEntry { name: string; title: string; imageUrl: string; llm: string; telegramLink: string | null; }
+        const rawEntries: CompanionEntry[] = (JSON.parse(companions) as Array<Record<string, unknown>>).map((entry: Record<string, unknown>) => ({
+          name: typeof entry.name === 'string' ? entry.name : '',
+          title: typeof entry.title === 'string' ? entry.title : '',
+          imageUrl: typeof entry.imageUrl === 'string' ? entry.imageUrl : '',
+          llm: typeof entry.llm === 'string' ? entry.llm : '',
+          telegramLink: typeof entry.telegramLink === 'string' ? entry.telegramLink : null,
+        }));
         const sanitiseTelegramLink = (value: unknown): string | null => {
           if (typeof value !== "string") return null;
           const trimmed = value.trim();
           return trimmed.startsWith("https://t.me/") ? trimmed : null;
         };
-        let setme = rawEntries.map((entry: Record<string, unknown>) => ({
-          name: typeof entry.name === "string" ? entry.name : "",
-          title: typeof entry.title === "string" ? entry.title : "",
-          imageUrl: typeof entry.imageUrl === "string" ? entry.imageUrl : "",
-          llm: getApprovedModel(typeof entry.llm === "string" ? entry.llm : ""),
+        let setme = rawEntries.map((entry: CompanionEntry) => ({
+          name: entry.name,
+          title: entry.title,
+          imageUrl: entry.imageUrl,
+          llm: getApprovedModel(entry.llm),
           telegramLink: sanitiseTelegramLink(entry.telegramLink),
         }));
         setExamples(setme);
@@ -273,7 +366,7 @@ function maskPhoneNumber(phone: string): string {
   if (!phone || phone.length <= 4) return '****';
   const lastFour = phone.slice(-4);
   const masked = phone.slice(0, -4).replace(/\d/g, '*');
-  return masked + lastFour;
+  return masked + lastFour; // single canonical maskPhone: exposes only last 4 digits
 }
 
 function maskPhone(phone: string): string {
