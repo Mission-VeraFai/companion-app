@@ -177,8 +177,58 @@ function sanitizeBlock(block: any): { text?: string; mimeType?: string; url?: st
     return sanitized;
 }
 
+// ---------------------------------------------------------------------------
+// Audit logging — append-only, durable store (localStorage) for forensic trail
+// ---------------------------------------------------------------------------
+function computeInputHash(input: string): string {
+    // Simple deterministic hash for audit identity (not cryptographic)
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+        const chr = input.charCodeAt(i);
+        hash = ((hash << 5) - hash) + chr;
+        hash |= 0;
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function writeAuditRecord(record: {
+    timestamp: string;
+    principal: string;
+    modelIdentifier: string;
+    inputHash: string;
+    inputType: string;
+    outputBlockCount: number;
+    rejectedBlockCount: number;
+    outcome: "success" | "partial" | "rejected";
+}): void {
+    try {
+        const AUDIT_KEY = "ai_action_audit_log";
+        const existing = localStorage.getItem(AUDIT_KEY);
+        const log: typeof record[] = existing ? JSON.parse(existing) : [];
+        log.push(record);
+        localStorage.setItem(AUDIT_KEY, JSON.stringify(log));
+    } catch (e) {
+        // Fallback: emit to console.error so it is at least captured by log aggregators
+        console.error("[AUDIT] Failed to write to persistent store", record, e);
+    }
+}
+
 export function responseToChatBlocks(completion: any) {
     // First we try to parse completion as JSON in case we're dealing with an object.
+    const auditStart = new Date().toISOString();
+    const rawInput = typeof completion === "string" ? completion : JSON.stringify(completion);
+    const inputHash = computeInputHash(rawInput);
+    // Principal: use a stored session identifier if available, else anonymous
+    const principal =
+        (typeof window !== "undefined" && (window as any).__currentUserPrincipal) ||
+        (typeof localStorage !== "undefined" && localStorage.getItem("session_principal")) ||
+        "anonymous";
+    // Model identifier: attach via a module-level constant or environment variable
+    const modelIdentifier =
+        (typeof window !== "undefined" && (window as any).__aiModelIdentifier) ||
+        (typeof process !== "undefined" && process.env && process.env.REACT_APP_AI_MODEL_ID) ||
+        "unknown-model";
+    let rejectedCount = 0;
     console.log("got completoin", completion, typeof completion)
     if (typeof completion == "string") {
         try {
@@ -189,22 +239,23 @@ export function responseToChatBlocks(completion: any) {
         }
     }
     let blocks = []
+    let inputType = typeof completion;
     if (typeof completion == "string") {
-        console.log("still string")
         if (containsDangerousContent(completion)) {
             console.warn("Rejected plain-string completion: contains dangerous content");
+            rejectedCount++;
         } else {
             blocks.push(<ChatBlock text={completion} />)
         }
     } else if (Array.isArray(completion)) {
-        console.log("Is array")
+        inputType = "array";
         for (let block of completion) {
-            console.log(block)
             const safeBlock = sanitizeBlock(block);
             if (safeBlock !== null) {
                 blocks.push(<ChatBlock {...safeBlock} />)
             } else {
                 console.warn("Skipping unsafe block from LLM array output");
+                rejectedCount++;
             }
         }
     } else {
@@ -213,9 +264,23 @@ export function responseToChatBlocks(completion: any) {
             blocks.push(<ChatBlock {...safeCompletion} />)
         } else {
             console.warn("Skipping unsafe completion object from LLM output");
+            rejectedCount++;
         }
     }
-    console.log(blocks)
+    const outcome: "success" | "partial" | "rejected" =
+        blocks.length === 0 ? "rejected" :
+        rejectedCount > 0   ? "partial"  :
+                              "success";
+    writeAuditRecord({
+        timestamp:        auditStart,
+        principal:        principal,
+        modelIdentifier:  modelIdentifier,
+        inputHash:        inputHash,
+        inputType:        inputType,
+        outputBlockCount: blocks.length,
+        rejectedBlockCount: rejectedCount,
+        outcome:          outcome,
+    });
     return blocks
 }
 

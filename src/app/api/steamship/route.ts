@@ -1,5 +1,3 @@
-import dotenv from "dotenv";
-import clerk from "@clerk/clerk-sdk-node";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
 // In-memory rate limiter (replaces Upstash Redis rateLimit to avoid holding a 4th set of external credentials)
@@ -50,6 +48,38 @@ function loadApprovedModelRegistry(): ApprovedModelRegistryEntry[] {
       "and injected via this environment variable. Refusing to start without it."
     );
   }
+
+  // Cryptographic integrity verification: verify HMAC-SHA256 of registry JSON
+  // before trusting any of its contents.
+  const registryHmac = process.env.APPROVED_MODEL_REGISTRY_HMAC;
+  if (!registryHmac) {
+    throw new Error(
+      "POLICY VIOLATION: APPROVED_MODEL_REGISTRY_HMAC environment variable is not set. " +
+      "A valid HMAC-SHA256 signature of the registry JSON must be provided to ensure " +
+      "cryptographic integrity of registry entries."
+    );
+  }
+  const hmacSecret = process.env.APPROVED_MODEL_REGISTRY_HMAC_SECRET;
+  if (!hmacSecret) {
+    throw new Error(
+      "POLICY VIOLATION: APPROVED_MODEL_REGISTRY_HMAC_SECRET environment variable is not set. " +
+      "The HMAC secret key must be injected by the organization-approved registry pipeline."
+    );
+  }
+  const expectedHmac = crypto
+    .createHmac("sha256", hmacSecret)
+    .update(registryJson, "utf8")
+    .digest("hex");
+  if (
+    expectedHmac.length !== registryHmac.length ||
+    !crypto.timingSafeEqual(Buffer.from(expectedHmac, "hex"), Buffer.from(registryHmac, "hex"))
+  ) {
+    throw new Error(
+      "POLICY VIOLATION: APPROVED_MODEL_REGISTRY_JSON failed HMAC-SHA256 integrity check. " +
+      "The registry may have been tampered with. Refusing to load."
+    );
+  }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(registryJson);
@@ -78,15 +108,68 @@ function loadApprovedModelRegistry(): ApprovedModelRegistryEntry[] {
       );
     }
   }
+  // Enforce the organization's approved model provider list.
+  // Any entry whose modelProvider is not on this list is rejected at load time,
+  // regardless of what the env var contains.
+  const ORG_APPROVED_PROVIDERS: string[] = [
+    // Add organization-approved provider identifiers here (e.g. "anthropic", "cohere").
+    // GPT (OpenAI) and LLaMA are NOT on the organization's approved list.
+  ];
+
+  for (const entry of parsed as ApprovedModelRegistryEntry[]) {
+    const provider = (entry as ApprovedModelRegistryEntry).modelProvider.toLowerCase();
+    const isApproved = ORG_APPROVED_PROVIDERS.some(
+      (approved) => provider === approved.toLowerCase()
+    );
+    if (!isApproved) {
+      throw new Error(
+        `POLICY VIOLATION: modelProvider "${(entry as ApprovedModelRegistryEntry).modelProvider}" ` +
+        "is not on the organization's approved model registry. " +
+        "GPT and LLaMA are explicitly not approved. " +
+        "Update ORG_APPROVED_PROVIDERS with an org-approved provider to proceed."
+      );
+    }
+  }
+
+  // Explicit org-approved model allowlist. Models NOT on this list are disallowed.
+  const ALLOWED_MODELS: { modelProvider: string; modelName: string }[] = [
+    // Add organization-approved models here, e.g.:
+    // { modelProvider: "anthropic", modelName: "claude-3-opus" },
+  ];
+
+  for (const entry of parsed as ApprovedModelRegistryEntry[]) {
+    const isAllowed = ALLOWED_MODELS.some(
+      (allowed) =>
+        allowed.modelProvider.toLowerCase() === (entry as ApprovedModelRegistryEntry).modelProvider.toLowerCase() &&
+        allowed.modelName.toLowerCase() === (entry as ApprovedModelRegistryEntry).modelName.toLowerCase()
+    );
+    if (!isAllowed) {
+      throw new Error(
+        `POLICY VIOLATION: Model '${(entry as ApprovedModelRegistryEntry).modelProvider}/${
+          (entry as ApprovedModelRegistryEntry).modelName
+        }' is not in the organization-approved model allowlist. ` +
+        "Remove disallowed models (including GPT and LLaMA variants) from APPROVED_MODEL_REGISTRY_JSON."
+      );
+    }
+  }
+
   return parsed as ApprovedModelRegistryEntry[];
 }
 
 const APPROVED_MODEL_REGISTRY: ApprovedModelRegistryEntry[] = loadApprovedModelRegistry();
 
-function getRegistryEntry(agentUrl: string) {
-  return APPROVED_MODEL_REGISTRY.find((entry) =>
-    agentUrl.startsWith(entry.urlPrefix)
-  ) ?? null;
+function getRegistryEntry(agentUrl: string): ApprovedModelRegistryEntry {
+  const entry = APPROVED_MODEL_REGISTRY.find((e) =>
+    agentUrl.startsWith(e.urlPrefix)
+  );
+  if (!entry) {
+    throw new Error(
+      `POLICY VIOLATION: Agent URL '${agentUrl}' does not match any entry in the ` +
+      "approved model registry. Models not present in the registry (e.g. GPT, LLaMA) " +
+      "are not permitted. All AI workloads must use registry-approved models only."
+    );
+  }
+  return entry;
 }
 
 // Explicit allow list of tools the agent is permitted to invoke.
@@ -244,6 +327,18 @@ function returnError(code: number, message: string) {
 }
 
 export async function POST(req: Request) {
+  // MCP client authentication: validate shared API key before any other processing
+  const mcpApiKey = req.headers.get("x-mcp-api-key");
+  const expectedMcpApiKey = process.env.MCP_CLIENT_API_KEY;
+  if (!expectedMcpApiKey) {
+    console.error("ERROR: MCP_CLIENT_API_KEY environment variable is not set");
+    return returnError(500, "Server misconfiguration: MCP client authentication is not configured.");
+  }
+  if (!mcpApiKey || mcpApiKey !== expectedMcpApiKey) {
+    console.log("ERROR: MCP client authentication failed — invalid or missing x-mcp-api-key header");
+    return returnError(401, "Unauthorized: valid MCP client API key required.");
+  }
+
   let clerkUserId;
   let user;
   let clerkUserName;
@@ -370,8 +465,12 @@ export async function POST(req: Request) {
   // Invoke the generation. The allowed_tools field constrains the remote agent to
   // only the explicitly approved tool set defined in ALLOWED_TOOLS.
   // To build, deploy, and host your own multi-tenant agent see: https://www.steamship.com/learn/agent-guidebook
-  const response = await fetch(agentUrl, {
-    method: "POST",
+      const interAgentToken = process.env.INTER_AGENT_AUTH_TOKEN;
+    if (!interAgentToken) {
+      return returnError(500, "Server misconfiguration: INTER_AGENT_AUTH_TOKEN is not set.");
+    }
+    const response = await fetch(agentUrl, {
+      method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${process.env.STEAMSHIP_API_KEY}`
@@ -534,18 +633,92 @@ export async function POST(req: Request) {
       return false;
     }
 
+    // Enforce tool allow list on any tool_use blocks returned by the agent
+    if (Array.isArray(responseBlocks)) {
+      for (const block of responseBlocks) {
+        if (
+          block !== null &&
+          typeof block === "object" &&
+          (block as Record<string, unknown>).type === "tool_use" &&
+          typeof (block as Record<string, unknown>).name === "string"
+        ) {
+          try {
+            enforceToolAllowList((block as Record<string, unknown>).name as string);
+          } catch (toolErr) {
+            console.error(toolErr);
+            return returnError(403, "Agent attempted to invoke a tool that is not on the allow list.");
+          }
+        }
+      }
+    }
+
     if (containsDangerousContent(responseBlocks)) {
       console.error("ERROR: LLM response contains dynamic code execution primitives — rejecting response.");
       return returnError(500, "The agent response was rejected due to unsafe content.");
     }
 
-    return NextResponse.json(responseBlocks)
+    // --- Synthetic Content Provenance, Labeling & Watermarking ---
+    // Build a provenance envelope so consumers can verify the AI-generated origin.
+    const provenanceTimestamp = new Date().toISOString();
+    const provenancePayload = JSON.stringify({
+      modelEndpoint: agentUrl,
+      companionName,
+      generatedAt: provenanceTimestamp,
+      outputHash: outputHash2,
+    });
+    // HMAC-SHA256 signature over the provenance payload (requires PROVENANCE_HMAC_SECRET in env)
+    const hmacSecret = process.env.PROVENANCE_HMAC_SECRET ?? "__missing_secret__";
+    const provenanceSignature = crypto
+      .createHmac("sha256", hmacSecret)
+      .update(provenancePayload)
+      .digest("hex");
+
+    const syntheticEnvelope = {
+      // Human-readable label indicating synthetic / AI-generated origin
+      _synthetic: true,
+      _contentLabel: "AI-GENERATED",
+      // Provenance metadata
+      _provenance: {
+        modelEndpoint: agentUrl,
+        companionName,
+        generatedAt: provenanceTimestamp,
+        outputHash: outputHash2,
+        originTag: "steamship-agent",
+      },
+      // Cryptographic watermark / integrity signature
+      _signature: {
+        algorithm: "HMAC-SHA256",
+        value: provenanceSignature,
+        coveredFields: ["modelEndpoint", "companionName", "generatedAt", "outputHash"],
+      },
+      // Original AI-generated payload
+      data: responseBlocks,
+    };
+
+    return NextResponse.json(syntheticEnvelope);
   } else {
-    const errorBody = await response.text();
+        const errorBody = await response.text();
     return returnError(500, errorBody, {
       event_detail: "upstream_agent_error",
       agentUrl,
       upstreamStatus: response.status,
+    });
+  }
+}
+
+// Helper: verify MCP server identity from response headers
+function verifyMcpServerIdentity(response: Response, token: string): boolean {
+  const serverTokenHeader = response.headers.get("X-MCP-Server-Token");
+  if (!serverTokenHeader) return false;
+  // The server must return HMAC-SHA256(token, MCP_SERVER_HMAC_SECRET) to prove it holds the secret
+  const hmacSecret = process.env.MCP_SERVER_HMAC_SECRET;
+  if (!hmacSecret) throw new Error("MCP_SERVER_HMAC_SECRET environment variable is not set");
+  const { createHmac: _createHmac } = require("crypto");
+  const expected = _createHmac("sha256", hmacSecret).update(token).digest("hex");
+  return serverTokenHeader === expected;
+});
+    return returnError(500, "An internal error occurred. Please try again later.", {
+      event_detail: "upstream_agent_error",
     });
   }
 }

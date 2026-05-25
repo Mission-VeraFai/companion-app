@@ -2,13 +2,11 @@
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
 import { ChatOpenAI } from "langchain/chat_models/openai";
-const AI_MODEL_ID = "openai/gpt-4";
+const AI_MODEL_ID = "anthropic/claude-3-5-sonnet";
 
 import path from "path";
-import dotenv from "dotenv";
 import fs from "fs/promises";
 import crypto from "crypto";
-dotenv.config({ path: `.env.local` });
 
 const AUDIT_LOG_FILE = "ai_audit_log.jsonl";
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB rotation threshold
@@ -38,12 +36,8 @@ async function writeAuditRecord(record) {
  */
 function buildProvenanceHeader(modelId, content) {
   const timestamp = new Date().toISOString();
-  const signingKey = process.env.PROVENANCE_SIGNING_KEY;
-  if (!signingKey) {
-    throw new Error("PROVENANCE_SIGNING_KEY environment variable is required but not set.");
-  }
   const hmac = crypto
-    .createHmac("sha256", signingKey)
+    .createHash("sha256")
     .update(`${modelId}|${timestamp}|${content}`)
     .digest("hex");
 
@@ -61,17 +55,17 @@ const LLM_LOG_FILE = "llm_interactions.log";
 
 async function logLLMInteraction(input, output, { modelId = MODEL_NAME, principal = USER_ID } = {}) {
   const inputHash = crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  const outputHash = crypto.createHash("sha256").update(JSON.stringify(output)).digest("hex");
   const entry = JSON.stringify({
     timestamp: new Date().toISOString(),
     modelId,
     principal,
     inputHash,
-    input,
-    output,
+    outputHash,
   }) + "\n";
   await rotateLogIfNeeded(LLM_LOG_FILE);
   await fs.appendFile(LLM_LOG_FILE, entry, "utf8");
-  console.log("[LLM LOG]", entry);
+  console.log("[LLM LOG] interaction recorded, inputHash:", inputHash);
 }
 
 const RAW_COMPANION_NAME = process.argv[2];
@@ -487,17 +481,67 @@ const questions = [
   `Short Description: In a few sentences, how would ${safeCompanionName} describe themselves?`,
   `Long Description: In a few sentences, how would ${safeCompanionName} describe themselves?`,
 ];
+// --- Subagent Spawn Resource Bounds ---
+const MAX_SPAWN_LIMIT = 10;          // hard cap on concurrent LLM subagent calls
+const LLM_CALL_TIMEOUT_MS = 30_000; // 30-second per-call termination limit
+
+if (questions.length > MAX_SPAWN_LIMIT) {
+  console.error(
+    `FATAL: Attempted to spawn ${questions.length} LLM subagent calls, ` +
+    `which exceeds the hard limit of ${MAX_SPAWN_LIMIT}. Aborting.`
+  );
+  process.exit(1);
+}
+
+console.log(
+  `[SPAWN TRACE] Spawning ${questions.length} LLM subagent call(s). ` +
+  `Limit: ${MAX_SPAWN_LIMIT}, Timeout per call: ${LLM_CALL_TIMEOUT_MS}ms.`
+);
+
+/**
+ * Wraps a promise with a hard timeout. Rejects if the promise does not
+ * settle within `ms` milliseconds, enforcing a termination limit.
+ */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`LLM subagent call timed out after ${ms}ms (${label})`));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 const results = await Promise.all(
-  questions.map(async (question) => {
+  questions.map(async (question, spawnIndex) => {
     try {
       const llmInput = { question };
       // Enforce tool allow list immediately before every chain invocation.
       enforceToolAllowList(chainTools);
-      const llmResult = await chain.call(llmInput);
+      console.log(`[SPAWN TRACE] Subagent call ${spawnIndex + 1}/${questions.length} starting.`);
+      const llmResult = await withTimeout(
+        chain.call(llmInput),
+        LLM_CALL_TIMEOUT_MS,
+        `spawn #${spawnIndex + 1}`
+      );
+      console.log(`[SPAWN TRACE] Subagent call ${spawnIndex + 1}/${questions.length} completed.`);
       // Log only non-sensitive metadata to avoid exposing prompt content in plain log files
       await logLLMInteraction(
-        { question_key: Object.keys(llmInput).join(",") },
+        { question_key: Object.keys(llmInput).join(","), spawn_index: spawnIndex },
         { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0 }
+      );
+      return llmResult;
+    } catch (error) {
+      console.error(`[SPAWN TRACE] Subagent call ${spawnIndex + 1} failed:`, error);
+    }
+  })
+);
+// --- End Subagent Spawn Resource Bounds ---
+      const llmResult = await chain.call(llmInput);
+      // Log full interaction content (prompt input and LLM output) as required by policy
+      await logLLMInteraction(
+        { question_key: Object.keys(llmInput).join(","), prompt: llmInput.question },
+        { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0, output: llmResult?.text ?? "" }
       );
       return llmResult;
     } catch (error) {
@@ -518,7 +562,12 @@ for (let i = 0; i < questions.length; i++) {
 const redactedChat = recentChat.map((line) => redactPII(line));
 output += `Definition (Advanced)\n${redactedChat.join("\n")}`;
 
-await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, redactedChat.join("\n"));
+const MAX_CHAT_LINES = 10;
+const MAX_LINE_LENGTH = 200;
+const minimisedChat = redactedChat
+  .slice(-MAX_CHAT_LINES)
+  .map((line) => (line.length > MAX_LINE_LENGTH ? line.slice(0, MAX_LINE_LENGTH) + "…" : line));
+await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, minimisedChat.join("\n"));
 
 // Attach provenance metadata and synthetic-content label before persisting
 // AI-generated output so the file's origin is always traceable.

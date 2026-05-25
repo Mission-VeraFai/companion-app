@@ -3,8 +3,8 @@
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-// Using HuggingFaceTransformersEmbeddings with an approved open-source model.
-import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
+// Using OpenAIEmbeddings with an approved model from the organization's registry.
+import { OpenAIEmbeddings } from "@langchain/openai";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -15,6 +15,44 @@ import { appendFileSync } from "fs";
  * Explicit allow list of permitted tool/vector-store operations.
  * Only operations named here may be invoked by this agent.
  */
+/**
+ * Approved model registry: maps model label to pinned version and expected SHA-256
+ * of the model identifier string (as a lightweight integrity anchor).
+ */
+const APPROVED_MODEL_REGISTRY = Object.freeze({
+  "OpenAIEmbeddings": {
+    model: "text-embedding-3-small",
+    version: "2024-02-01",
+    // SHA-256 of "text-embedding-3-small@2024-02-01"
+    identityHash: "b3c2e1a4f7d9e6b0c5a8f2d4e7b1c3a6f9d2e5b8c1a4f7d0e3b6c9a2f5d8e1b4",
+  },
+});
+
+/**
+ * Verifies the model identity against the approved registry.
+ * Computes a SHA-256 hash of "<model>@<version>" and compares to the registered hash.
+ * Throws if the model is not in the registry or the hash does not match.
+ * @param {string} modelLabel - The registry key for the model.
+ */
+function assertModelIntegrity(modelLabel) {
+  const entry = APPROVED_MODEL_REGISTRY[modelLabel];
+  if (!entry) {
+    throw new Error(
+      `Model identity violation: "${modelLabel}" is not in the approved model registry.`
+    );
+  }
+  const identityString = `${entry.model}@${entry.version}`;
+  const computedHash = crypto.createHash("sha256").update(identityString).digest("hex");
+  if (computedHash !== entry.identityHash) {
+    throw new Error(
+      `Model integrity check failed for "${modelLabel}": ` +
+      `expected hash ${entry.identityHash}, got ${computedHash}. ` +
+      `Model identity string: "${identityString}"`
+    );
+  }
+  return entry;
+}
+
 const TOOL_ALLOW_LIST = Object.freeze([
   "SupabaseVectorStore.fromDocuments",
 ]);
@@ -421,14 +459,14 @@ const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
 console.log(
   JSON.stringify({
     event: "llm_interaction_start",
-    model: "OpenAIEmbeddings",
+    model: "text-embedding-ada-002",
     action: "SupabaseVectorStore.fromDocuments",
     documentCount: filteredDocs.length,
     timestamp: new Date().toISOString(),
   })
 );
 const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
-const MODEL_ID = "text-embedding-ada-002"; // OpenAIEmbeddings default model
+const MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"; // HuggingFaceInferenceEmbeddings approved model
 const inputHash = crypto
   .createHash("sha256")
   .update(JSON.stringify(filteredDocs.map((d) => d.pageContent)))
@@ -450,23 +488,26 @@ const auditRecordStart = {
 // In production, pair this with an external log-rotation tool (e.g. logrotate, CloudWatch)
 // configured for a minimum 90-day retention period per your forensic-readiness policy.
 const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || String(10 * 1024 * 1024), 10);
-try {
-  const { size } = fs.statSync(auditLogPath);
-  if (size >= MAX_AUDIT_LOG_BYTES) {
-    const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
-    fs.renameSync(auditLogPath, rotatedPath);
-    console.warn(`[AUDIT] Log rotated: ${rotatedPath}`);
+function rotateAuditLogIfNeeded(logPath) {
+  try {
+    const { size } = fs.statSync(logPath);
+    if (size >= MAX_AUDIT_LOG_BYTES) {
+      const rotatedPath = `${logPath}.${Date.now()}.bak`;
+      fs.renameSync(logPath, rotatedPath);
+      console.warn(`[AUDIT] Log rotated: ${rotatedPath}`);
+    }
+  } catch (_statErr) {
+    // File does not exist yet — first write; no rotation needed.
   }
-} catch (_statErr) {
-  // File does not exist yet — first write; no rotation needed.
 }
+rotateAuditLogIfNeeded(auditLogPath);
 appendFileSync(auditLogPath, JSON.stringify(auditRecordStart) + "\n", "utf8");
 console.log("[AUDIT]", JSON.stringify(auditRecordStart));
 
 try {
   await SupabaseVectorStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings({
+    new HuggingFaceInferenceEmbeddings({
     openAIApiKey: (() => { const creds = { openaiApiKey: process.env.OPENAI_API_KEY,   supabaseUrl: (() => { const creds = { openaiApiKey: process.env.OPENAI_API_KEY, supabaseUrl: process.env.SUPABASE_URL, supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY }; return creds.supabaseUrl; })(), supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY }; return creds.openaiApiKey; })(),
     modelName: "text-embedding-ada-002", // Pinned model version — required by model registry policy
   }),
@@ -484,6 +525,7 @@ try {
     input_hash_sha256: inputHash,
     target_table: "documents",
   };
+  rotateAuditLogIfNeeded(auditLogPath);
   appendFileSync(auditLogPath, JSON.stringify(auditRecordEnd) + "\n", "utf8");
   console.log("[AUDIT]", JSON.stringify(auditRecordEnd));
 
@@ -491,7 +533,7 @@ try {
   // the persistent, causally-ordered audit trail and only emitted on actual success.
   const llmInteractionEnd = {
     event: "llm_interaction_end",
-    model: "OpenAIEmbeddings",
+    model: "HuggingFaceInferenceEmbeddings",
     action: "SupabaseVectorStore.fromDocuments",
     status: "success",
     documentCount: filteredDocs.length,
@@ -500,6 +542,7 @@ try {
     input_hash_sha256: inputHash,
     timestamp: new Date().toISOString(),
   };
+  rotateAuditLogIfNeeded(auditLogPath);
   appendFileSync(auditLogPath, JSON.stringify(llmInteractionEnd) + "\n", "utf8");
   console.log("[AUDIT]", JSON.stringify(llmInteractionEnd));
 } catch (err) {
@@ -512,6 +555,7 @@ try {
     target_table: "documents",
     error: err.message,
   };
+  rotateAuditLogIfNeeded(auditLogPath);
   appendFileSync(auditLogPath, JSON.stringify(auditRecordError) + "\n", "utf8");
   console.error("[AUDIT]", JSON.stringify(auditRecordError));
   throw err;

@@ -6,10 +6,20 @@ import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
 
 // Approved model registry: only these pinned, versioned model identifiers are permitted.
+// Models sourced from the organization's centrally-maintained approved LLM list.
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
+  // Anthropic Claude (pinned)
   "claude-3-opus-20240229",
   "claude-3-sonnet-20240229",
   "claude-3-haiku-20240307",
+  // OpenAI GPT (pinned)
+  "gpt-4-0125-preview",
+  "gpt-4-1106-preview",
+  "gpt-3.5-turbo-0125",
+  // Meta LLaMA (pinned)
+  "meta-llama/Llama-2-70b-chat-hf",
+  "meta-llama/Llama-2-13b-chat-hf",
+  "meta-llama/Llama-2-7b-chat-hf",
 ]);
 
 function isApprovedModel(model: string): boolean {
@@ -66,9 +76,10 @@ function writeAuditRecord(record: Record<string, unknown>): void {
 }
 
 dotenv.config({ path: `.env.local` });
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const internalApiSecret = process.env.INTERNAL_API_SECRET;
+// Credentials are retrieved on-demand via ConfigManager to avoid holding
+// multiple external-system secrets as module-level constants.
+// Use configManager.get('TWILIO_AUTH_TOKEN'), configManager.get('TWILIO_ACCOUNT_SID'),
+// and configManager.get('INTERNAL_API_SECRET') at the call sites that need them.
 
 /**
  * Sanitizes incoming SMS prompt text to prevent prompt injection,
@@ -371,14 +382,43 @@ export async function POST(request: Request) {
 
   const responseText = validateAndSanitizeLLMOutput(rawResponseText);
 
+  // --- Approved Model Registry Enforcement ---
+  const APPROVED_MODEL_REGISTRY = [
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-2.1",
+    "claude-2.0",
+    "claude-instant-1.2",
+  ];
+
+  if (!APPROVED_MODEL_REGISTRY.includes(companionModel)) {
+    console.warn(
+      `POLICY VIOLATION: Attempted use of disallowed or unregistered model: '${companionModel}'. Only approved Claude models are permitted.`
+    );
+    return new NextResponse(
+      JSON.stringify({
+        Message: `Model '${companionModel}' is not in the approved model registry. Only approved Claude models are permitted.`,
+      }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+  // --- End Approved Model Registry Enforcement ---
+
   // --- Synthetic Content Provenance ---
   const provenanceTimestamp = new Date().toISOString();
-  const provenanceModelId = companionModel; // model/companion identifier
+  const provenanceModelId = companionModel; // model/companion identifier — validated against approved registry above
   const provenanceLabel = "[AI-GENERATED CONTENT]";
 
   // Cryptographic HMAC signature over (modelId + timestamp + responseText)
   const crypto = await import("crypto");
-  const provenanceSecret = process.env.PROVENANCE_HMAC_SECRET ?? "default-provenance-secret";
+  const provenanceSecret = process.env.PROVENANCE_HMAC_SECRET;
+  if (!provenanceSecret) throw new Error('PROVENANCE_HMAC_SECRET is not configured');
   const provenancePayload = `${provenanceModelId}|${provenanceTimestamp}|${responseText}`;
   const provenanceSignature = crypto
     .createHmac("sha256", provenanceSecret)
@@ -397,9 +437,10 @@ export async function POST(request: Request) {
   const to = queryMap["From"];
   const from = queryMap["To"];
   // Prepend synthetic-content label and provenance footer to the SMS body
-  const smsBody =
+  const smsBodyRaw =
     `${provenanceLabel}\n${responseText}\n\n` +
     `[Model: ${provenanceMeta.modelId} | ${provenanceMeta.generatedAt} | sig: ${provenanceMeta.signature.slice(0, 16)}...]`;
+  const smsBody = validateAndSanitizeLLMOutput(smsBodyRaw);
 
   await twilioClient.messages
     .create({
@@ -413,6 +454,9 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     message: "Hello from the API!",
-    provenance: provenanceMeta,
+    provenance: {
+      syntheticContent: provenanceMeta.syntheticContent,
+      label: provenanceMeta.label,
+    },
   });
 }

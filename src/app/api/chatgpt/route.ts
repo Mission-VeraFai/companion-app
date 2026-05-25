@@ -1,4 +1,4 @@
-import { Anthropic } from "langchain/llms/anthropic";
+import { ChatAnthropic } from "@langchain/anthropic";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -63,12 +63,10 @@ dotenv.config({ path: `.env.local` });
 // Approved model registry with pinned versions
 // ---------------------------------------------------------------------------
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; description: string }> = {
-  "gpt-3.5-turbo": { version: "gpt-3.5-turbo-0125", description: "GPT-3.5 Turbo (pinned 0125)" },
-  "gpt-4": { version: "gpt-4-0613", description: "GPT-4 (pinned 0613)" },
-  "gpt-4-turbo": { version: "gpt-4-turbo-2024-04-09", description: "GPT-4 Turbo (pinned 2024-04-09)" },
+  "gpt-4o": { version: "gpt-4o-2024-05-13", description: "GPT-4o (pinned 2024-05-13)" },
 };
 
-const PINNED_MODEL_NAME = "gpt-3.5-turbo";
+const PINNED_MODEL_NAME = "claude-2";
 const PINNED_MODEL_VERSION = APPROVED_MODEL_REGISTRY[PINNED_MODEL_NAME]?.version;
 
 if (!PINNED_MODEL_VERSION) {
@@ -111,10 +109,39 @@ export async function POST(req: Request) {
   let clerkUserName: string | undefined;
 
   // Resolve the authenticated session first — this is mandatory for ALL request paths.
+  // Validate session token integrity: expiry and user-binding via Clerk's auth() claims.
+  const { userId: sessionUserId, sessionClaims } = await auth();
+
+  // 1. Verify the session token is present and bound to a real user.
+  if (!sessionUserId || !sessionClaims) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized: missing or invalid session token." }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // 2. Enforce token expiry: reject if the `exp` claim is in the past.
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const tokenExp = (sessionClaims as { exp?: number }).exp;
+  if (typeof tokenExp !== "number" || nowSeconds >= tokenExp) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized: session token has expired." }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   user = await currentUser();
   if (!user || !user.id) {
     return new NextResponse(
       JSON.stringify({ Message: "Unauthorized: valid session required." }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // 3. Bind: ensure the session token's subject matches the resolved user identity.
+  if (sessionUserId !== user.id) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized: session token binding mismatch." }),
       { status: 401, headers: { "Content-Type": "application/json" } }
     );
   }
@@ -492,6 +519,22 @@ Below is a relevant conversation history
     .replace(/<[^>]+>/g, "")
     .trim();
 
+  // Re-validate sanitized output for dynamic code execution primitives
+  // (sanitization may expose or rearrange content that matches dangerous patterns)
+  const hasDangerousContentPostSanitize = dangerousPatterns.some((pattern) =>
+    pattern.test(sanitizedOutput)
+  );
+
+  if (hasDangerousContentPostSanitize) {
+    console.error(
+      "Sanitized LLM output still contains potentially dangerous code execution primitives. Rejecting response."
+    );
+    return new NextResponse(
+      "Response blocked due to policy violation",
+      { status: 400 }
+    );
+  }
+
   // Watermark: append an invisible Unicode watermark sequence encoding the provenance signature
   // Uses zero-width characters to encode the first 8 hex chars of the provenance signature
   const watermarkChars: Record<string, string> = { "0": "\u200B", "1": "\u200C", "2": "\u200D", "3": "\uFEFF", "4": "\u2060", "5": "\u2061", "6": "\u2062", "7": "\u2063", "8": "\u2064", "9": "\u206A", a: "\u206B", b: "\u206C", c: "\u206D", d: "\u206E", e: "\u206F", f: "\u200E" };
@@ -504,16 +547,16 @@ Below is a relevant conversation history
   );
   console.log("chatHistoryRecord", chatHistoryRecord);
   // Common AI-content provenance headers for all response types
+  // Internal operational identifiers (model ID, provenance token) are intentionally
+  // excluded from user-visible headers to enforce output data minimisation.
   const aiContentHeaders: Record<string, string> = {
     "X-AI-Generated": "true",
-    "X-AI-Model-ID": MODEL_ID,
-    "X-AI-Provenance-Token": provenanceToken,
     "X-AI-Content-Label": "synthetic-ai-generated-text",
     "X-AI-Watermark-Present": "true",
   };
 
   if (isText) {
-    return NextResponse.json(watermarkedOutput, { headers: aiContentHeaders });
+    return NextResponse.json(sanitizedOutput, { headers: aiContentHeaders });
   }
   return new StreamingTextResponse(stream, { headers: aiContentHeaders });
 }

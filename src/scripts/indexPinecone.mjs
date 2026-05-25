@@ -1,6 +1,8 @@
 // Major ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
+import https from "https";
+import tls from "tls";
 
 // ---------------------------------------------------------------------------
 // Approved-model registry enforcement
@@ -30,7 +32,7 @@ if (!APPROVED_VECTOR_STORES.has(VECTOR_STORE_PROVIDER)) {
 }
 // ---------------------------------------------------------------------------
 import { Document } from "langchain/document";
-import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -39,6 +41,98 @@ import crypto from "crypto";
 import os from "os";
 
 dotenv.config({ path: `.env.local` });
+
+// ---------------------------------------------------------------------------
+// URL allowlist enforcement
+// Policy: all outbound HTTP fetch() calls must target only approved hostnames.
+// ---------------------------------------------------------------------------
+const ALLOWED_EMBEDDING_HOSTNAMES = new Set([
+  // Add your approved embedding API hostnames here, e.g.:
+  // "api.openai.com",
+  // "api.cohere.ai",
+  // "your-internal-embedding-service.example.com",
+  ...(process.env.EMBEDDING_API_ALLOWED_HOSTS
+    ? process.env.EMBEDDING_API_ALLOWED_HOSTS.split(",").map((h) => h.trim()).filter(Boolean)
+    : []),
+]);
+
+/**
+ * Validates that a URL's hostname is in the approved allowlist before
+ * an outbound fetch() is made.
+ * @param {string} urlString - The full URL string to validate.
+ * @throws {Error} If the hostname is not in the approved allowlist.
+ */
+function assertAllowedEmbeddingURL(urlString) {
+  let parsed;
+  try {
+    parsed = new URL(urlString);
+  } catch (e) {
+    throw new Error(
+      `Policy violation: EMBEDDING_API_URL "${urlString}" is not a valid URL.`
+    );
+  }
+  if (!ALLOWED_EMBEDDING_HOSTNAMES.has(parsed.hostname)) {
+    throw new Error(
+      `Policy violation: outbound fetch to hostname "${parsed.hostname}" is not in the approved allowlist. ` +
+        `Approved hostnames: [${[...ALLOWED_EMBEDDING_HOSTNAMES].join(", ")}]. ` +
+        `Add the hostname to EMBEDDING_API_ALLOWED_HOSTS in your environment or to ALLOWED_EMBEDDING_HOSTNAMES in code.`
+    );
+  }
+}
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MCP server authentication: TLS certificate pinning for Pinecone API
+// Policy: MCP client must authenticate MCP server.
+// Set PINECONE_SERVER_CERT_FINGERPRINT in your environment to the expected
+// SHA-256 fingerprint (colon-separated hex) of the Pinecone API server cert.
+// ---------------------------------------------------------------------------
+const PINECONE_SERVER_CERT_FINGERPRINT = process.env.PINECONE_SERVER_CERT_FINGERPRINT;
+if (!PINECONE_SERVER_CERT_FINGERPRINT) {
+  throw new Error(
+    "Policy violation: PINECONE_SERVER_CERT_FINGERPRINT environment variable is not set. " +
+      "Server identity verification requires a pinned certificate fingerprint."
+  );
+}
+
+/**
+ * Creates an HTTPS agent that pins the Pinecone server certificate by
+ * verifying the SHA-256 fingerprint of the presented certificate.
+ */
+function createPineconeHttpsAgent() {
+  return new https.Agent({
+    rejectUnauthorized: true, // enforce standard CA chain validation
+    checkServerIdentity(hostname, cert) {
+      // Standard hostname check first
+      const err = tls.checkServerIdentity(hostname, cert);
+      if (err) throw err;
+
+      // Certificate pinning: verify the server cert fingerprint
+      const rawCert = cert.raw;
+      if (!rawCert) {
+        throw new Error("Server certificate pinning failed: no raw certificate available.");
+      }
+      const actualFingerprint = crypto
+        .createHash("sha256")
+        .update(rawCert)
+        .digest("hex")
+        .toUpperCase()
+        .match(/.{2}/g)
+        .join(":");
+
+      const expectedFingerprint = PINECONE_SERVER_CERT_FINGERPRINT.toUpperCase();
+      if (actualFingerprint !== expectedFingerprint) {
+        throw new Error(
+          `Server certificate pinning failed: expected fingerprint "${expectedFingerprint}" ` +
+            `but received "${actualFingerprint}". Possible MITM attack.`
+        );
+      }
+    },
+  });
+}
+
+const pineconeHttpsAgent = createPineconeHttpsAgent();
+// ---------------------------------------------------------------------------
 
 /**
  * Detects Singapore PII categories in text content.
@@ -429,7 +523,31 @@ try {
         );
       }
       const data = await response.json();
-      return data.embeddings;
+      // Validate and sanitize output from the MCP/embedding server
+      if (!data || !Array.isArray(data.embeddings) || data.embeddings.length === 0) {
+        throw new Error(
+          "Invalid response from external embedding service (embedDocuments): " +
+          "'embeddings' must be a non-empty array."
+        );
+      }
+      const sanitizedEmbeddings = data.embeddings.map((vec, i) => {
+        if (!Array.isArray(vec) || vec.length === 0) {
+          throw new Error(
+            `Invalid embedding at index ${i} from external embedding service: must be a non-empty array.`
+          );
+        }
+        return vec.map((val, j) => {
+          const num = Number(val);
+          if (!Number.isFinite(num)) {
+            throw new Error(
+              `Invalid embedding value at index [${i}][${j}] from external embedding service: ` +
+              `expected finite number, got ${val}.`
+            );
+          }
+          return num;
+        });
+      });
+      return sanitizedEmbeddings;
     }
 
     async embedQuery(text) {
@@ -444,7 +562,24 @@ try {
         );
       }
       const data = await response.json();
-      return data.embedding;
+      // Validate and sanitize output from the MCP/embedding server
+      if (!data || !Array.isArray(data.embedding) || data.embedding.length === 0) {
+        throw new Error(
+          "Invalid response from external embedding service (embedQuery): " +
+          "'embedding' must be a non-empty array."
+        );
+      }
+      const sanitizedEmbedding = data.embedding.map((val, j) => {
+        const num = Number(val);
+        if (!Number.isFinite(num)) {
+          throw new Error(
+            `Invalid embedding value at index [${j}] from external embedding service: ` +
+            `expected finite number, got ${val}.`
+          );
+        }
+        return num;
+      });
+      return sanitizedEmbedding;
     }
   }
 
@@ -471,10 +606,21 @@ try {
     outcome,
     ...(errorDetail ? { errorDetail } : {}),
   };
+  // --- Audit log rotation (retain last file; rotate at AUDIT_LOG_MAX_BYTES) ---
+  const AUDIT_LOG_MAX_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
+  try {
+    const stat = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
+    if (stat && stat.size >= AUDIT_LOG_MAX_BYTES) {
+      const rotatedPath = AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-");
+      fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+    }
+  } catch (rotateErr) {
+    console.error("[AUDIT] Log rotation failed:", rotateErr.message);
+  }
   fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(auditRecordEnd) + "\n", "utf8");
   console.log("[AUDIT]", JSON.stringify(auditRecordEnd));
 }
-  console.log(JSON.stringify({
+  const llmCompleteRecord = {
     timestamp: new Date().toISOString(),
     event: "llm_interaction_complete",
     service: "CohereEmbeddings",
@@ -482,9 +628,18 @@ try {
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "success",
-  }));
+  };
+  try {
+    const _statC = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
+    const _maxC = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
+    if (_statC && _statC.size >= _maxC) {
+      fs.renameSync(AUDIT_LOG_PATH, AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-"));
+    }
+  } catch (_re) { console.error("[AUDIT] Log rotation failed:", _re.message); }
+  fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(llmCompleteRecord) + "\n", "utf8");
+  console.log("[AUDIT]", JSON.stringify(llmCompleteRecord));
 } catch (err) {
-  console.error(JSON.stringify({
+  const llmErrorRecord = {
     timestamp: new Date().toISOString(),
     event: "llm_interaction_error",
     service: "CohereEmbeddings",
@@ -493,6 +648,15 @@ try {
     documentCount: docsToEmbed.length,
     status: "error",
     error: err.message,
-  }));
+  };
+  try {
+    const _statE = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
+    const _maxE = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
+    if (_statE && _statE.size >= _maxE) {
+      fs.renameSync(AUDIT_LOG_PATH, AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-"));
+    }
+  } catch (_re) { console.error("[AUDIT] Log rotation failed:", _re.message); }
+  fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(llmErrorRecord) + "\n", "utf8");
+  console.error("[AUDIT]", JSON.stringify(llmErrorRecord));
   throw err;
 }

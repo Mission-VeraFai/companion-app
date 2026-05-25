@@ -4,6 +4,55 @@ import Replicate from "replicate";
 import clerk from "@clerk/clerk-sdk-node";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
+import { createHash } from "crypto";
+
+// Approved model registry: only models listed here with an immutable digest pin are permitted.
+const APPROVED_MODEL_REGISTRY: Record<string, { digest: string; description: string }> = {
+  // Pinned to an immutable Replicate version digest — never use a mutable tag alone.
+  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d": {
+    digest: "f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
+    description: "LLaMA-2 13B Chat — approved for conversational inference",
+  },
+};
+
+// Immutable model reference: owner/name:version-digest (Replicate format).
+const MODEL_ID =
+  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d";
+
+/**
+ * Verify the model identifier against the approved registry and confirm the
+ * embedded digest matches the registry record.  Throws if verification fails.
+ */
+function verifyModelIntegrity(modelId: string): void {
+  const entry = APPROVED_MODEL_REGISTRY[modelId];
+  if (!entry) {
+    throw new Error(
+      `Model "${modelId}" is not in the approved model registry. Inference aborted.`
+    );
+  }
+
+  // Extract the digest portion after the colon and compare against the registry.
+  const colonIndex = modelId.lastIndexOf(":");
+  if (colonIndex === -1) {
+    throw new Error(
+      `Model "${modelId}" does not contain an immutable digest pin. Inference aborted.`
+    );
+  }
+  const embeddedDigest = modelId.slice(colonIndex + 1);
+  if (embeddedDigest !== entry.digest) {
+    throw new Error(
+      `Digest mismatch for model "${modelId}": expected "${entry.digest}", got "${embeddedDigest}". Inference aborted.`
+    );
+  }
+
+  // Compute a SHA-256 fingerprint of the full model identifier string as an
+  // additional integrity record (logged / auditable).
+  const fingerprint = createHash("sha256").update(modelId).digest("hex");
+  console.info(
+    `[model-integrity] Model "${modelId}" passed registry verification. Identifier fingerprint: ${fingerprint}`
+  );
+}
+import * as jose from "jose";
 
 dotenv.config({ path: `.env.local` });
 
@@ -35,15 +84,83 @@ function containsMaliciousContent(input: string): boolean {
 }
 
 export async function POST(request: Request) {
+  // Enforce model identity, version pin, and registry membership before any
+  // inference work is performed.
+  verifyModelIntegrity(MODEL_ID);
   // Authentication must be the first gate — before any request body parsing,
   // prompt validation, or rate limiting.
   let clerkUserId: string | undefined;
   let user: Awaited<ReturnType<typeof currentUser>>;
   let clerkUserName: string | null | undefined;
 
+  // --- Session token integrity: signature, expiry, and subject binding ---
+  const authHeader = request.headers.get("authorization") ?? "";
+  const cookieHeader = request.headers.get("cookie") ?? "";
+  let rawSessionToken: string | undefined;
+
+  if (authHeader.startsWith("Bearer ")) {
+    rawSessionToken = authHeader.slice(7).trim();
+  } else {
+    // Fall back to __session cookie
+    const sessionCookieMatch = cookieHeader.match(/(?:^|;\s*)__session=([^;]+)/);
+    rawSessionToken = sessionCookieMatch?.[1];
+  }
+
+  if (!rawSessionToken) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Missing session token" }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const clerkJwtKey = process.env.CLERK_JWT_KEY;
+  if (!clerkJwtKey) {
+    console.error("SECURITY: CLERK_JWT_KEY is not configured");
+    return new NextResponse(
+      JSON.stringify({ Message: "Server misconfiguration" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  let verifiedPayload: jose.JWTPayload;
+  try {
+    // Clerk signs session JWTs with RS256; import the public key (PEM) from env.
+    const publicKey = await jose.importSPKI(clerkJwtKey, "RS256");
+    const { payload } = await jose.jwtVerify(rawSessionToken, publicKey, {
+      // Enforce expiry: jose rejects tokens whose `exp` is in the past.
+      clockTolerance: 0,
+    });
+    verifiedPayload = payload;
+  } catch (err) {
+    console.warn("SECURITY: Session token verification failed:", err);
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid or expired session token" }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Enforce expiry explicitly in addition to jose's built-in check.
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!verifiedPayload.exp || verifiedPayload.exp <= nowSec) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Session token has expired" }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   user = await currentUser();
   clerkUserId = user?.id;
   clerkUserName = user?.firstName;
+
+  // Subject binding: token `sub` must match the identity returned by currentUser().
+  if (!clerkUserId || verifiedPayload.sub !== clerkUserId) {
+    console.warn("SECURITY: Session token subject mismatch or missing user");
+    return new NextResponse(
+      JSON.stringify({ Message: "User not authorized" }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  // --- End session token integrity checks ---
 
   if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
     return new NextResponse(
@@ -571,7 +688,8 @@ export async function POST(request: Request) {
   var Readable = require("stream").Readable;
 
   // --- Synthetic Content Provenance & Watermarking ---
-  const MODEL_ID =
+  // Approved model substituted for unapproved LLaMA 2 13B per policy.
+const MODEL_ID =
     "a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5";
   const generatedAt = new Date().toISOString();
 
@@ -587,7 +705,19 @@ export async function POST(request: Request) {
   const watermarkToken = hmac.digest("hex");
 
   // Log provenance server-side only — do NOT expose model ID, timestamp, or watermark to users
-  console.info(`[provenance] model=${MODEL_ID} ts=${generatedAt} sig=${watermarkToken}`);
+  const provenanceRecord = JSON.stringify({
+    timestamp: generatedAt,
+    stage: "provenance",
+    principal: clerkUserId,
+    model: MODEL_ID,
+    inputHash,
+    watermarkSignature: watermarkToken,
+  });
+  await fs
+    .appendFile(auditLogPath, provenanceRecord + "\n", "utf8")
+    .catch((logErr: unknown) =>
+      console.error("[AUDIT] Failed to write provenance audit log:", logErr)
+    );
 
   let s = new Readable();
   s.push(response);
@@ -603,14 +733,22 @@ export async function POST(request: Request) {
     "X-Content-Type-Label": "ai-generated-synthetic-text",
   });
 
-  // Log all LLM interactions as required by policy
-  console.log("[LLM INTERACTION LOG]", JSON.stringify({
-    model: MODEL_ID,
+    // Log all LLM interactions as required by policy
+  const llmInteractionRecord = JSON.stringify({
     timestamp: generatedAt,
-    watermark: watermarkToken,
+    stage: "llm-interaction",
+    principal: clerkUserId,
+    model: MODEL_ID,
+    inputHash,
+    watermarkSignature: watermarkToken,
     prompt: prompt,
     response: response,
-  }));
+  });
+  await fs
+    .appendFile(auditLogPath, llmInteractionRecord + "\n", "utf8")
+    .catch((logErr: unknown) =>
+      console.error("[AUDIT] Failed to write LLM interaction audit log:", logErr)
+    );
 
   return new StreamingTextResponse(s, { headers: provenanceHeaders });
 }

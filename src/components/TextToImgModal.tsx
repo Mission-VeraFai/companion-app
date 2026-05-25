@@ -10,7 +10,10 @@ import crypto from "crypto";
 
 /** Compute a SHA-256 HMAC over provenance metadata for tamper-evidence. */
 function signProvenance(provenance: { generatedAt: string; model: string; synthetic: boolean }): string {
-  const secret = process.env.PROVENANCE_SIGNING_SECRET ?? "default-dev-secret-change-in-prod";
+  const secret = process.env.PROVENANCE_SIGNING_SECRET;
+  if (!secret) {
+    throw new Error("PROVENANCE_SIGNING_SECRET environment variable is not set.");
+  }
   const payload = JSON.stringify(provenance);
   return crypto.createHmac("sha256", secret).update(payload).digest("hex");
 }
@@ -111,11 +114,14 @@ export default function TextToImgModal({
   };
 
   // Approved model registry and pinned version — must match server-side allowlist
+  // Only models explicitly approved by the organization's LLM registry may be listed here.
+  // 'stable-diffusion-v1-5' and 'stable-diffusion-xl-1.0' have been removed as they are
+  // NOT in the organization's approved model registry. Replace with an approved model ID.
   const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-    "stable-diffusion-v1-5": "stable-diffusion-v1-5",
-    "stable-diffusion-xl-1.0": "stable-diffusion-xl-1.0",
+    // TODO: Insert organization-approved model ID here, e.g.:
+    // "org-approved-model-id": "org-approved-model-id",
   };
-  const PINNED_MODEL_ID = "stable-diffusion-v1-5";
+  const PINNED_MODEL_ID = ""; // TODO: Set to an organization-approved model ID.
 
   const validateModelProvenance = (responseModel: unknown): void => {
     if (typeof responseModel !== "string" || responseModel.trim() === "") {
