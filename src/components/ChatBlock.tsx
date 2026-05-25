@@ -224,10 +224,32 @@ export function responseToChatBlocks(completion: any) {
         (typeof localStorage !== "undefined" && localStorage.getItem("session_principal")) ||
         "anonymous";
     // Model identifier: attach via a module-level constant or environment variable
-    const modelIdentifier =
+    // Approved model registry: only these pinned identifiers are permitted.
+    const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
+        "gpt-4o-2024-05-13",
+        "gpt-4-turbo-2024-04-09",
+        "gpt-3.5-turbo-0125",
+        "mistral-7b-instruct-v0.3",
+        "mistral-small-2402",
+        "mistral-medium-2312",
+        "text-embedding-3-small-1",
+        "text-embedding-ada-002-2",
+    ]);
+
+    const rawModelIdentifier: string =
         (typeof window !== "undefined" && (window as any).__aiModelIdentifier) ||
         (typeof process !== "undefined" && process.env && process.env.REACT_APP_AI_MODEL_ID) ||
         "unknown-model";
+
+    const modelIdentifier: string = APPROVED_MODEL_REGISTRY.has(rawModelIdentifier)
+        ? rawModelIdentifier
+        : (() => {
+              console.warn(
+                  `[POLICY VIOLATION] Model identifier "${rawModelIdentifier}" is NOT in the approved registry. ` +
+                  `Rejecting and substituting sentinel value. Approved models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+              );
+              return "REJECTED_UNAPPROVED_MODEL";
+          })();
     let rejectedCount = 0;
     console.log("got completoin", completion, typeof completion)
     if (typeof completion == "string") {
@@ -275,6 +297,7 @@ export function responseToChatBlocks(completion: any) {
         timestamp:        auditStart,
         principal:        principal,
         modelIdentifier:  modelIdentifier,
+        modelRegistryValidated: modelIdentifier !== "REJECTED_UNAPPROVED_MODEL",
         inputHash:        inputHash,
         inputType:        inputType,
         outputBlockCount: blocks.length,

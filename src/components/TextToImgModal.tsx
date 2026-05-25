@@ -1,10 +1,7 @@
-import dotenv from "dotenv";
-
-dotenv.config({ path: `.env.local` });
-
 import { Fragment, useState } from "react";
 import { useSession } from "next-auth/react";
-import crypto from "crypto";
+import { Dialog, Transition } from "@headlessui/react";
+import Image from "next/image";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
 import crypto from "crypto";
@@ -38,6 +35,46 @@ const ALLOWED_IMAGE_HOSTS = [
   "cdn.openai.com",
 ];
 
+const CODE_EXECUTION_PATTERNS: RegExp[] = [
+  /\beval\s*\(/i,
+  /\bFunction\s*\(/i,
+  /\bsetTimeout\s*\(/i,
+  /\bsetInterval\s*\(/i,
+  /\bexecScript\s*\(/i,
+  /\bdocument\.write\s*\(/i,
+  /\.innerHTML\s*=/i,
+  /\.outerHTML\s*=/i,
+  /\bimportScripts\s*\(/i,
+  /javascript\s*:/i,
+  /data\s*:\s*text\s*\/\s*(html|javascript)/i,
+  /\bnew\s+Function\b/i,
+  /\bvm\.runInThisContext\b/i,
+  /\bvm\.runInNewContext\b/i,
+  /\bexec\s*\(/i,
+  /\bspawn\s*\(/i,
+  /\brequire\s*\(/i,
+  /\bimport\s*\(/i,
+];
+
+/**
+ * Validates that a raw LLM/API response payload contains no dynamic code
+ * execution primitives. Throws if any are detected.
+ */
+function sanitizeLlmResponse(responsePayload: unknown): void {
+  const serialized =
+    typeof responsePayload === "string"
+      ? responsePayload
+      : JSON.stringify(responsePayload);
+
+  for (const pattern of CODE_EXECUTION_PATTERNS) {
+    if (pattern.test(serialized)) {
+      throw new Error(
+        `LLM response contains a forbidden code execution primitive matching: ${pattern}`
+      );
+    }
+  }
+}
+
 function isValidImageUrl(url: unknown): url is string {
   if (typeof url !== "string" || url.trim() === "") return false;
   try {
@@ -65,6 +102,30 @@ export default function TextToImgModal({
   } | null>(null);
   const [provenanceSignature, setProvenanceSignature] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  /** Write an append-only audit log entry to the server for every AI generation event. */
+  const writeAuditLog = useCallback(async (entry: {
+    eventType: string;
+    modelId: string;
+    inputHash: string;
+    outputUrl: string;
+    generatedAt: string;
+    principal: string;
+    provenanceSignature: string;
+  }) => {
+    try {
+      const response = await fetch("/api/audit-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(entry),
+      });
+      if (!response.ok) {
+        console.error("[AuditLog] Failed to write audit log entry:", response.status, await response.text());
+      }
+    } catch (err) {
+      console.error("[AuditLog] Exception writing audit log entry:", err);
+    }
+  }, []);
 
   const sanitizePrompt = (input: string): string | null => {
     if (!input || typeof input !== "string") return null;

@@ -25,8 +25,8 @@ function rateLimit(identifier: string): { success: boolean } {
 // MD5 removed: use HMAC-SHA256 for session/cache key generation with subject binding and expiry
 // Usage: generateSessionKey(userId) returns a signed, bound, expiry-aware cache key
 function generateSessionKey(userId: string): string {
-  const secret = process.env.SESSION_HMAC_SECRET;
-  if (!secret) throw new Error('SESSION_HMAC_SECRET environment variable is not set');
+  const secret = process.env.HMAC_SECRET;
+  if (!secret) throw new Error('HMAC_SECRET environment variable is not set');
   const expiryWindow = Math.floor(Date.now() / (1000 * 60 * 15)); // 15-minute window
   const payload = `${userId}:${expiryWindow}`;
   return createHmac('sha256', secret).update(payload).digest('hex');
@@ -1008,12 +1008,60 @@ function sanitizeMcpResponseBlocks(blocks: unknown[]): unknown[] {
   });
 }
 
+// Helper: sanitize LLM/agent output for dangerous dynamic code execution primitives
+const DANGEROUS_CODE_EXEC_PATTERNS = [
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
+  /\bimportScripts\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\bwindow\[\s*['"`]/gi,
+  /\bglobalThis\[\s*['"`]/gi,
+  /\bprocess\.binding\s*\(/gi,
+  /\brequire\s*\(\s*['"`]child_process/gi,
+  /\bspawn\s*\(/gi,
+  /\bexecSync\s*\(/gi,
+  /\bexecFile\s*\(/gi,
+];
+
+function sanitizeLlmOutput(output: string): string {
+  if (typeof output !== "string") return output;
+  for (const pattern of DANGEROUS_CODE_EXEC_PATTERNS) {
+    if (pattern.test(output)) {
+      // Reset lastIndex for global regexes
+      pattern.lastIndex = 0;
+      throw new Error(
+        `POLICY VIOLATION: LLM output contains a forbidden dynamic code execution primitive matching pattern: ${pattern}`
+      );
+    }
+    pattern.lastIndex = 0;
+  }
+  return output;
+}
+
+function sanitizeLlmOutputObject(obj: unknown): unknown {
+  if (typeof obj === "string") {
+    return sanitizeLlmOutput(obj);
+  } else if (Array.isArray(obj)) {
+    return obj.map(sanitizeLlmOutputObject);
+  } else if (obj !== null && typeof obj === "object") {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      sanitized[key] = sanitizeLlmOutputObject(value);
+    }
+    return sanitized;
+  }
+  return obj;
+}
+
 // Helper: verify MCP server identity from response headers
 function verifyMcpServerIdentity(response: Response, token: string): boolean {
   const serverTokenHeader = response.headers.get("X-MCP-Server-Token");
   if (!serverTokenHeader) return false;
   // The server must return HMAC-SHA256(token, MCP_SERVER_HMAC_SECRET) to prove it holds the secret
-  const hmacSecret = process.env.MCP_SERVER_HMAC_SECRET;
+  const hmacSecret = process.env.HMAC_SECRET;
   if (!hmacSecret) throw new Error("MCP_SERVER_HMAC_SECRET environment variable is not set");
   const { createHmac: _createHmac } = require("crypto");
   const expected = _createHmac("sha256", hmacSecret).update(token).digest("hex");
@@ -1023,7 +1071,60 @@ function verifyMcpServerIdentity(response: Response, token: string): boolean {
 // Policy enforcement: validate agentUrl against the approved model registry.
 // This MUST be called before any upstream request to a Steamship agent endpoint.
 // Returns the matching registry entry if approved, or throws a policy violation error.
+// STATIC approved model registry — do NOT replace with a runtime/env-var-based lookup.
+// Only endpoints listed here may be invoked. GPT and langchain are NOT approved.
+// To add or remove entries, update this list and submit a security review.
+const STATIC_APPROVED_MODEL_REGISTRY: ApprovedModelRegistryEntry[] = [
+  // Example approved Steamship-hosted entries (update to match org's actual approved endpoints):
+  { urlPrefix: "https://api.steamship.com/api/v1/package/instance/" },
+];
+
+// Disallowed model identifiers: GPT (langchain_openai/OpenAI) is NOT_IN_REGISTRY
+const DISALLOWED_MODEL_PATTERNS: RegExp[] = [
+  /openai/i,
+  /langchain[_-]openai/i,
+  /gpt[-_]?[0-9]/i,
+  /gpt[-_]?turbo/i,
+  /\/gpt\b/i,
+  /text-davinci/i,
+  /o1[-_]?(mini|preview|pro)?/i,
+];
+
+// ── LLM Interaction Logger ───────────────────────────────────────────────────
+// Logs all requests sent to and responses received from LLM/agent endpoints.
+// This satisfies the policy: "Agents must log all interactions with an LLM".
+function logLlmInteraction(event: {
+  type: "request" | "response" | "error";
+  agentUrl: string;
+  userId?: string;
+  sessionKey?: string;
+  requestBody?: unknown;
+  responseStatus?: number;
+  responseBody?: unknown;
+  errorMessage?: string;
+  durationMs?: number;
+}): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    llm_interaction: true,
+    ...event,
+  };
+  // Use structured JSON logging so log aggregators can index LLM interactions
+  console.log(JSON.stringify(entry));
+}
+
 function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
+  // Explicit deny-list check: GPT/OpenAI models are disallowed per organization policy
+  for (const pattern of DISALLOWED_MODEL_PATTERNS) {
+    if (pattern.test(agentUrl)) {
+      throw new Error(
+        `POLICY VIOLATION: agentUrl '${agentUrl}' references a disallowed model (GPT/OpenAI via ` +
+        `langchain_openai/OpenAI). GPT models are NOT_IN_REGISTRY and are explicitly prohibited ` +
+        `by the organization's approved model policy.`
+      );
+    }
+  }
+
   let registry: ApprovedModelRegistryEntry[];
   try {
     registry = loadApprovedModelRegistry();
@@ -1034,6 +1135,66 @@ function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
       }`
     );
   }
+
+  // Secondary deny-list check: reject any registry entry that references a disallowed model
+    const match = registry.find((entry) => agentUrl.startsWith(entry.urlPrefix));
+  if (!match) {
+    const traceId = _auditRandomUUID();
+    writeAuditRecord({
+      traceId,
+      timestamp: new Date().toISOString(),
+      principal: process.env.AI_AGENT_PRINCIPAL || "unknown",
+      modelId: "unknown",
+      agentUrl,
+      inputHash: hashInput(agentUrl),
+      outputSummary: "BLOCKED: agentUrl not in approved registry",
+      decision: "DENY",
+      retentionDays: AUDIT_RETENTION_DAYS,
+      eventDetail: "policy_violation_unapproved_agent_url",
+    });
+    throw new Error(
+      `POLICY VIOLATION: agentUrl '${agentUrl}' does not match any entry in the ` +
+      `organization-approved model registry. Only approved model endpoints may be invoked. ` +
+      `Approved prefixes: [${registry.map((e) => e.urlPrefix).join(", ")}] ` +
+      `[traceId=${traceId}]`
+    );
+  }
+  const approvalTraceId = _auditRandomUUID();
+  writeAuditRecord({
+    traceId: approvalTraceId,
+    timestamp: new Date().toISOString(),
+    principal: process.env.AI_AGENT_PRINCIPAL || "unknown",
+    modelId: match.modelId ?? match.urlPrefix,
+    agentUrl,
+    inputHash: hashInput(agentUrl),
+    outputSummary: "APPROVED: agentUrl matched registry entry",
+    decision: "ALLOW",
+    retentionDays: AUDIT_RETENTION_DAYS,
+    eventDetail: "agent_url_approved",
+  });
+  return match;
+}' matched registry entry '${match.urlPrefix}' ` +
+          `but that entry references a disallowed model (GPT/OpenAI). ` +
+          `GPT models are NOT_IN_REGISTRY and are explicitly prohibited by organization policy.`
+        );
+      }
+    }
+  }
+
+  if (!match) {
+    throw new Error(
+      `POLICY VIOLATION: agentUrl '${agentUrl}' does not match any entry in the ` +
+      `organization-approved model registry. Only approved model endpoints may be invoked. ` +
+      `Approved prefixes: [${registry.map((e) => e.urlPrefix).join(", ")}]`
+    );
+  }
+  return match;
+}' references a model (GPT/langchain/OpenAI) ` +
+        `that is NOT in the organization's approved model list and is explicitly prohibited.`
+      );
+    }
+  }
+
   const match = registry.find((entry) => agentUrl.startsWith(entry.urlPrefix));
   if (!match) {
     throw new Error(
@@ -1044,8 +1205,7 @@ function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
   }
   return match;
 }
-    return returnError(500, "An internal error occurred. Please try again later.", {
-      event_detail: "upstream_agent_error",
-    });
+    const sanitizedErrorContext = sanitizeMcpResponseBlocks([{ event_detail: "upstream_agent_error" }])[0];
+    return returnError(500, "An internal error occurred. Please try again later.", sanitizedErrorContext);
   }
 }

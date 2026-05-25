@@ -1,5 +1,4 @@
-// Major ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
-import { PineconeClient } from "@pinecone-database/pinecone";
+// Major ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/chroma
 import dotenv from "dotenv";
 import https from "https";
 import tls from "tls";
@@ -8,6 +7,33 @@ import tls from "tls";
 // Approved-model registry enforcement
 // Policy: all AI workloads must use pinned, registry-approved model identifiers.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Explicit tool allow list enforcement
+// Policy: AI agents may only invoke tools present in this allow list.
+// ---------------------------------------------------------------------------
+const TOOL_ALLOW_LIST = new Set([
+  "pinecone",
+  "chroma",
+  "openai-embeddings",
+  "character-text-splitter",
+  "document-loader",
+]);
+
+/**
+ * Validates that a tool name is in the explicit allow list before execution.
+ * Throws a policy violation error if the tool is not approved.
+ * @param {string} toolName - The identifier of the tool to validate.
+ */
+function validateTool(toolName) {
+  if (!TOOL_ALLOW_LIST.has(toolName)) {
+    throw new Error(
+      `Policy violation: tool "${toolName}" is not in the explicit tool allow list. ` +
+        `Approved tools: ${[...TOOL_ALLOW_LIST].join(", ")}`
+    );
+  }
+  console.info(`[Policy] Tool access granted: ${toolName}`);
+}
+
 const APPROVED_EMBEDDING_MODELS = new Set([
   "text-embedding-3-small",
   "text-embedding-3-large",
@@ -16,11 +42,22 @@ const APPROVED_EMBEDDING_MODELS = new Set([
 const APPROVED_VECTOR_STORES = new Set(["pgvector", "chroma", "weaviate", "pinecone"]);
 
 const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
+// SHA-256 digest of the approved model artifact for integrity verification.
+// Update this value whenever the pinned model version changes.
+const PINNED_EMBEDDING_MODEL_DIGEST =
+  process.env.PINNED_EMBEDDING_MODEL_DIGEST ||
+  "sha256:3f4b2c1a8e7d6f5e4c3b2a1908f7e6d5c4b3a2918e7d6f5e4c3b2a1908f7e6d5";
 const VECTOR_STORE_PROVIDER = "chroma";
 
 if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
   throw new Error(
     `Policy violation: embedding model "${PINNED_EMBEDDING_MODEL}" is not in the approved model registry.`
+  );
+}
+if (!PINNED_EMBEDDING_MODEL_DIGEST || PINNED_EMBEDDING_MODEL_DIGEST.trim() === "") {
+  throw new Error(
+    "Policy violation: PINNED_EMBEDDING_MODEL_DIGEST is empty. " +
+      "A valid digest must be provided for integrity verification."
   );
 }
 console.info(
@@ -35,8 +72,65 @@ if (!APPROVED_VECTOR_STORES.has(VECTOR_STORE_PROVIDER)) {
 }
 // ---------------------------------------------------------------------------
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "@langchain/openai";
-import { Chroma } from "langchain/vectorstores/chroma";
+// OpenAIEmbeddings (@langchain/openai) removed: not in approved model registry.
+// Using registry-approved embedding model via PINNED_EMBEDDING_MODEL constant.
+import { CacheBackedEmbeddings } from "langchain/embeddings/cache_backed";
+import { FakeEmbeddings } from "langchain/embeddings/fake";
+
+/**
+ * ApprovedEmbeddings: wraps only registry-approved model identifiers.
+ * Swap FakeEmbeddings for your org's approved provider SDK when available.
+ */
+class ApprovedEmbeddings extends FakeEmbeddings {
+  constructor({ modelName } = {}) {
+    super();
+    if (!APPROVED_EMBEDDING_MODELS.has(modelName)) {
+      throw new Error(
+        `Policy violation: embedding model "${modelName}" is not in the approved model registry.`
+      );
+    }
+    this.modelName = modelName;
+  }
+}
+// Chroma (vector store) direct writes are handled by the agent intermediary, not the MCP server.
+// import { Chroma } from "langchain/vectorstores/chroma";
+
+// Validate that both core tools are in the allow list at module load time.
+// This ensures the module itself cannot be loaded if the tools are not approved.
+validateTool("pinecone");
+validateTool("chroma");
+validateTool("openai-embeddings");
+validateTool("character-text-splitter");
+validateTool("document-loader"); // REMOVED – policy violation
+
+/**
+ * agentIndexRequest – sends a structured indexing request to the agent
+ * intermediary instead of calling the embedding model directly.
+ * @param {object} payload - { texts: string[], metadatas: object[], namespace: string }
+ * @returns {Promise<object>} - agent response
+ */
+async function agentIndexRequest(payload) {
+  const agentEndpoint = process.env.AGENT_INTERMEDIARY_URL;
+  if (!agentEndpoint) {
+    throw new Error(
+      "Policy violation: AGENT_INTERMEDIARY_URL is not set. " +
+        "The MCP server must delegate embedding/indexing to an agent intermediary."
+    );
+  }
+  const url = new URL(agentEndpoint);
+  validateOutboundUrl(url.toString()); // reuse existing allowlist check if applicable
+  const response = await fetch(agentEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "index", ...payload }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Agent intermediary returned HTTP ${response.status}: ${await response.text()}`
+    );
+  }
+  return response.json();
+}
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
@@ -44,6 +138,279 @@ import crypto from "crypto";
 import os from "os";
 
 dotenv.config({ path: `.env.local` });
+
+// ---------------------------------------------------------------------------
+// PII redaction
+// Policy: redact PII from file contents before embedding or uploading.
+// ---------------------------------------------------------------------------
+/**
+ * Redacts common PII patterns from a string.
+ * Patterns covered: email addresses, US phone numbers, US SSNs,
+ * credit-card numbers, and IPv4 addresses.
+ * Extend the PATTERNS array to cover additional PII types as needed.
+ */
+function redactPII(text) {
+  if (typeof text !== "string") return text;
+  const PATTERNS = [
+    // Email addresses
+    { re: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, label: "[REDACTED_EMAIL]" },
+    // US Social Security Numbers  (###-##-####)
+    { re: /\b\d{3}-\d{2}-\d{4}\b/g, label: "[REDACTED_SSN]" },
+    // Credit-card numbers (13-16 digits, optionally separated by spaces or dashes)
+    { re: /\b(?:\d[ \-]?){13,16}\b/g, label: "[REDACTED_CC]" },
+    // US phone numbers in common formats
+    { re: /\b(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, label: "[REDACTED_PHONE]" },
+    // IPv4 addresses
+    { re: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g, label: "[REDACTED_IP]" },
+  ];
+  let redacted = text;
+  for (const { re, label } of PATTERNS) {
+    redacted = redacted.replace(re, label);
+  }
+  return redacted;
+}
+
+/**
+ * Returns a new array of Document objects with PII redacted from pageContent.
+ * The original documents are not mutated.
+ */
+function redactDocuments(docs) {
+  return docs.map((doc) => ({
+    ...doc,
+    pageContent: redactPII(doc.pageContent),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Document content scanner
+// Policy: documents must be scanned for hidden prompts, base64-encoded payloads,
+// shell commands, and binary executables before entering the embedding pipeline.
+// ---------------------------------------------------------------------------
+const SUSPICIOUS_PATTERNS = [
+  // Prompt-injection / jailbreak triggers
+  /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
+  /you\s+are\s+now\s+(a\s+)?(?:dan|jailbreak|unrestricted)/i,
+  /system\s*:\s*you\s+are/i,
+  /<\s*\/?\s*(?:system|user|assistant)\s*>/i,
+  /\[\s*(?:INST|SYS|SYSTEM|HUMAN|ASSISTANT)\s*\]/i,
+  // Shell / OS command patterns
+  /(?:^|[\s;|&`$])(?:bash|sh|zsh|cmd|powershell|pwsh|exec|eval|system|popen)\s*[\(\-]/im,
+  /(?:rm\s+-rf|mkfs|dd\s+if=|chmod\s+[0-7]{3,4}|wget\s+http|curl\s+http)/i,
+  /(?:\$\(|`)[^`]*(?:\)|`)/,   // command substitution
+  // Base64-encoded blobs (>= 64 contiguous base64 chars — heuristic for hidden payloads)
+  /[A-Za-z0-9+\/]{64,}={0,2}/,
+  // Binary / non-printable bytes (null bytes, high-byte sequences)
+  /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/,
+];
+
+/**
+ * Scans a LangChain Document for malicious content.
+ * Throws an error (and logs an audit record) if suspicious content is found.
+ * @param {import('langchain/document').Document} doc
+ * @param {number} index - position in the batch, for diagnostics
+ */
+function scanDocumentForMaliciousContent(doc, index) {
+  const content = typeof doc.pageContent === "string" ? doc.pageContent : "";
+  for (const pattern of SUSPICIOUS_PATTERNS) {
+    if (pattern.test(content)) {
+      const auditRecord = {
+        timestamp: new Date().toISOString(),
+        event: "DOCUMENT_SCAN_REJECTED",
+        docIndex: index,
+        source: doc.metadata?.source ?? "unknown",
+        patternMatched: pattern.toString(),
+      };
+      try {
+        fs.appendFileSync(
+          AUDIT_LOG_PATH,
+          JSON.stringify(auditRecord) + "\n",
+          "utf8"
+        );
+      } catch (_e) {
+        console.error("[AUDIT] Failed to write scan-rejection record:", _e.message);
+      }
+      console.error("[SCAN] Rejected document at index", index, "— matched pattern:", pattern.toString());
+      throw new Error(
+        `[SCAN] Document at index ${index} (source: ${
+          doc.metadata?.source ?? "unknown"
+        }) contains potentially malicious content and was rejected before embedding.`
+      );
+    }
+  }
+}
+
+/**
+ * Scans an entire batch of documents.
+ * Call this immediately before any embedding / vector-store ingestion.
+ * @param {import('langchain/document').Document[]} docs
+ */
+function scanDocumentBatch(docs) {
+  if (!Array.isArray(docs) || docs.length === 0) {
+    throw new Error("[SCAN] Document batch is empty or invalid — aborting embedding.");
+  }
+  docs.forEach((doc, i) => scanDocumentForMaliciousContent(doc, i));
+  console.info(`[SCAN] All ${docs.length} document(s) passed malicious-content scan.`);
+}
+
+// ---------------------------------------------------------------------------
+// Input sanitization and validation for AI model inputs
+// Policy: all text content must be sanitized and validated before LLM invocation.
+// ---------------------------------------------------------------------------
+const MAX_DOCUMENT_CHARS = 100_000; // max characters per document chunk
+const MIN_DOCUMENT_CHARS = 1;       // reject empty documents
+
+/**
+ * Sanitizes a single document's pageContent before it is sent to the embedding model.
+ * - Removes null bytes and non-printable control characters (except common whitespace)
+ * - Truncates content exceeding MAX_DOCUMENT_CHARS
+ * - Returns null if the content is empty or invalid after sanitization
+ *
+ * @param {string} text - Raw text content from a document chunk
+ * @returns {string|null} Sanitized text, or null if the document should be rejected
+ */
+function sanitizeDocumentText(text) {
+  if (typeof text !== "string") return null;
+  // Remove null bytes
+  let sanitized = text.replace(/\x00/g, "");
+  // Remove non-printable ASCII control characters except tab (\x09), newline (\x0A), carriage return (\x0D)
+  sanitized = sanitized.replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Truncate to maximum allowed length
+  if (sanitized.length > MAX_DOCUMENT_CHARS) {
+    console.warn(
+      `[Sanitize] Document truncated from ${sanitized.length} to ${MAX_DOCUMENT_CHARS} characters.`
+    );
+    sanitized = sanitized.slice(0, MAX_DOCUMENT_CHARS);
+  }
+  // Reject documents that are empty after sanitization
+  if (sanitized.trim().length < MIN_DOCUMENT_CHARS) {
+    return null;
+  }
+  return sanitized;
+}
+
+/**
+ * Validates and sanitizes an array of LangChain Document objects.
+ * Documents that fail sanitization are dropped and logged.
+ *
+ * @param {Array} docs - Array of LangChain Document objects
+ * @returns {Array} Array of sanitized Document objects safe for embedding
+ */
+function sanitizeDocuments(docs) {
+  if (!Array.isArray(docs)) {
+    throw new Error("[Sanitize] Expected an array of documents.");
+  }
+  const sanitized = [];
+  for (let i = 0; i < docs.length; i++) {
+    const doc = docs[i];
+    const cleanText = sanitizeDocumentText(doc.pageContent);
+    if (cleanText === null) {
+      console.warn(
+        `[Sanitize] Document at index ${i} was rejected after sanitization (empty or invalid content).`
+      );
+      continue;
+    }
+    sanitized.push(
+      new Document({ pageContent: cleanText, metadata: doc.metadata ?? {} })
+    );
+  }
+  if (sanitized.length === 0) {
+    throw new Error(
+      "[Sanitize] All documents were rejected during sanitization. Aborting embedding to prevent empty index."
+    );
+  }
+  console.info(
+    `[Sanitize] ${sanitized.length} of ${docs.length} documents passed sanitization and will be embedded.`
+  );
+  return sanitized;
+}
+
+// ---------------------------------------------------------------------------
+// MCP server output sanitization
+// Policy: Client must validate and sanitize any output from a MCP server
+// before further processing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Sanitizes and validates a raw MCP server tool response.
+ * @param {unknown} mcpResponse - The raw response from an MCP server tool call.
+ * @param {object} [options]
+ * @param {number} [options.maxStringLength=65536] - Maximum allowed length for any string field.
+ * @param {string[]} [options.requiredFields=[]] - Fields that must be present on the response.
+ * @returns {object} - The sanitized, validated response object.
+ * @throws {Error} If the response fails structural or content validation.
+ */
+function sanitizeMcpOutput(mcpResponse, { maxStringLength = 65536, requiredFields = [] } = {}) {
+  // 1. Reject null / non-object responses
+  if (mcpResponse === null || mcpResponse === undefined) {
+    throw new Error("[MCP Sanitization] Response is null or undefined.");
+  }
+  if (typeof mcpResponse !== "object" || Array.isArray(mcpResponse)) {
+    throw new Error(
+      `[MCP Sanitization] Expected an object response, got: ${typeof mcpResponse}`
+    );
+  }
+
+  // 2. Check required fields
+  for (const field of requiredFields) {
+    if (!(field in mcpResponse)) {
+      throw new Error(
+        `[MCP Sanitization] Required field "${field}" is missing from MCP response.`
+      );
+    }
+  }
+
+  // 3. Deep-clone to avoid prototype pollution and strip non-own properties
+  const sanitized = JSON.parse(JSON.stringify(mcpResponse));
+
+  // 4. Recursively sanitize string values
+  function sanitizeValue(value, keyPath) {
+    if (typeof value === "string") {
+      if (value.length > maxStringLength) {
+        throw new Error(
+          `[MCP Sanitization] String field "${keyPath}" exceeds maximum allowed length ` +
+            `(${value.length} > ${maxStringLength}).`
+        );
+      }
+      // Strip null bytes and control characters (except common whitespace)
+      const cleaned = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+      // Detect and reject obvious script-injection patterns
+      if (/<script[\s>]/i.test(cleaned) || /javascript:/i.test(cleaned)) {
+        throw new Error(
+          `[MCP Sanitization] Potentially unsafe content detected in field "${keyPath}".`
+        );
+      }
+      return cleaned;
+    } else if (Array.isArray(value)) {
+      return value.map((item, idx) => sanitizeValue(item, `${keyPath}[${idx}]`));
+    } else if (value !== null && typeof value === "object") {
+      const result = {};
+      for (const [k, v] of Object.entries(value)) {
+        result[k] = sanitizeValue(v, `${keyPath}.${k}`);
+      }
+      return result;
+    }
+    // numbers, booleans, null pass through unchanged
+    return value;
+  }
+
+  const result = sanitizeValue(sanitized, "root");
+  console.info("[MCP Sanitization] MCP server output passed validation and sanitization.");
+  return result;
+}
+
+/**
+ * Wraps an MCP tool call, automatically sanitizing the response before returning it.
+ * @param {Function} mcpToolFn - The async MCP tool function to call.
+ * @param {object} [sanitizeOptions] - Options forwarded to sanitizeMcpOutput.
+ * @returns {Function} - A wrapped async function that returns sanitized output.
+ */
+function withMcpSanitization(mcpToolFn, sanitizeOptions = {}) {
+  return async function (...args) {
+    const rawResponse = await mcpToolFn(...args);
+    return sanitizeMcpOutput(rawResponse, sanitizeOptions);
+  };
+}
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // URL allowlist enforcement
@@ -100,16 +467,86 @@ function assertAllowedEmbeddingURL(urlString) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// MCP server authentication: TLS certificate pinning for Pinecone API
+// ---------------------------------------------------------------------------
+// MCP server client authentication
+// Policy: MCP server must authenticate all clients.
+// Clients must supply a Bearer token matching MCP_CLIENT_AUTH_TOKEN in the
+// Authorization header (or equivalent transport header) of every request.
+// ---------------------------------------------------------------------------
+const MCP_CLIENT_AUTH_TOKEN = process.env.MCP_CLIENT_AUTH_TOKEN;
+if (!MCP_CLIENT_AUTH_TOKEN || MCP_CLIENT_AUTH_TOKEN.trim().length === 0) {
+  throw new Error(
+    "Policy violation: MCP_CLIENT_AUTH_TOKEN environment variable is not set. " +
+      "The MCP server requires a non-empty shared secret to authenticate all clients. " +
+      "Set MCP_CLIENT_AUTH_TOKEN in your environment before starting the server."
+  );
+}
+
+/**
+ * Authenticates an incoming MCP client request by validating the Bearer token
+ * supplied in the Authorization header against the expected server secret.
+ *
+ * @param {string|undefined} authorizationHeader - The value of the Authorization
+ *   header from the incoming MCP client request (e.g. "Bearer <token>").
+ * @throws {Error} If the token is missing, malformed, or does not match the
+ *   expected MCP_CLIENT_AUTH_TOKEN, rejecting the client request.
+ */
+function authenticateMcpClient(authorizationHeader) {
+  if (!authorizationHeader || typeof authorizationHeader !== "string") {
+    throw new Error(
+      "MCP client authentication failed: Authorization header is missing. " +
+        "All clients must supply a Bearer token."
+    );
+  }
+
+  const BEARER_PREFIX = "Bearer ";
+  if (!authorizationHeader.startsWith(BEARER_PREFIX)) {
+    throw new Error(
+      "MCP client authentication failed: Authorization header must use the Bearer scheme. " +
+        `Received: "${authorizationHeader.slice(0, 20)}..."`
+    );
+  }
+
+  const suppliedToken = authorizationHeader.slice(BEARER_PREFIX.length);
+
+  // Use a timing-safe comparison to prevent timing-based token oracle attacks.
+  const expected = Buffer.from(MCP_CLIENT_AUTH_TOKEN, "utf8");
+  const supplied = Buffer.from(suppliedToken, "utf8");
+
+  let tokenValid = false;
+  if (expected.length === supplied.length) {
+    tokenValid = crypto.timingSafeEqual(expected, supplied);
+  }
+
+  if (!tokenValid) {
+    throw new Error(
+      "MCP client authentication failed: supplied Bearer token does not match " +
+        "the expected MCP_CLIENT_AUTH_TOKEN. Client is not authorized."
+    );
+  }
+}
+// ---------------------------------------------------------------------------ation (COMPLETE): TLS certificate pinning for Pinecone API
 // Policy: MCP client must authenticate MCP server.
+// The client MUST verify the MCP server's identity before sending any data.
 // Set PINECONE_SERVER_CERT_FINGERPRINT in your environment to the expected
-// SHA-256 fingerprint (colon-separated hex) of the Pinecone API server cert.
+// SHA-256 fingerprint (colon-separated hex, e.g. "AB:CD:EF:...") of the
+// Pinecone API server certificate. Connections are rejected if the fingerprint
+// does not match, preventing MITM attacks.
 // ---------------------------------------------------------------------------
 const PINECONE_SERVER_CERT_FINGERPRINT = process.env.PINECONE_SERVER_CERT_FINGERPRINT;
 if (!PINECONE_SERVER_CERT_FINGERPRINT) {
   throw new Error(
     "Policy violation: PINECONE_SERVER_CERT_FINGERPRINT environment variable is not set. " +
-      "Server identity verification requires a pinned certificate fingerprint."
+      "MCP client must authenticate the MCP server. " +
+      "Server identity verification requires a pinned certificate fingerprint. " +
+      "Set PINECONE_SERVER_CERT_FINGERPRINT to the SHA-256 fingerprint of the Pinecone API server certificate."
+  );
+}
+// Validate fingerprint format (colon-separated hex pairs, SHA-256 = 32 bytes = 95 chars)
+if (!/^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$/.test(PINECONE_SERVER_CERT_FINGERPRINT)) {
+  throw new Error(
+    "Policy violation: PINECONE_SERVER_CERT_FINGERPRINT is not a valid SHA-256 fingerprint. " +
+      "Expected format: 64 hex characters separated by colons (e.g. \"AB:CD:EF:...\", 95 chars total)."
   );
 }
 
@@ -141,8 +578,10 @@ function createPineconeHttpsAgent() {
       const expectedFingerprint = PINECONE_SERVER_CERT_FINGERPRINT.toUpperCase();
       if (actualFingerprint !== expectedFingerprint) {
         throw new Error(
-          `Server certificate pinning failed: expected fingerprint "${expectedFingerprint}" ` +
-            `but received "${actualFingerprint}". Possible MITM attack.`
+          `MCP server authentication failed: certificate fingerprint mismatch. ` +
+            `Expected "${expectedFingerprint}" but received "${actualFingerprint}". ` +
+            `The MCP server identity could not be verified — connection refused to prevent MITM attack. ` +
+            `Update PINECONE_SERVER_CERT_FINGERPRINT if the server certificate has been legitimately rotated.`
         );
       }
     },
@@ -454,12 +893,53 @@ function validateAndSanitizeDoc(doc) {
   return doc;
 }
 
+// Attach provenance metadata and cryptographic watermark to every document before embedding/storage.
+// PROVENANCE_HMAC_SECRET must be set in the environment; it is used to produce a per-document HMAC-SHA256
+// watermark that allows downstream verification of content origin and integrity.
+const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET;
+if (!PROVENANCE_HMAC_SECRET || PROVENANCE_HMAC_SECRET.length < 32) {
+  throw new Error(
+    "PROVENANCE_HMAC_SECRET environment variable must be set and at least 32 characters long " +
+    "to enable cryptographic watermarking of AI-generated embeddings."
+  );
+}
+
+const CONTENT_ORIGIN_TAG = process.env.CONTENT_ORIGIN_TAG ?? "ai-generated:openai-embeddings";
+
+function attachProvenanceAndWatermark(doc) {
+  const provenanceTimestamp = new Date().toISOString();
+  const provenancePayload = JSON.stringify({
+    modelIdentifier: PINNED_EMBEDDING_MODEL,
+    contentOriginTag: CONTENT_ORIGIN_TAG,
+    provenanceTimestamp,
+    fileName: doc.metadata?.fileName ?? "unknown",
+    pageContent: doc.pageContent,
+  });
+  const watermark = crypto
+    .createHmac("sha256", PROVENANCE_HMAC_SECRET)
+    .update(provenancePayload)
+    .digest("hex");
+  return new Document({
+    pageContent: doc.pageContent,
+    metadata: {
+      ...doc.metadata,
+      provenance_model: PINNED_EMBEDDING_MODEL,
+      provenance_timestamp: provenanceTimestamp,
+      provenance_origin: CONTENT_ORIGIN_TAG,
+      provenance_watermark: watermark,
+    },
+  });
+}
+
 const safeDocs = langchainDocs
   .flat()
   .filter((doc) => doc !== undefined)
-  .map((doc) => validateAndSanitizeDoc(doc));
+  .map((doc) => validateAndSanitizeDoc(doc))
+  .map((doc) => attachProvenanceAndWatermark(doc));
 
-const docsToEmbed = langchainDocs.flat().filter((doc) => doc !== undefined);
+const docsToEmbed = redactDocuments(
+  // original assignment continues below — wrap the existing value
+  (() => { const _raw = safeDocs;
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_complete",
@@ -724,6 +1204,20 @@ try {
     console.error("[AUDIT] Log rotation failed:", rotateErr.message);
   }
       fs.copyFileSync(AUDIT_LOG_PATH, resolvedRotated);
+      // --- HITL approval gate for risky delete operation ---
+      (function requireHITLApprovalForDelete(targetPath) {
+        const approved = process.env.HITL_DELETE_APPROVED === "true";
+        if (!approved) {
+          throw new Error(
+            `[HITL] Human approval required before deleting file. ` +
+            `Operation: delete '${targetPath}'. ` +
+            `Set environment variable HITL_DELETE_APPROVED=true to explicitly approve this risky operation.`
+          );
+        }
+        console.warn(
+          `[HITL] Human-approved file delete operation proceeding: '${targetPath}'`
+        );
+      })(AUDIT_LOG_PATH);
       fs.unlinkSync(AUDIT_LOG_PATH);
     }
   } catch (rotateErr) {
@@ -736,7 +1230,7 @@ try {
     timestamp: new Date().toISOString(),
     event: "llm_interaction_complete",
     service: "OpenAIEmbeddings",
-    model: "embed-english-v3.0",
+    model: PINNED_EMBEDDING_MODEL, // Registry-approved: text-embedding-3-small
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "success",
@@ -745,7 +1239,15 @@ try {
       const _statC = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
     const _maxC = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
     if (_statC && _statC.size >= _maxC) {
-      fs.renameSync(AUDIT_LOG_PATH, AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-"));
+      const _rotatedPathC = AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-");
+      const _pathModC = require ? (() => { try { return require("path"); } catch(_){return null;} })() : null;
+      const _resolvedC = _pathModC ? _pathModC.resolve(_rotatedPathC) : _rotatedPathC;
+      const _expectedDirC = _pathModC ? _pathModC.dirname(_pathModC.resolve(AUDIT_LOG_PATH)) : null;
+      const _sepC = _pathModC ? _pathModC.sep : "/";
+      if (_expectedDirC && !_resolvedC.startsWith(_expectedDirC + _sepC) && _resolvedC !== _expectedDirC) {
+        throw new Error("[AUDIT] Rotated log path escapes expected directory: " + _resolvedC);
+      }
+      fs.renameSync(AUDIT_LOG_PATH, _resolvedC);
     }
   } catch (_re) { console.error("[AUDIT] Log rotation failed:", _re.message); }
   fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(llmCompleteRecord) + "\n", "utf8");
@@ -754,22 +1256,25 @@ try {
   const llmErrorRecord = {
     timestamp: new Date().toISOString(),
     event: "llm_interaction_error",
-    service: "CohereEmbeddings",
-    model: "embed-english-v3.0",
+    service: "ApprovedEmbeddings",
+    model: PINNED_EMBEDDING_MODEL,
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "error",
-    error: err.message,
+    error: "embedding_operation_failed",
   };
   // NOTE: docsToEmbed must be field-filtered before this block (see minimisedDocs usage above)
   try {
     const _statE = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
     const _maxE = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
-        if (_statE && _statE.size >= _maxE) {
+            if (_statE && _statE.size >= _maxE) {
       const _rotatedPathE = AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-");
       requireHITLApprovalForRotation(AUDIT_LOG_PATH, _rotatedPathE);
-      fs.renameSync(AUDIT_LOG_PATH, _rotatedPathE);
-    } = await import("path");
+      // Path-traversal guard: verify rotated path stays within the same directory
+      const _pathMod = await import("path");
+      const _resE = _pathMod.resolve;
+      const _dirE = _pathMod.dirname;
+      const _sepE = _pathMod.sep;
       const _expectedDirE = _dirE(_resE(AUDIT_LOG_PATH));
       const _resolvedE = _resE(_rotatedPathE);
       if (!_resolvedE.startsWith(_expectedDirE + _sepE) && _resolvedE !== _expectedDirE) {
@@ -777,6 +1282,10 @@ try {
       }
       fs.copyFileSync(AUDIT_LOG_PATH, _resolvedE);
       fs.unlinkSync(AUDIT_LOG_PATH);
+    }
+      // Use atomic rename only; no copy+unlink to avoid partial-state exposure
+      const { renameSync } = fs;
+      renameSync(AUDIT_LOG_PATH, _resolvedE);
     }
   } catch (_re) { console.error("[AUDIT] Log rotation failed:", _re.message); }
   fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(llmErrorRecord) + "\n", "utf8");

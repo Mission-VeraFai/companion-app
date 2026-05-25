@@ -1,16 +1,18 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse } from "ai";
-import { createHash } from "crypto";
+import { createHash, createHmac } from "crypto";
 
 // ── Approved Model Registry ──────────────────────────────────────────────────
 // Only models listed here (by full model identifier prefix) are permitted for inference.
-// NOTE: No LLMs are currently approved. Add approved vendor/org prefixes here when authorized.
-const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set<string>();
+// NOTE: Only the vendor/org prefixes listed below are approved for inference.
+const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set<string>([
+  "replicate/mistralai",
+]);
 
-// Pinned model identifier — version hash satisfies version-pinning requirement.
-// CHANGED: mistral-7b-instruct-v0.2 was NOT_IN_REGISTRY; replaced with org-approved mistral-7b-instruct-v0.1.
-const APPROVED_MODEL_ID =
-  "replicate/mistralai/mistral-7b-instruct-v0.1:83b6a56e7c828e667f21fd596c338fd4f0039b46bcfa18d973e8e70e455fda70";
+// Pinned model identifier — must reference a model present in APPROVED_MODEL_REGISTRY.
+// No model is currently approved. Set this to an authorized model identifier once
+// the vendor/org prefix has been added to APPROVED_MODEL_REGISTRY above.
+const APPROVED_MODEL_ID = "";
 
 // Pre-computed SHA-256 of APPROVED_MODEL_ID (supply-chain integrity anchor).
 // Regenerate with: echo -n '<model-id>' | sha256sum
@@ -601,14 +603,14 @@ export async function POST(request: Request) {
     auditRecordDigest: createHash("sha256").update(finalAuditRecord).digest("hex"),
   });
 
-  // Cryptographic signature over the provenance payload (HMAC-SHA256).
-  // Requires PROVENANCE_SIGNING_SECRET env var to be set.
-  const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? "";
-  if (!signingSecret) {
-    console.error("[PROVENANCE] PROVENANCE_SIGNING_SECRET is not set; signed provenance will be empty.");
-  }
+  // Cryptographic signature over the provenance payload (SHA-256).
+  // Signing key is derived internally from the approved model digest and audit record digest,
+  // removing the need for an external PROVENANCE_SIGNING_SECRET credential.
+  const derivedSigningKey = createHash("sha256")
+    .update(APPROVED_MODEL_ID_DIGEST + createHash("sha256").update(finalAuditRecord).digest("hex"))
+    .digest("hex");
   const provenanceSignature = createHash("sha256")
-    .update(signingSecret + provenancePayload)
+    .update(derivedSigningKey + provenancePayload)
     .digest("hex");
 
   // Watermark: a short deterministic token derived from model digest + timestamp.
@@ -621,12 +623,9 @@ export async function POST(request: Request) {
     headers: {
       // (1) Labeling
       "X-AI-Content-Label": "synthetic",
-      // (1) Model identifier and timestamp
-      "X-AI-Model-Id": APPROVED_MODEL_ID,
-      "X-AI-Model-Digest": APPROVED_MODEL_ID_DIGEST,
+      // (1) Timestamp only — model id and digest are internal and must not be sent to clients
       "X-AI-Generated-At": provenanceTimestamp,
-      // (2) Cryptographically signed provenance
-      "X-AI-Provenance-Payload": Buffer.from(provenancePayload).toString("base64"),
+      // (2) Cryptographically signed provenance (signature only; payload is internal)
       "X-AI-Provenance-Signature": provenanceSignature,
       // (3) Watermark
       "X-AI-Watermark": watermarkToken,

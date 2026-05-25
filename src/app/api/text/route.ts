@@ -4,30 +4,88 @@ import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
 
-// Approved model registry: loaded exclusively from the organization's centrally-maintained
-// approved LLM list, supplied via the APPROVED_LLM_MODELS environment variable.
-// Format: a comma-separated list of approved model identifiers, e.g.:
-//   APPROVED_LLM_MODELS="org-model-a-v1,org-model-b-v2"
-// No models are approved by default — if the variable is absent or empty, all model
-// requests will be rejected, preventing accidental use of unapproved LLMs.
-function loadApprovedModelRegistry(): ReadonlySet<string> {
-  const raw = process.env.APPROVED_LLM_MODELS ?? "";
-  const models = raw
-    .split(",")
-    .map((m) => m.trim())
-    .filter((m) => m.length > 0);
-  if (models.length === 0) {
-    console.warn(
-      "[SECURITY] APPROVED_LLM_MODELS env var is not set or empty. " +
-      "No LLM models are approved. All model requests will be denied."
-    );
-  }
-  return new Set(models);
+// ---------------------------------------------------------------------------
+// Static Approved Model Registry — version-pinned with SHA-256 digest
+// ---------------------------------------------------------------------------
+// Each entry binds a model identifier to an immutable SHA-256 digest of its
+// canonical weight/config artifact.  Both the name AND the digest must match
+// for a model to be considered approved.  To add or update a model, a human
+// reviewer must update this table in source control and supply the correct
+// digest obtained from the organisation's model-artifact store.
+//
+// DO NOT load approved models from environment variables or any other
+// runtime-mutable source — doing so bypasses version pinning and integrity
+// verification.
+// ---------------------------------------------------------------------------
+interface ApprovedModelEntry {
+  /** Canonical model identifier (name + version). */
+  readonly id: string;
+  /**
+   * SHA-256 hex digest of the model's canonical weight/config artifact as
+   * published in the organisation's approved-model artifact store.
+   * Obtain with: sha256sum <artifact-file> | awk '{print $1}'
+   */
+  readonly sha256: string;
 }
-const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = loadApprovedModelRegistry();
 
-function isApprovedModel(model: string): boolean {
-  return APPROVED_MODEL_REGISTRY.has(model);
+/**
+ * Immutable, source-controlled list of approved foundation models.
+ * Only models present here — with a matching digest — may be used.
+ */
+const APPROVED_MODEL_ENTRIES: readonly ApprovedModelEntry[] = Object.freeze([
+  // -----------------------------------------------------------------------
+  // Add approved models here following security review.
+  // Example (replace with real digests from your artifact store):
+  //
+  // {
+  //   id: "org-approved-model-v1.2.0",
+  //   sha256: "<64-char-hex-sha256-of-model-artifact>",
+  // },
+  // -----------------------------------------------------------------------
+] as const);
+
+/** Fast lookup: model-id → expected SHA-256 digest. */
+const APPROVED_MODEL_REGISTRY: ReadonlyMap<string, string> = new Map(
+  APPROVED_MODEL_ENTRIES.map((e) => [e.id, e.sha256])
+);
+
+if (APPROVED_MODEL_REGISTRY.size === 0) {
+  console.warn(
+    "[SECURITY] APPROVED_MODEL_ENTRIES is empty. " +
+    "No LLM models are approved. All model requests will be denied."
+  );
+}
+
+/**
+ * Verifies that `model` is in the static approved registry AND that the
+ * supplied `artifactDigest` matches the pinned SHA-256 for that model.
+ *
+ * Both checks must pass; failing either rejects the model.
+ *
+ * @param model          - The model identifier string supplied by the caller.
+ * @param artifactDigest - Hex-encoded SHA-256 digest of the model artifact
+ *                         being loaded, computed at load time by the caller.
+ */
+function isApprovedModel(model: string, artifactDigest: string): boolean {
+  const expectedDigest = APPROVED_MODEL_REGISTRY.get(model);
+  if (expectedDigest === undefined) {
+    console.error(
+      `[SECURITY] Model "${model}" is NOT in the approved model registry. ` +
+      "Request denied."
+    );
+    return false;
+  }
+  // Constant-time comparison to prevent timing-based oracle attacks.
+  const expected = Buffer.from(expectedDigest.toLowerCase(), "hex");
+  const actual   = Buffer.from(artifactDigest.toLowerCase(), "hex");
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+    console.error(
+      `[SECURITY] Model "${model}" digest mismatch. ` +
+      `Expected ${expectedDigest}, got ${artifactDigest}. Request denied.`
+    );
+    return false;
+  }
+  return true;
 }
 import * as fs from "fs";
 import * as path from "path";
@@ -419,15 +477,23 @@ export async function POST(request: Request) {
   const provenanceModelId = companionModel; // model/companion identifier — validated against approved registry above
   const provenanceLabel = "[AI-GENERATED CONTENT]";
 
-  // Cryptographic HMAC signature over (modelId + timestamp + responseText)
-  const crypto = await import("crypto");
-  // Provenance HMAC signing moved to a dedicated signing service; secret not held here.
-  if (!provenanceSecret) throw new Error('PROVENANCE_HMAC_SECRET is not configured');
+  // Cryptographic HMAC signature delegated to the dedicated signing service.
+  // PROVENANCE_HMAC_SECRET is NOT held here; signing is performed remotely.
   const provenancePayload = `${provenanceModelId}|${provenanceTimestamp}|${responseText}`;
-  const provenanceSignature = crypto
-    .createHmac("sha256", provenanceSecret)
-    .update(provenancePayload)
-    .digest("hex");
+  const signingServiceUrl = configManager.get('SIGNING_SERVICE_URL');
+  const internalApiSecret = configManager.get('INTERNAL_API_SECRET');
+  const signingResponse = await fetch(`${signingServiceUrl}/sign`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${internalApiSecret}`,
+    },
+    body: JSON.stringify({ payload: provenancePayload }),
+  });
+  if (!signingResponse.ok) {
+    throw new Error(`Signing service error: ${signingResponse.status}`);
+  }
+  const { signature: provenanceSignature } = await signingResponse.json();
 
   const provenanceMeta = {
     syntheticContent: true,

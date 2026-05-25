@@ -15,6 +15,55 @@ const _inMemoryCache = new Map<string, string>();
  * @param operation  Short label for the operation (e.g. "cache.del").
  * @param target     The resource being deleted (e.g. the cache key).
  */
+/**
+ * Returns the set of allowed hostnames for the HITL approval endpoint.
+ * Reads from HITL_APPROVAL_ALLOWED_HOSTS (comma-separated list).
+ * Throws if the env var is not set or empty, to prevent open-redirect by default.
+ */
+function getHITLAllowedHosts(): Set<string> {
+  const raw = process.env.HITL_APPROVAL_ALLOWED_HOSTS ?? "";
+  const hosts = raw
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter((h) => h.length > 0);
+  if (hosts.length === 0) {
+    throw new Error(
+      "[HITL] HITL_APPROVAL_ALLOWED_HOSTS is not configured. " +
+      "Set it to a comma-separated list of permitted hostnames for the approval endpoint."
+    );
+  }
+  return new Set(hosts);
+}
+
+/**
+ * Validates that the given URL's hostname is in the HITL approval allowlist.
+ * Throws if the URL is invalid or the hostname is not permitted.
+ */
+function validateHITLEndpointURL(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(
+      `[HITL] HITL_APPROVAL_ENDPOINT "${rawUrl}" is not a valid URL. Operation blocked.`
+    );
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      `[HITL] HITL_APPROVAL_ENDPOINT must use HTTPS. Got "${parsed.protocol}". Operation blocked.`
+    );
+  }
+  const allowedHosts = getHITLAllowedHosts();
+  const hostname = parsed.hostname.toLowerCase();
+  if (!allowedHosts.has(hostname)) {
+    throw new Error(
+      `[HITL] HITL_APPROVAL_ENDPOINT hostname "${hostname}" is not in the allowlist ` +
+      `(HITL_APPROVAL_ALLOWED_HOSTS). Operation blocked.`
+    );
+  }
+  return parsed;
+}
+
 async function requireHITLApproval(operation: string, target: string): Promise<void> {
   const approvalEndpoint = process.env.HITL_APPROVAL_ENDPOINT;
   if (!approvalEndpoint || approvalEndpoint.trim() === "") {
@@ -24,9 +73,12 @@ async function requireHITLApproval(operation: string, target: string): Promise<v
     );
   }
 
+  // Validate the endpoint URL against the hostname allowlist before fetching.
+  const validatedURL = validateHITLEndpointURL(approvalEndpoint.trim());
+
   let response: Response;
   try {
-    response = await fetch(approvalEndpoint.trim(), {
+    response = await fetch(validatedURL.toString(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -73,18 +125,54 @@ const redis = {
   get: async (key: string) => _inMemoryCache.get(key) ?? null,
   set: async (key: string, value: string) => { _inMemoryCache.set(key, value); return "OK"; },
   del: async (key: string) => {
-    await requireHITLApproval("cache.del", key);
-    _inMemoryCache.delete(key);
-    return 1;
+    console.info(`[MCP] Interaction start: operation="cache.del" target="${key}" requestedAt="${new Date().toISOString()}"`);
+    try {
+      await requireHITLApproval("cache.del", key);
+      _inMemoryCache.delete(key);
+      console.info(`[MCP] Interaction success: operation="cache.del" target="${key}" completedAt="${new Date().toISOString()}"`);
+      return 1;
+    } catch (err) {
+      console.error(`[MCP] Interaction failed: operation="cache.del" target="${key}" failedAt="${new Date().toISOString()}" error="${err}"`);
+      throw err;
+    }
   },
 };
 // CohereEmbeddings removed: not in approved model registry and lacks version pinning.
 import { PineconeClient } from "@pinecone-database/pinecone";
-import { PineconeStore } from "langchain/vectorstores/pinecone";
+import { PineconeStore as _PineconeStoreBase } from "langchain/vectorstores/pinecone";
+
+// MCP interaction logging wrapper for PineconeStore
+const _mcpLoggedPineconeStore = new Proxy(_PineconeStoreBase, {
+  construct(target, args) {
+    console.info(`[MCP] Interaction start: operation="PineconeStore.construct" requestedAt="${new Date().toISOString()}"`);
+    const instance = new target(...args);
+    console.info(`[MCP] Interaction success: operation="PineconeStore.construct" completedAt="${new Date().toISOString()}"`);
+    return new Proxy(instance, {
+      get(obj, prop) {
+        const val = (obj as Record<string | symbol, unknown>)[prop as string | symbol];
+        if (typeof val === "function") {
+          return async (...fnArgs: unknown[]) => {
+            console.info(`[MCP] Interaction start: operation="PineconeStore.${String(prop)}" args=${JSON.stringify(fnArgs).slice(0, 200)} requestedAt="${new Date().toISOString()}"`);
+            try {
+              const result = await (val as (...a: unknown[]) => unknown).apply(obj, fnArgs);
+              console.info(`[MCP] Interaction success: operation="PineconeStore.${String(prop)}" completedAt="${new Date().toISOString()}"`);
+              return result;
+            } catch (err) {
+              console.error(`[MCP] Interaction failed: operation="PineconeStore.${String(prop)}" failedAt="${new Date().toISOString()}" error="${err}"`);
+              throw err;
+            }
+          };
+        }
+        return val;
+      },
+    });
+  },
+});
+const PineconeStore = _mcpLoggedPineconeStore;
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
 
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+// OpenAIEmbeddings removed: not in approved model registry. Use only registry-approved embedding models.
 import * as crypto from "crypto";
 
 // ── Model registry ────────────────────────────────────────────────────────────
@@ -532,7 +620,45 @@ class MemoryManager {
     return result;
   }
 
-    private sanitizeHistoryEntry(entry: string): string {
+    private static readonly MAX_HISTORY_ENTRY_CHARS = 500;
+  private static readonly MAX_VECTOR_DOC_CHARS = 800;
+  private static readonly ALLOWED_VECTOR_METADATA_FIELDS = new Set(["source", "companionName", "userId"]);
+
+  /**
+   * Minimise a raw history member string: parse the envelope, extract only
+   * the 'text' field, and truncate to MAX_HISTORY_ENTRY_CHARS.
+   */
+  private minimiseHistoryEntry(raw: string): string {
+    try {
+      const parsed = JSON.parse(raw);
+      // Extract only the text field — discard traceId, ts, and any other fields
+      const text: string = typeof parsed.text === "string" ? parsed.text : String(parsed);
+      return text.slice(0, MemoryManager.MAX_HISTORY_ENTRY_CHARS);
+    } catch {
+      // If not JSON, treat the whole string as text and truncate
+      return String(raw).slice(0, MemoryManager.MAX_HISTORY_ENTRY_CHARS);
+    }
+  }
+
+  /**
+   * Minimise a vector store document before injecting it into model context:
+   * - Allow only a defined metadata field allowlist
+   * - Truncate pageContent to MAX_VECTOR_DOC_CHARS
+   */
+  private minimiseVectorDocument(doc: { pageContent: string; metadata?: Record<string, unknown> }): { pageContent: string; metadata: Record<string, unknown> } {
+    const truncatedContent = (doc.pageContent ?? "").slice(0, MemoryManager.MAX_VECTOR_DOC_CHARS);
+    const filteredMetadata: Record<string, unknown> = {};
+    if (doc.metadata) {
+      for (const field of MemoryManager.ALLOWED_VECTOR_METADATA_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(doc.metadata, field)) {
+          filteredMetadata[field] = doc.metadata[field];
+        }
+      }
+    }
+    return { pageContent: truncatedContent, metadata: filteredMetadata };
+  }
+
+  private sanitizeHistoryEntry(entry: string): string {
     // Remove base64-encoded content (sequences of 20+ base64 chars)
     entry = entry.replace(/[A-Za-z0-9+/]{20,}={0,2}/g, "[REDACTED_BASE64]");
 
@@ -718,5 +844,85 @@ async function appendAuditRecord(
 
 // Hoisted crypto import — must never be required dynamically inside loops or callbacks
 const cryptoModule = require("crypto") as typeof import("crypto");
+
+/**
+ * sanitizeQuery — validates a query string before it enters the retrieval or LLM pipeline.
+ *
+ * Blocks:
+ *  - Shell/system commands (e.g. rm, curl, wget, bash, eval, exec, sudo, chmod, etc.)
+ *  - Base64-encoded payloads (long base64 blobs that may hide instructions)
+ *  - Binary / non-printable content
+ *  - Leetspeak obfuscation patterns commonly used to bypass filters
+ *  - Hidden prompt-injection markers (e.g. "ignore previous instructions", "system:", "<|im_start|>")
+ *
+ * @param query - raw user-supplied query string
+ * @returns the original query if it passes all checks
+ * @throws Error if any suspicious pattern is detected
+ */
+function sanitizeQuery(query: string): string {
+  if (typeof query !== "string") {
+    throw new Error("[sanitizeQuery] Query must be a string.");
+  }
+
+  // 1. Reject binary / non-printable characters (allow common whitespace)
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(query)) {
+    throw new Error("[sanitizeQuery] Query contains binary or non-printable characters.");
+  }
+
+  // 2. Reject base64-encoded blobs (20+ consecutive base64 chars with optional padding)
+  //    Legitimate natural-language queries rarely contain such sequences.
+  if (/(?:[A-Za-z0-9+/]{20,}={0,2})/.test(query)) {
+    // Secondary check: attempt decode and see if it contains shell commands
+    const b64Matches = query.match(/[A-Za-z0-9+/]{20,}={0,2}/g) ?? [];
+    for (const match of b64Matches) {
+      try {
+        const decoded = Buffer.from(match, "base64").toString("utf8");
+        if (/\b(bash|sh|cmd|powershell|eval|exec|system|curl|wget|nc|ncat|python|perl|ruby|php)\b/i.test(decoded)) {
+          throw new Error("[sanitizeQuery] Query contains a base64-encoded shell command payload.");
+        }
+      } catch (e) {
+        if ((e as Error).message.startsWith("[sanitizeQuery]")) throw e;
+        // Decode failed — not valid base64, safe to continue
+      }
+    }
+  }
+
+  // 3. Reject shell command patterns
+  const shellCommandPattern =
+    /\b(rm\s+-rf|sudo|chmod|chown|curl|wget|bash|sh\s+-c|eval|exec|system|popen|subprocess|os\.system|__import__|import\s+os|import\s+subprocess|nc\s+-|ncat\s+|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)\b/i;
+  if (shellCommandPattern.test(query)) {
+    throw new Error("[sanitizeQuery] Query contains a shell command or code execution pattern.");
+  }
+
+  // 4. Reject prompt-injection markers
+  const promptInjectionPattern =
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?|system\s*:|<\|im_start\||<\|im_end\||\[INST\]|\[\/?SYS\]|###\s*instruction|you\s+are\s+now\s+(a\s+)?|disregard\s+(all\s+)?previous|forget\s+(all\s+)?previous|new\s+persona|act\s+as\s+(if\s+you\s+are|a\s+)/i;
+  if (promptInjectionPattern.test(query)) {
+    throw new Error("[sanitizeQuery] Query contains a prompt-injection pattern.");
+  }
+
+  // 5. Reject leetspeak obfuscation (e.g. 3x3c, 1gnor3, 3v4l)
+  //    Heuristic: high ratio of digit-substituted alpha characters
+  const leetspeakPattern = /(?:[a-z]*[013456789][a-z0-9]*){4,}/i;
+  if (leetspeakPattern.test(query.replace(/\s+/g, ""))) {
+    // Only flag if the leet sequence also resembles a blocked keyword when decoded
+    const normalized = query
+      .replace(/0/g, "o")
+      .replace(/1/g, "i")
+      .replace(/3/g, "e")
+      .replace(/4/g, "a")
+      .replace(/5/g, "s")
+      .replace(/6/g, "g")
+      .replace(/7/g, "t")
+      .replace(/8/g, "b")
+      .replace(/9/g, "g");
+    if (shellCommandPattern.test(normalized) || promptInjectionPattern.test(normalized)) {
+      throw new Error("[sanitizeQuery] Query contains leetspeak-obfuscated malicious content.");
+    }
+  }
+
+  return query;
+}
 
 export default MemoryManager;

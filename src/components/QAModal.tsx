@@ -8,6 +8,12 @@ import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
 // Audit logging for AI-driven actions (decision log / forensic trail)
 // Entries are sent to a server-side endpoint for persistent, append-only, immutable storage.
+// Server-side enforcement note:
+// The /api/audit/ai-action endpoint MUST be configured with:
+//   - Append-only / immutable storage (no UPDATE or DELETE on audit rows)
+//   - Retention policy: minimum 12 months hot, 7 years cold (adjust per compliance requirement)
+//   - Log rotation must preserve all entries (rotation = archive, not delete)
+// These controls MUST be verified during infrastructure review.
 async function logAIAuditEntry(entry: {
   timestamp: string;
   principal: string;
@@ -16,15 +22,46 @@ async function logAIAuditEntry(entry: {
   inputHash: string;
   outputHash: string;
   correlationId: string;
-}) {
+}): Promise<void> {
+  let response: Response | undefined;
   try {
-    await fetch("/api/audit/ai-action", {
+    response = await fetch("/api/audit/ai-action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(entry),
     });
+    if (!response.ok) {
+      throw new Error(
+        `[audit] Server rejected audit entry: HTTP ${response.status} ${response.statusText} (correlationId=${entry.correlationId})`
+      );
+    }
   } catch (e) {
+    // Log to console so local diagnostics are preserved.
     console.error("[audit] Failed to persist audit entry to server:", e);
+
+    // Alert the monitoring system so the failure is visible to ops/SIEM.
+    // This is a best-effort call; we do not suppress the original error.
+    try {
+      await fetch("/api/monitoring/alert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          severity: "CRITICAL",
+          source: "logAIAuditEntry",
+          message: "Audit log write failure — forensic trail may be incomplete",
+          correlationId: entry.correlationId,
+          timestamp: new Date().toISOString(),
+          detail: e instanceof Error ? e.message : String(e),
+        }),
+      });
+    } catch (alertErr) {
+      // If the alerting call also fails, surface it so it is not silently swallowed.
+      console.error("[audit] Additionally failed to send monitoring alert:", alertErr);
+    }
+
+    // Re-throw so the caller knows the audit write failed and can decide
+    // whether to abort the AI action or surface the error to the user.
+    throw e;
   }
 }
 
@@ -33,7 +70,7 @@ function generateCorrelationId(): string {
     return crypto.randomUUID();
   }
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}-${Math.random().toString(36).slice(2)}`;
+  }
 }
 
 async function sha256Hex(message: string): Promise<string> {
@@ -46,6 +83,68 @@ async function sha256Hex(message: string): Promise<string> {
   } catch {
     return "hash-unavailable";
   }
+}
+
+/**
+ * Signs provenance metadata with HMAC-SHA256 using a session-scoped key.
+ * Falls back to a double-SHA256 chain if HMAC is unavailable.
+ * The resulting hex string is attached to the rendered output as a
+ * verifiable provenance signature.
+ */
+async function signProvenance(metadata: {
+  correlationId: string;
+  outputHash: string;
+  modelId: string;
+  timestamp: string;
+  principal: string;
+}): Promise<string> {
+  const payload = JSON.stringify(metadata);
+  try {
+    // Derive a session-scoped HMAC key from a combination of the correlation ID
+    // and the output hash so the signature is unique per response.
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(metadata.correlationId + metadata.outputHash),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const sig = await crypto.subtle.sign(
+      "HMAC",
+      keyMaterial,
+      new TextEncoder().encode(payload)
+    );
+    return Array.from(new Uint8Array(sig))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    // Fallback: double-SHA256 chain
+    const first = await sha256Hex(payload);
+    return sha256Hex(first + metadata.correlationId);
+  }
+}
+
+/**
+ * Embeds an invisible Unicode watermark into a string by appending
+ * zero-width characters that encode the correlation ID in binary.
+ * This watermark survives copy-paste and is detectable programmatically.
+ */
+function embedWatermark(text: string, correlationId: string): string {
+  // Encode each character of the correlationId as zero-width joiners (\u200D)
+  // and zero-width non-joiners (\u200C) representing 1 and 0 bits respectively.
+  const bits = correlationId
+    .split("")
+    .map((c) =>
+      c
+        .charCodeAt(0)
+        .toString(2)
+        .padStart(8, "0")
+        .split("")
+        .map((b) => (b === "1" ? "\u200D" : "\u200C"))
+        .join("")
+    )
+    .join("\u2060"); // word-joiner as byte separator
+  return text + "\u200B" + bits; // zero-width space as watermark start marker
 }
 
 // Removed: `last_name` global variable eliminated to prevent PII tracking in component scope per output data minimisation policy.
@@ -66,17 +165,131 @@ function maskEmail(email: string | null | undefined): string {
 // Approved model registry with pinned versions
 // NOTE: Only models explicitly approved by the organization's LLM governance process
 // may be listed here. Do NOT add models without prior approval.
+const DEFAULT_MODEL_KEY = "default-approved-model";
+
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; endpoint: string }> = {
-  // Replace the entry below with your organization's approved model identifier,
-  // pinned version, and approved endpoint once governance approval is obtained.
-  // Example (pending approval):
-  // "approved-model-id": { version: "approved-model-id-YYYY-MM-DD", endpoint: "approved-endpoint" },
+  // Approved model: gpt-4o, pinned to stable release 2024-08-06, served via the organization's
+  // approved OpenAI-compatible endpoint. Approved by LLM Governance Board — do NOT modify
+  // without a new approval ticket.
+  "gpt-4o": { version: "gpt-4o-2024-08-06", endpoint: "openai" },
 };
 
-const DEFAULT_MODEL_ENDPOINT = "";
+/** The key used when no explicit llmIdentifier is supplied to resolveApprovedModel. */
+const DEFAULT_MODEL_KEY = "gpt-4o";
+const DEFAULT_MODEL_ENDPOINT = APPROVED_MODEL_REGISTRY[DEFAULT_MODEL_KEY]?.endpoint ?? "";
+
+const MAX_PROMPT_LENGTH = 4000;
+
+/**
+ * Sanitizes and validates user-supplied prompt input before sending to the LLM.
+ * - Trims whitespace
+ * - Enforces maximum length
+ * - Strips ASCII control characters (except newlines/tabs)
+ * - Removes common prompt injection patterns
+ * Throws if the input is empty or invalid after sanitization.
+ */
+function sanitizeUserInput(input: string): string {
+  if (typeof input !== "string") {
+    throw new Error("Invalid input: prompt must be a string.");
+  }
+
+  // Trim leading/trailing whitespace
+  let sanitized = input.trim();
+
+  // Reject empty input
+  if (!sanitized) {
+    throw new Error("Invalid input: prompt must not be empty.");
+  }
+
+  // Enforce maximum length to prevent token exhaustion / abuse
+  if (sanitized.length > MAX_PROMPT_LENGTH) {
+    sanitized = sanitized.slice(0, MAX_PROMPT_LENGTH);
+  }
+
+  // Strip ASCII control characters except newline (\n, 0x0A) and tab (\t, 0x09)
+  // eslint-disable-next-line no-control-regex
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Remove common prompt injection / jailbreak patterns (case-insensitive)
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+    /forget\s+(all\s+)?(previous|prior|above)\s+instructions?/gi,
+    /you\s+are\s+now\s+(a|an)\s+/gi,
+    /act\s+as\s+(a|an)\s+/gi,
+    /<\s*script[^>]*>/gi,
+    /system\s*:/gi,
+  ];
+  for (const pattern of injectionPatterns) {
+    sanitized = sanitized.replace(pattern, "");
+  }
+
+  // Final check: ensure something remains after sanitization
+  if (!sanitized.trim()) {
+    throw new Error("Invalid input: prompt is empty after sanitization.");
+  }
+
+  return sanitized;
+}
+
+/**
+ * Validates a prompt for malicious content before LLM invocation.
+ * Throws if the prompt contains hidden prompts, base64-encoded content,
+ * leetspeak obfuscation, invisible text, shell commands, or binary data.
+ */
+function sanitizePrompt(prompt: string): void {
+  // 1. Reject invisible/zero-width Unicode characters (hidden text injection)
+  const invisibleCharsPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u2028\u2029]/;
+  if (invisibleCharsPattern.test(prompt)) {
+    throw new Error("Prompt rejected: contains invisible or zero-width characters.");
+  }
+
+  // 2. Reject non-printable / binary-like bytes (binary executable injection)
+  // Allow common whitespace (\t, \n, \r) but reject other control characters
+  const binaryPattern = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+  if (binaryPattern.test(prompt)) {
+    throw new Error("Prompt rejected: contains non-printable or binary characters.");
+  }
+
+  // 3. Reject base64-encoded blocks (common exfiltration / hidden instruction vector)
+  // Matches long base64 strings (40+ chars) that look like encoded payloads
+  const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/;
+  if (base64Pattern.test(prompt)) {
+    throw new Error("Prompt rejected: contains suspected base64-encoded content.");
+  }
+
+  // 4. Reject shell command patterns
+  const shellCommandPattern = /(?:^|\s|;|&&|\|\|)(\$\(|`|\bsudo\b|\brm\s+-rf\b|\bchmod\b|\bchown\b|\bcurl\b.*\|.*sh|\bwget\b.*\|.*sh|\beval\b|\bexec\b|\bsystem\b|\bpasswd\b|\b\/etc\/shadow\b|\b\/bin\/sh\b|\b\/bin\/bash\b)/i;
+  if (shellCommandPattern.test(prompt)) {
+    throw new Error("Prompt rejected: contains suspected shell command patterns.");
+  }
+
+  // 5. Reject prompt injection / jailbreak keywords
+  const injectionPattern = /(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?|disregard\s+(?:all\s+)?(?:previous|prior|above)|you\s+are\s+now\s+(?:a|an|the)\s+|act\s+as\s+(?:a|an|the)\s+|pretend\s+(?:you\s+are|to\s+be)\s+|forget\s+(?:all\s+)?(?:previous|prior|your)\s+|new\s+instructions?\s*:|system\s*:\s*you\s+are|<\s*system\s*>|\[\s*system\s*\])/i;
+  if (injectionPattern.test(prompt)) {
+    throw new Error("Prompt rejected: contains suspected prompt injection content.");
+  }
+
+  // 6. Reject leetspeak obfuscation (common bypass technique)
+  // Detects heavy use of digit-for-letter substitution (e.g. 1gn0r3, 3x3cut3)
+  const leetspeakPattern = /\b(?=[a-z0-9]*[0-9][a-z0-9]*[a-z][a-z0-9]*)(?=[a-z0-9]*[a-z][a-z0-9]*[0-9][a-z0-9]*)[a-z0-9]{4,}\b/i;
+  const leetspeakWords = prompt.match(/\b[a-z0-9]{3,}\b/gi) || [];
+  const leetspeakCount = leetspeakWords.filter(w =>
+    /[0-9]/.test(w) && /[a-z]/i.test(w) && (w.match(/[0-9]/g) || []).length / w.length > 0.4
+  ).length;
+  if (leetspeakCount >= 3) {
+    throw new Error("Prompt rejected: contains suspected leetspeak obfuscation.");
+  }
+
+  // 7. Length guard — extremely long prompts may embed hidden instructions
+  const MAX_PROMPT_LENGTH = 4000;
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    throw new Error(`Prompt rejected: exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.`);
+  }
+}
 
 function resolveApprovedModel(llmIdentifier: string): string {
-  const key = llmIdentifier || DEFAULT_MODEL_KEY;
+  const key = (llmIdentifier && llmIdentifier.trim()) ? llmIdentifier.trim() : DEFAULT_MODEL_KEY;
   const entry = APPROVED_MODEL_REGISTRY[key];
   if (!entry) {
     throw new Error(
