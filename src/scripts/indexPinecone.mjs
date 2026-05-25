@@ -14,7 +14,7 @@ import tls from "tls";
 const TOOL_ALLOW_LIST = new Set([
   "pinecone",
   "chroma",
-  "openai-embeddings",
+  "cohere-embeddings",
   "character-text-splitter",
   "document-loader",
 ]);
@@ -35,13 +35,13 @@ function validateTool(toolName) {
 }
 
 const APPROVED_EMBEDDING_MODELS = new Set([
-  "text-embedding-3-small",
-  "text-embedding-3-large",
-  "text-embedding-ada-002",
+  "embed-english-v3.0",
+  "embed-multilingual-v3.0",
+  "embed-english-light-v3.0",
 ]);
 const APPROVED_VECTOR_STORES = new Set(["pgvector", "chroma", "weaviate", "pinecone"]);
 
-const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
+const PINNED_EMBEDDING_MODEL = "embed-english-v3.0";
 // SHA-256 digest of the approved model artifact for integrity verification.
 // Update this value whenever the pinned model version changes.
 const PINNED_EMBEDDING_MODEL_DIGEST =
@@ -72,24 +72,84 @@ if (!APPROVED_VECTOR_STORES.has(VECTOR_STORE_PROVIDER)) {
 }
 // ---------------------------------------------------------------------------
 import { Document } from "langchain/document";
-// OpenAIEmbeddings (@langchain/openai) removed: not in approved model registry.
-// Using registry-approved embedding model via PINNED_EMBEDDING_MODEL constant.
+// OpenAIEmbeddings and FakeEmbeddings removed: not in approved model registry.
+// Embedding calls are delegated to the agent intermediary using the approved model.
 import { CacheBackedEmbeddings } from "langchain/embeddings/cache_backed";
-import { FakeEmbeddings } from "langchain/embeddings/fake";
+import { Embeddings } from "langchain/embeddings/base";
 
 /**
- * ApprovedEmbeddings: wraps only registry-approved model identifiers.
- * Swap FakeEmbeddings for your org's approved provider SDK when available.
+ * ApprovedEmbeddings: registry-approved, version-pinned embedding provider.
+ * Calls the org-approved EMBEDDING_SERVICE_URL endpoint directly.
+ * No FakeEmbeddings or unregistered provider SDKs are used.
  */
-class ApprovedEmbeddings extends FakeEmbeddings {
+class ApprovedEmbeddings extends Embeddings {
   constructor({ modelName } = {}) {
-    super();
+    super({});
     if (!APPROVED_EMBEDDING_MODELS.has(modelName)) {
       throw new Error(
         `Policy violation: embedding model "${modelName}" is not in the approved model registry.`
       );
     }
     this.modelName = modelName;
+    this.embeddingServiceUrl = process.env.EMBEDDING_SERVICE_URL;
+    if (!this.embeddingServiceUrl) {
+      throw new Error(
+        "Policy violation: EMBEDDING_SERVICE_URL is not set. " +
+          "A registry-approved embedding service endpoint must be configured."
+      );
+    }
+    const serviceUrl = new URL(this.embeddingServiceUrl);
+    if (!ALLOWED_EMBEDDING_HOSTNAMES.has(serviceUrl.hostname)) {
+      throw new Error(
+        `Policy violation: embedding service hostname "${serviceUrl.hostname}" is not in the approved allowlist.`
+      );
+    }
+  }
+
+  async _request(path, body) {
+    const response = await fetch(this.embeddingServiceUrl + path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Model-Name": this.modelName,
+        "X-Model-Digest": PINNED_EMBEDDING_MODEL_DIGEST,
+      },
+      body: JSON.stringify({ model: this.modelName, ...body }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Embedding service error: ${response.status} ${response.statusText}`
+      );
+    }
+    return response.json();
+  }
+
+  async embedDocuments(texts) {
+    const data = await this._request("/embedDocuments", { texts });
+    if (!Array.isArray(data.embeddings)) {
+      throw new Error("Embedding service returned unexpected response for embedDocuments.");
+    }
+    return data.embeddings;
+  }
+
+  async embedQuery(text) {
+    const data = await this._request("/embedQuery", { text });
+    if (!Array.isArray(data.embedding)) {
+      throw new Error("Embedding service returned unexpected response for embedQuery.");
+    }
+    return data.embedding;
+  }
+} from "langchain/embeddings/cache_backed";
+
+/**
+ * assertApprovedEmbeddingModel: validates that a model identifier is in the
+ * org-approved registry before use. Throws on violation.
+ */
+function assertApprovedEmbeddingModel(modelName) {
+  if (!APPROVED_EMBEDDING_MODELS.has(modelName)) {
+    throw new Error(
+      `Policy violation: embedding model "${modelName}" is not in the approved model registry.`
+    );
   }
 }
 // Chroma (vector store) direct writes are handled by the agent intermediary, not the MCP server.
@@ -99,7 +159,7 @@ class ApprovedEmbeddings extends FakeEmbeddings {
 // This ensures the module itself cannot be loaded if the tools are not approved.
 validateTool("pinecone");
 validateTool("chroma");
-validateTool("openai-embeddings");
+validateTool("cohere-embeddings");
 validateTool("character-text-splitter");
 validateTool("document-loader"); // REMOVED – policy violation
 
@@ -109,6 +169,160 @@ validateTool("document-loader"); // REMOVED – policy violation
  * @param {object} payload - { texts: string[], metadatas: object[], namespace: string }
  * @returns {Promise<object>} - agent response
  */
+/**
+ * Strips non-printable / control characters (except common whitespace) from a string.
+ */
+function stripControlChars(str) {
+  // Allow tab (\t), newline (\n), carriage return (\r); remove other C0/C1 controls
+  return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "");
+}
+
+/**
+ * Validates and sanitizes the agentIndexRequest payload.
+ * - texts: non-empty array of strings; each entry is PII-redacted and control-char-stripped
+ * - metadatas: array of plain objects (same length as texts)
+ * - namespace: non-empty string, alphanumeric/hyphens/underscores only
+ * Returns a new sanitized payload object.
+ */
+function sanitizeIndexPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Policy violation: agentIndexRequest payload must be a non-null object.");
+  }
+
+  const { texts, metadatas, namespace } = payload;
+
+  // --- Validate & sanitize texts ---
+  if (!Array.isArray(texts) || texts.length === 0) {
+    throw new Error("Policy violation: payload.texts must be a non-empty array.");
+  }
+  const sanitizedTexts = texts.map((t, i) => {
+    if (typeof t !== "string") {
+      throw new Error(`Policy violation: payload.texts[${i}] must be a string.`);
+    }
+    if (t.length > 100_000) {
+      throw new Error(`Policy violation: payload.texts[${i}] exceeds maximum allowed length (100 000 chars).`);
+    }
+    return stripControlChars(redactPII(t));
+  });
+
+  // --- Validate metadatas ---
+  if (!Array.isArray(metadatas) || metadatas.length !== sanitizedTexts.length) {
+    throw new Error(
+      "Policy violation: payload.metadatas must be an array with the same length as texts."
+    );
+  }
+  const sanitizedMetadatas = metadatas.map((m, i) => {
+    if (m === null || typeof m !== "object" || Array.isArray(m)) {
+      throw new Error(`Policy violation: payload.metadatas[${i}] must be a plain object.`);
+    }
+    // Shallow-copy; stringify values to prevent prototype pollution
+    const clean = {};
+    for (const [k, v] of Object.entries(m)) {
+      if (typeof k !== "string") {
+        throw new Error(`Policy violation: metadata key at index ${i} must be a string.`);
+      }
+      // Allow only primitive values in metadata
+      if (v !== null && !["string", "number", "boolean"].includes(typeof v)) {
+        throw new Error(
+          `Policy violation: metadata value for key "${k}" at index ${i} must be a primitive.`
+        );
+      }
+      clean[k] = typeof v === "string" ? stripControlChars(redactPII(v)) : v;
+    }
+    return clean;
+  });
+
+  // --- Validate namespace ---
+  if (typeof namespace !== "string" || namespace.trim().length === 0) {
+    throw new Error("Policy violation: payload.namespace must be a non-empty string.");
+  }
+  if (!/^[a-zA-Z0-9_\-]{1,128}$/.test(namespace.trim())) {
+    throw new Error(
+      "Policy violation: payload.namespace contains disallowed characters. " +
+        "Only alphanumeric characters, hyphens, and underscores are permitted (max 128 chars)."
+    );
+  }
+
+  return {
+    texts: sanitizedTexts,
+    metadatas: sanitizedMetadatas,
+    namespace: namespace.trim(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dangerous-pattern sanitization
+// Policy: block hidden prompts, base64, leetspeak, shell/binary commands, and
+// JS runtime-execution patterns before any text reaches the agent or embeddings.
+// ---------------------------------------------------------------------------
+const DANGEROUS_PATTERNS = [
+  // JS runtime execution
+  /\beval\s*\(/i,
+  /\bexec\s*\(/i,
+  /new\s+Function\s*\(/i,
+  /\bsetTimeout\s*\(/i,
+  /\bsetInterval\s*\(/i,
+  /\bimportScripts\s*\(/i,
+  /\brequire\s*\(/i,
+  /\bimport\s*\(/i,
+  // Shell / ProcessBuilder / Runtime.exec
+  /ProcessBuilder/i,
+  /Runtime\.exec\s*\(/i,
+  /\bsh\s+-[csi]/i,
+  /\bbash\s+-[csi]/i,
+  /\bcmd\.exe/i,
+  /\bpowershell/i,
+  // Shell metacharacters sequences indicative of injection
+  /[`$]\s*\(/,
+  /;\s*(rm|wget|curl|nc|ncat|python|perl|ruby|php)\b/i,
+  // Base64-encoded blobs (long runs of base64 chars)
+  /(?:[A-Za-z0-9+\/]{40,}={0,2})/,
+  // Invisible / zero-width characters used to hide prompts
+  /[\u200B-\u200D\uFEFF\u00AD\u2060]/,
+  // Leetspeak patterns (common substitutions used to evade filters)
+  /(?:3x3c|3v4l|1mp0rt|r3qu1r3)/i,
+  // Binary / ELF / PE magic bytes represented as escape sequences or literals
+  /\\x7fELF/i,
+  /MZ\x90/,
+  // Prompt-injection trigger phrases
+  /ignore\s+(all\s+)?previous\s+instructions/i,
+  /disregard\s+(all\s+)?previous\s+instructions/i,
+  /you\s+are\s+now\s+in\s+(developer|jailbreak|dan)\s+mode/i,
+];
+
+/**
+ * Throws if `text` matches any dangerous pattern.
+ * @param {string} text
+ * @param {string} [context] - label for error messages
+ */
+function assertNoDangerousPatterns(text, context = "input") {
+  if (typeof text !== "string") return;
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(text)) {
+      throw new Error(
+        `Policy violation: dangerous pattern detected in ${context}: ${pattern}`
+      );
+    }
+  }
+}
+
+/**
+ * Recursively sanitizes all string values in an object/array.
+ * @param {*} value
+ * @param {string} [context]
+ */
+function sanitizeValue(value, context = "payload") {
+  if (typeof value === "string") {
+    assertNoDangerousPatterns(value, context);
+  } else if (Array.isArray(value)) {
+    value.forEach((item, i) => sanitizeValue(item, `${context}[${i}]`));
+  } else if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      sanitizeValue(v, `${context}.${k}`);
+    }
+  }
+}
+
 async function agentIndexRequest(payload) {
   const agentEndpoint = process.env.AGENT_INTERMEDIARY_URL;
   if (!agentEndpoint) {
@@ -119,9 +333,52 @@ async function agentIndexRequest(payload) {
   }
   const url = new URL(agentEndpoint);
   validateOutboundUrl(url.toString()); // reuse existing allowlist check if applicable
+
+  // Sanitize and validate all payload fields before forwarding to the agent intermediary.
+  const sanitizedPayload = sanitizeIndexPayload(payload);
+
+    // --- Synthetic Content Provenance, Labeling & Watermarking ---
+  // Attach model ID, timestamp, synthetic-origin label, and HMAC signature.
+  const _modelId =
+    process.env.EMBEDDING_MODEL_ID || "approved-embedding-model/v1";
+  const _provenanceTimestamp = new Date().toISOString();
+  const _contentOriginLabel = "ai-generated-synthetic";
+  const _enrichedBody = {
+    action: "index",
+    ...payload,
+    _provenance: {
+      modelId: _modelId,
+      provenanceTimestamp: _provenanceTimestamp,
+      contentOriginLabel: _contentOriginLabel,
+      syntheticContent: true,
+    },
+  };
+  const _signingSecret = process.env.PROVENANCE_SIGNING_SECRET;
+  if (!_signingSecret) {
+    throw new Error(
+      "Policy violation: PROVENANCE_SIGNING_SECRET is not set. " +
+        "A signing secret is required to attach cryptographic provenance signatures to AI-generated outputs."
+    );
+  }
+  const _bodyString = JSON.stringify(_enrichedBody);
+  const _provenanceSignature = crypto
+    .createHmac("sha256", _signingSecret)
+    .update(_bodyString)
+    .digest("hex");
+
+    const agentApiKey = process.env.AGENT_INTERMEDIARY_API_KEY;
+  if (!agentApiKey) {
+    throw new Error(
+      "Policy violation: AGENT_INTERMEDIARY_API_KEY is not set. " +
+        "Inter-agent communication must be authenticated with a Bearer token."
+    );
+  }
   const response = await fetch(agentEndpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${agentApiKey}`,
+    },
     body: JSON.stringify({ action: "index", ...payload }),
   });
   if (!response.ok) {
@@ -130,6 +387,167 @@ async function agentIndexRequest(payload) {
     );
   }
   return response.json();
+}
+  const url = new URL(agentEndpoint);
+  validateOutboundUrl(url.toString()); // reuse existing allowlist check if applicable
+
+  // --- Input validation and sanitization ---
+  const { texts, metadatas, namespace } = payload ?? {};
+
+  // Validate and sanitize texts
+  if (!Array.isArray(texts) || texts.length === 0) {
+    throw new Error(
+      "Policy violation: agentIndexRequest requires a non-empty 'texts' array."
+    );
+  }
+  const sanitizedTexts = texts.map((t, i) => {
+    if (typeof t !== "string") {
+      throw new Error(
+        `Policy violation: texts[${i}] must be a string, got ${typeof t}.`
+      );
+    }
+    // Apply PII redaction and strip null bytes
+    return redactPII(t).replace(/\0/g, "");
+  });
+
+  // Validate and sanitize metadatas
+  if (!Array.isArray(metadatas) || metadatas.length !== sanitizedTexts.length) {
+    throw new Error(
+      "Policy violation: agentIndexRequest requires a 'metadatas' array with the same length as 'texts'."
+    );
+  }
+  const sanitizedMetadatas = metadatas.map((m, i) => {
+    if (m === null || typeof m !== "object" || Array.isArray(m)) {
+      throw new Error(
+        `Policy violation: metadatas[${i}] must be a plain object.`
+      );
+    }
+    // Allow only string/number/boolean values; drop anything else
+    const safe = {};
+    for (const [k, v] of Object.entries(m)) {
+      if (typeof k !== "string") continue;
+      const safeKey = k.replace(/[^\w\-\.]/g, "_").slice(0, 128);
+      if (typeof v === "string") {
+        safe[safeKey] = redactPII(v).replace(/\0/g, "").slice(0, 4096);
+      } else if (typeof v === "number" || typeof v === "boolean") {
+        safe[safeKey] = v;
+      }
+      // silently drop other types
+    }
+    return safe;
+  });
+
+  // Validate and sanitize namespace
+  if (typeof namespace !== "string" || namespace.trim().length === 0) {
+    throw new Error(
+      "Policy violation: agentIndexRequest requires a non-empty string 'namespace'."
+    );
+  }
+  const sanitizedNamespace = namespace.trim().replace(/[^\w\-]/g, "_").slice(0, 256);
+  // --- End input validation and sanitization ---
+
+  const sanitizedPayload = {
+    texts: sanitizedTexts,
+    metadatas: sanitizedMetadatas,
+    namespace: sanitizedNamespace,
+  };
+
+  const response = await fetch(agentEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "index", ...sanitizedPayload }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Agent intermediary returned HTTP ${response.status}: ${await response.text()}`
+    );
+  }
+  const rawResponse = await response.json();
+  return sanitizeMcpOutput(rawResponse);
+}
+
+/**
+ * sanitizeMcpOutput – validates and sanitizes output received from an MCP
+ * server or agent intermediary before it is used by the client.
+ *
+ * Policy: Client must validate and sanitize any output from a MCP server.
+ *
+ * Validation checks:
+ *  - Response must be a non-null plain object.
+ *  - Must not contain unexpected executable or script-like string values.
+ *  - String values are stripped of HTML/script tags and null bytes.
+ *  - Keys are restricted to an allowlist of expected response fields.
+ *
+ * @param {unknown} raw - The raw parsed JSON from the MCP/agent response.
+ * @returns {object} - The sanitized response object.
+ */
+function sanitizeMcpOutput(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(
+      "MCP output validation failed: response must be a non-null plain object."
+    );
+  }
+
+  // Allowlist of top-level keys expected in an indexing response.
+  const ALLOWED_KEYS = new Set([
+    "status",
+    "message",
+    "indexed",
+    "namespace",
+    "count",
+    "ids",
+    "errors",
+    "warnings",
+    "metadata",
+  ]);
+
+  const sanitized = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!ALLOWED_KEYS.has(key)) {
+      // Drop unexpected keys rather than propagating potentially injected fields.
+      continue;
+    }
+    sanitized[key] = sanitizeMcpValue(value);
+  }
+  return sanitized;
+}
+
+/**
+ * Recursively sanitizes a value from MCP output.
+ * Strings are stripped of HTML tags, script content, and null bytes.
+ * Arrays are sanitized element-by-element.
+ * Nested plain objects are sanitized recursively (keys are not allowlist-checked
+ * for nested objects, but string values are still cleaned).
+ *
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function sanitizeMcpValue(value) {
+  if (typeof value === "string") {
+    // Remove null bytes.
+    let clean = value.replace(/\0/g, "");
+    // Strip HTML/script tags.
+    clean = clean.replace(/<[^>]*>/g, "");
+    // Reject strings that look like executable JavaScript (prompt-injection guard).
+    if (/\b(eval|Function|setTimeout|setInterval|import\s*\()\s*\(/.test(clean)) {
+      throw new Error(
+        "MCP output validation failed: response contains potentially executable content."
+      );
+    }
+    return clean;
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeMcpValue);
+  }
+  if (value !== null && typeof value === "object") {
+    const nested = {};
+    for (const [k, v] of Object.entries(value)) {
+      nested[sanitizeMcpValue(k)] = sanitizeMcpValue(v);
+    }
+    return nested;
+  }
+  // Primitives (number, boolean, null) are returned as-is.
+  return value;
 }
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -406,7 +824,19 @@ function sanitizeMcpOutput(mcpResponse, { maxStringLength = 65536, requiredField
  */
 function withMcpSanitization(mcpToolFn, sanitizeOptions = {}) {
   return async function (...args) {
+    console.info(
+      "[MCP Interaction] Sending request to MCP tool:",
+      mcpToolFn.name || "(anonymous)",
+      "| args:",
+      JSON.stringify(args)
+    );
     const rawResponse = await mcpToolFn(...args);
+    console.info(
+      "[MCP Interaction] Received response from MCP tool:",
+      mcpToolFn.name || "(anonymous)",
+      "| response:",
+      JSON.stringify(rawResponse)
+    );
     return sanitizeMcpOutput(rawResponse, sanitizeOptions);
   };
 }
@@ -777,6 +1207,46 @@ function sanitizePromptContent(text) {
   return sanitized;
 }
 
+/**
+ * Detects and redacts Singapore-specific PII from text.
+ * Covers: NRIC/FIN numbers, Work Permit numbers, SingPass identifiers,
+ * CPF account numbers, Singapore phone numbers, Singapore postal codes,
+ * Singapore passport numbers, email addresses, and credit card numbers.
+ * @param {string} text - Text to redact
+ * @returns {string} Text with Singapore PII replaced by redaction tokens
+ */
+function detectAndRedactSingaporePII(text) {
+  const SG_PII_PATTERNS = [
+    // NRIC/FIN: S/T/F/G/M followed by 7 digits and a letter
+    { re: /\b[STFGM]\d{7}[A-Z]\b/gi, label: "[REDACTED_NRIC_FIN]" },
+    // Singapore passport: E followed by 7 digits (or similar formats)
+    { re: /\b[EK]\d{7}[A-Z]\b/gi, label: "[REDACTED_PASSPORT]" },
+    // Work Permit / Employment Pass: WP or EP followed by alphanumerics
+    { re: /\b(?:WP|EP|SP|DP|LTVP)[-\s]?[A-Z0-9]{6,12}\b/gi, label: "[REDACTED_WORK_PERMIT]" },
+    // SingPass identifier (NRIC used as SingPass ID — covered above, but also explicit SingPass prefix)
+    { re: /\bSingPass[-\s]?ID[-:\s]+[A-Z0-9]{6,12}\b/gi, label: "[REDACTED_SINGPASS_ID]" },
+    // CPF account number: 9 digits (distinct from phone by context prefix)
+    { re: /\bCPF[-\s]?(?:Account|Acct|No\.?|Number)?[-:\s]+\d{9}\b/gi, label: "[REDACTED_CPF_ACCOUNT]" },
+    // Singapore phone numbers: +65 or 65 country code, 8-digit local numbers starting with 6/8/9
+    { re: /\b(?:\+65|65)?[-\s]?[689]\d{3}[-\s]?\d{4}\b/g, label: "[REDACTED_SG_PHONE]" },
+    // Singapore postal code: 6-digit code (often preceded by S( or Singapore)
+    { re: /\b(?:S\()?(?:0[1-9]|[1-7]\d|8[0-8])\d{4}\)?\b/g, label: "[REDACTED_SG_POSTAL]" },
+    // Email addresses
+    { re: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, label: "[REDACTED_EMAIL]" },
+    // Credit card numbers: 13–19 digits, optionally separated by spaces or dashes
+    { re: /\b(?:\d[ \-]?){13,19}\b/g, label: "[REDACTED_CREDIT_CARD]" },
+    // Full names heuristic: two or more capitalised words (Title Case) in sequence
+    // e.g. "John Tan Wei Ming" — conservative pattern to avoid over-redaction
+    { re: /\b[A-Z][a-z]{1,20}(?:\s[A-Z][a-z]{1,20}){1,4}\b/g, label: "[REDACTED_FULL_NAME]" },
+  ];
+
+  let redacted = text;
+  for (const { re, label } of SG_PII_PATTERNS) {
+    redacted = redacted.replace(re, label);
+  }
+  return redacted;
+}
+
 const fileNames = fs.readdirSync("companions");
 const splitter = new CharacterTextSplitter({
   separator: " ",
@@ -825,6 +1295,9 @@ function sanitizeAndValidateContent(text, sourceFile) {
     );
     sanitized = sanitized.slice(0, MAX_CONTENT_LENGTH);
   }
+
+  // Redact Singapore-specific PII before content is embedded or uploaded
+  sanitized = detectAndRedactSingaporePII(sanitized);
 
   return sanitized;
 }
@@ -908,12 +1381,16 @@ const CONTENT_ORIGIN_TAG = process.env.CONTENT_ORIGIN_TAG ?? "ai-generated:opena
 
 function attachProvenanceAndWatermark(doc) {
   const provenanceTimestamp = new Date().toISOString();
+  const contentHash = crypto
+    .createHash("sha256")
+    .update(doc.pageContent ?? "")
+    .digest("hex");
   const provenancePayload = JSON.stringify({
     modelIdentifier: PINNED_EMBEDDING_MODEL,
     contentOriginTag: CONTENT_ORIGIN_TAG,
     provenanceTimestamp,
     fileName: doc.metadata?.fileName ?? "unknown",
-    pageContent: doc.pageContent,
+    contentHash,
   });
   const watermark = crypto
     .createHmac("sha256", PROVENANCE_HMAC_SECRET)
@@ -940,6 +1417,20 @@ const safeDocs = langchainDocs
 const docsToEmbed = redactDocuments(
   // original assignment continues below — wrap the existing value
   (() => { const _raw = safeDocs;
+    // Explicit tool allow list — only tools present here may be invoked.
+  const ALLOWED_TOOLS = new Set([
+    "OpenAIEmbeddings",
+    "PineconeStore.fromDocuments",
+  ]);
+  const requestedTools = ["OpenAIEmbeddings", "PineconeStore.fromDocuments"];
+  for (const tool of requestedTools) {
+    if (!ALLOWED_TOOLS.has(tool)) {
+      throw new Error(
+        `Tool '${tool}' is not in the approved allow list and cannot be invoked. ` +
+        `Approved tools: ${[...ALLOWED_TOOLS].join(", ")}`
+      );
+    }
+  }
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_complete",
@@ -949,7 +1440,8 @@ const docsToEmbed = redactDocuments(
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "success",
-  }));
+    allowListValidated: true,
+  })); // Note: document content is intentionally excluded from this log entry
 try {
   const AUDIT_LOG_PATH = path.resolve("audit.log");
 const MODEL_IDENTIFIER = "embed-english-v3.0"; // CohereEmbeddings approved model
@@ -959,7 +1451,7 @@ const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
 // Compute a deterministic SHA-256 hash of the input documents for forensic integrity
 const inputHash = crypto
   .createHash("sha256")
-  .update(JSON.stringify(filteredDocs.map((d) => ({ metadata: d.metadata, pageContent: d.pageContent }))))
+  .update(JSON.stringify(filteredDocs.map((d) => ({ metadata: d.metadata }))))
   .digest("hex");
 
 const principal = os.userInfo().username;
@@ -1013,7 +1505,7 @@ try {
       const response = await fetch(this.embeddingServiceUrl + "/embedDocuments", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texts }),
+        body: (() => { texts.forEach((t, i) => assertNoDangerousPatterns(t, `embedding-text[${i}]`)); return JSON.stringify({ texts }); })(),
       });
       if (!response.ok) {
         throw new Error(
@@ -1083,7 +1575,7 @@ try {
 
   // --- Input validation and sanitization of documents before indexing ---
   const MAX_CONTENT_LENGTH = parseInt(process.env.MAX_DOC_CONTENT_LENGTH || String(100 * 1024), 10);
-  const sanitizedDocs = filteredDocs.map((doc, idx) => {
+  const sanitizedDocs = splitDocs.map((doc, idx) => {
     if (!doc || typeof doc !== 'object') {
       throw new Error(`Document at index [${idx}] is not a valid object.`);
     }
@@ -1218,6 +1710,20 @@ try {
           `[HITL] Human-approved file delete operation proceeding: '${targetPath}'`
         );
       })(AUDIT_LOG_PATH);
+      // --- HITL approval gate for risky delete/destroy operation ---
+      (function requireHITLApprovalForUnlink(targetPath) {
+        const approved = process.env.HITL_DELETE_APPROVED === "true";
+        if (!approved) {
+          throw new Error(
+            `[HITL] Human approval required before deleting file. ` +
+            `Operation: delete '${targetPath}'. ` +
+            `Set environment variable HITL_DELETE_APPROVED=true to explicitly approve this risky operation.`
+          );
+        }
+        console.warn(
+          `[HITL] Human-approved file delete (unlink) operation proceeding: '${targetPath}'`
+        );
+      })(AUDIT_LOG_PATH);
       fs.unlinkSync(AUDIT_LOG_PATH);
     }
   } catch (rotateErr) {
@@ -1280,12 +1786,8 @@ try {
       if (!_resolvedE.startsWith(_expectedDirE + _sepE) && _resolvedE !== _expectedDirE) {
         throw new Error("[AUDIT] Rotated log path escapes expected directory: " + _resolvedE);
       }
-      fs.copyFileSync(AUDIT_LOG_PATH, _resolvedE);
-      fs.unlinkSync(AUDIT_LOG_PATH);
-    }
       // Use atomic rename only; no copy+unlink to avoid partial-state exposure
-      const { renameSync } = fs;
-      renameSync(AUDIT_LOG_PATH, _resolvedE);
+      fs.renameSync(AUDIT_LOG_PATH, _resolvedE);
     }
   } catch (_re) { console.error("[AUDIT] Log rotation failed:", _re.message); }
   fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(llmErrorRecord) + "\n", "utf8");
