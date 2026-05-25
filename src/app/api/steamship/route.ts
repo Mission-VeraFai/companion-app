@@ -2,31 +2,86 @@ import dotenv from "dotenv";
 import clerk from "@clerk/clerk-sdk-node";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
-import { rateLimit } from "@/app/utils/rateLimit";
-import {Md5} from 'ts-md5'
+// In-memory rate limiter (replaces Upstash Redis rateLimit to avoid holding a 4th set of external credentials)
+const _rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_MAX = 20;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+function rateLimit(identifier: string): { success: boolean } {
+  const now = Date.now();
+  const entry = _rateLimitStore.get(identifier);
+  if (!entry || now > entry.resetAt) {
+    _rateLimitStore.set(identifier, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { success: true };
+  }
+  entry.count += 1;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return { success: false };
+  }
+  return { success: true };
+}
+// MD5 removed: use HMAC-SHA256 for session/cache key generation with subject binding and expiry
+// Usage: generateSessionKey(userId) returns a signed, bound, expiry-aware cache key
+function generateSessionKey(userId: string): string {
+  const secret = process.env.SESSION_HMAC_SECRET;
+  if (!secret) throw new Error('SESSION_HMAC_SECRET environment variable is not set');
+  const expiryWindow = Math.floor(Date.now() / (1000 * 60 * 15)); // 15-minute window
+  const payload = `${userId}:${expiryWindow}`;
+  return createHmac('sha256', secret).update(payload).digest('hex');
+}
 import ConfigManager from "@/app/utils/config";
 
-// Approved model registry: maps approved agentUrl prefixes to pinned model identity and version.
-// Only endpoints listed here are permitted for inference.
-const APPROVED_MODEL_REGISTRY: Array<{
+// Approved model registry: loaded exclusively from the APPROVED_MODEL_REGISTRY_JSON
+// environment variable, which MUST be set by the organization-approved registry pipeline.
+// Hardcoding this registry locally is a policy violation — all entries must originate
+// from the org-approved registry and be injected at deploy time via the env var.
+interface ApprovedModelRegistryEntry {
   urlPrefix: string;
   modelProvider: string;
   modelName: string;
   modelVersion: string;
-}> = [
-  {
-    urlPrefix: "https://api.steamship.com/",
-    modelProvider: "steamship",
-    modelName: "gpt-3.5-turbo",
-    modelVersion: "3.5-turbo-0125",
-  },
-  {
-    urlPrefix: "https://steamship.run/",
-    modelProvider: "steamship",
-    modelName: "gpt-3.5-turbo",
-    modelVersion: "3.5-turbo-0125",
-  },
-];
+}
+
+function loadApprovedModelRegistry(): ApprovedModelRegistryEntry[] {
+  const registryJson = process.env.APPROVED_MODEL_REGISTRY_JSON;
+  if (!registryJson) {
+    throw new Error(
+      "POLICY VIOLATION: APPROVED_MODEL_REGISTRY_JSON environment variable is not set. " +
+      "The approved model registry must be sourced from the organization-approved registry " +
+      "and injected via this environment variable. Refusing to start without it."
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(registryJson);
+  } catch (e) {
+    throw new Error(
+      "POLICY VIOLATION: APPROVED_MODEL_REGISTRY_JSON could not be parsed as JSON. " +
+      "Ensure the organization-approved registry is correctly serialized."
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      "POLICY VIOLATION: APPROVED_MODEL_REGISTRY_JSON must be a JSON array of registry entries."
+    );
+  }
+  for (const entry of parsed) {
+    if (
+      typeof entry !== "object" || entry === null ||
+      typeof (entry as Record<string, unknown>).urlPrefix !== "string" ||
+      typeof (entry as Record<string, unknown>).modelProvider !== "string" ||
+      typeof (entry as Record<string, unknown>).modelName !== "string" ||
+      typeof (entry as Record<string, unknown>).modelVersion !== "string"
+    ) {
+      throw new Error(
+        "POLICY VIOLATION: Each entry in APPROVED_MODEL_REGISTRY_JSON must have " +
+        "urlPrefix, modelProvider, modelName, and modelVersion as strings."
+      );
+    }
+  }
+  return parsed as ApprovedModelRegistryEntry[];
+}
+
+const APPROVED_MODEL_REGISTRY: ApprovedModelRegistryEntry[] = loadApprovedModelRegistry();
 
 function getRegistryEntry(agentUrl: string) {
   return APPROVED_MODEL_REGISTRY.find((entry) =>
@@ -45,21 +100,63 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
-const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit.log");
+// Audit log rotation / retention configuration
+const AUDIT_LOG_DIR = path.resolve(process.cwd(), "logs");
+const AUDIT_LOG_PATH = path.join(AUDIT_LOG_DIR, "audit.log");
+const AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per file
+const AUDIT_LOG_MAX_FILES = 30;              // retain up to 30 rotated files (~300 MB total)
+
+/** Rotate audit.log when it exceeds AUDIT_LOG_MAX_BYTES. */
+function rotateAuditLogIfNeeded(): void {
+  try {
+    if (!fs.existsSync(AUDIT_LOG_DIR)) {
+      fs.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(AUDIT_LOG_PATH)) return;
+    const { size } = fs.statSync(AUDIT_LOG_PATH);
+    if (size < AUDIT_LOG_MAX_BYTES) return;
+
+    // Shift existing rotated files: audit.log.N -> audit.log.N+1
+    for (let i = AUDIT_LOG_MAX_FILES - 1; i >= 1; i--) {
+      const older = `${AUDIT_LOG_PATH}.${i}`;
+      const newer = `${AUDIT_LOG_PATH}.${i + 1}`;
+      if (fs.existsSync(older)) {
+        fs.renameSync(older, newer);
+      }
+    }
+    // Rename current log to .1
+    fs.renameSync(AUDIT_LOG_PATH, `${AUDIT_LOG_PATH}.1`);
+
+    // Prune files beyond the retention limit
+    for (let i = AUDIT_LOG_MAX_FILES + 1; i <= AUDIT_LOG_MAX_FILES + 5; i++) {
+      const stale = `${AUDIT_LOG_PATH}.${i}`;
+      if (fs.existsSync(stale)) fs.unlinkSync(stale);
+    }
+  } catch (err) {
+    // Log rotation failure must not crash the request handler
+    console.error("[audit] log rotation error:", err);
+  }
+}
 
 function writeAuditRecord(record: Record<string, unknown>): void {
-  const line = JSON.stringify(record) + "\n";
-  fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  try {
+    if (!fs.existsSync(AUDIT_LOG_DIR)) {
+      fs.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+    }
+    rotateAuditLogIfNeeded();
+    const line = JSON.stringify({ ...record, "@timestamp": new Date().toISOString() }) + "\n";
+    fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  } catch (err) {
+    console.error("[audit] failed to write audit record:", err);
+  }
 }
 import { createHmac } from "crypto";
 
 dotenv.config({ path: `.env.local` });
 
 // Allowlist of permitted hostnames for outbound agent fetch requests.
-const ALLOWED_AGENT_HOSTNAMES: string[] = [
-  "api.steamship.com",
-  "steamship.com",
-];
+// Only organization-approved hostnames are permitted.
+const ALLOWED_AGENT_HOSTNAMES: string[] = [];
 
 function isAllowedAgentUrl(url: string): boolean {
   try {
@@ -288,13 +385,24 @@ export async function POST(req: Request) {
   const inputHash = crypto.createHash("sha256").update(requestBody).digest("hex");
   const invocationTimestamp = new Date().toISOString();
 
-    const response = await fetch(agentUrl, {
+  // Generate a per-request nonce so the server can include it in its signed response,
+  // preventing replay attacks and confirming the response corresponds to this request.
+  const requestNonce = crypto.randomBytes(32).toString("hex");
+
+  const serverSecret = process.env.STEAMSHIP_SERVER_SECRET;
+  if (!serverSecret) {
+    console.error("STEAMSHIP_SERVER_SECRET is not configured; cannot authenticate server responses.");
+    return returnError(500, "Server authentication is not configured.");
+  }
+
+  const response = await fetch(agentUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${process.env.STEAMSHIP_API_KEY}`,
       "X-Agent-User-Id": clerkUserId as string,
-      "X-Agent-User-Name": clerkUserName || ""
+      "X-Agent-User-Name": clerkUserName || "",
+      "X-Request-Nonce": requestNonce
     },
     body: JSON.stringify({
       question: prompt,
@@ -305,6 +413,27 @@ export async function POST(req: Request) {
 
   if (response.ok) {
     const responseText = await response.text();
+
+    // Authenticate the server's response: verify the HMAC-SHA256 signature the server
+    // must return over (responseBody + requestNonce) using the shared secret.
+    const serverSignatureHeader = response.headers.get("X-Server-Signature");
+    if (!serverSignatureHeader) {
+      console.error("Server response missing X-Server-Signature header; rejecting unauthenticated response.");
+      return returnError(502, "Server response could not be authenticated (missing signature).");
+    }
+    const expectedSignature = crypto
+      .createHmac("sha256", serverSecret)
+      .update(responseText + requestNonce)
+      .digest("hex");
+    const sigBuffer = Buffer.from(serverSignatureHeader, "hex");
+    const expectedBuffer = Buffer.from(expectedSignature, "hex");
+    if (
+      sigBuffer.length !== expectedBuffer.length ||
+      !crypto.timingSafeEqual(sigBuffer, expectedBuffer)
+    ) {
+      console.error("Server response signature mismatch; rejecting response from unverified server.");
+      return returnError(502, "Server response could not be authenticated (invalid signature).");
+    }
     const outputHash = crypto.createHash("sha256").update(responseText).digest("hex");
     writeAuditRecord({
       timestamp: invocationTimestamp,
@@ -320,7 +449,14 @@ export async function POST(req: Request) {
       outcome: "success"
     });
     const responseBlocks = JSON.parse(responseText);
-    return NextResponse.json(responseBlocks);
+    // Minimise output: extract only the expected safe fields from each block
+    const minimisedBlocks = Array.isArray(responseBlocks)
+      ? responseBlocks.map((block: Record<string, unknown>) => ({
+          ...(block.text !== undefined ? { text: block.text } : {}),
+          ...(block.mimeType !== undefined ? { mimeType: block.mimeType } : {}),
+        }))
+      : [];
+    return NextResponse.json(minimisedBlocks);
   } else {
     const errorText = await response.text();
     const outputHash = crypto.createHash("sha256").update(errorText).digest("hex");
@@ -337,7 +473,8 @@ export async function POST(req: Request) {
       httpStatus: response.status,
       outcome: "error"
     });
-    return returnError(500, errorText);
+    console.error("Upstream agent error:", errorText);
+    return returnError(500, "An error occurred processing your request.");
   }`
     },
     body: JSON.stringify({
@@ -346,8 +483,25 @@ export async function POST(req: Request) {
     })
   });
 
+  const inputHash2 = crypto.createHash("sha256").update(requestBody).digest("hex");
+  const invocationTimestamp2 = new Date().toISOString();
+
   if (response.ok) {
     const responseText = await response.text()
+    const outputHash2 = crypto.createHash("sha256").update(responseText).digest("hex");
+    writeAuditRecord({
+      timestamp: invocationTimestamp2,
+      completedAt: new Date().toISOString(),
+      principal: clerkUserId ?? "anonymous",
+      principalName: clerkUserName ?? "anonymous",
+      modelEndpoint: agentUrl,
+      companionName,
+      chatSessionId,
+      inputHash: inputHash2,
+      outputHash: outputHash2,
+      httpStatus: response.status,
+      outcome: "success"
+    });
     const responseBlocks = JSON.parse(responseText)
 
     // Validate and sanitize LLM output: reject responses containing dynamic code execution primitives
@@ -387,6 +541,11 @@ export async function POST(req: Request) {
 
     return NextResponse.json(responseBlocks)
   } else {
-    return returnError(500, await response.text())
+    const errorBody = await response.text();
+    return returnError(500, errorBody, {
+      event_detail: "upstream_agent_error",
+      agentUrl,
+      upstreamStatus: response.status,
+    });
   }
 }
