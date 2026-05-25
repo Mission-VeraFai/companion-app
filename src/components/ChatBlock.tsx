@@ -297,7 +297,7 @@ export function responseToChatBlocks(completion: any) {
         timestamp:        auditStart,
         principal:        principal,
         modelIdentifier:  modelIdentifier,
-        modelRegistryValidated: modelIdentifier !== "REJECTED_UNAPPROVED_MODEL",
+        modelRegistryValidated: APPROVED_MODEL_REGISTRY.has(modelIdentifier),
         inputHash:        inputHash,
         inputType:        inputType,
         outputBlockCount: blocks.length,
