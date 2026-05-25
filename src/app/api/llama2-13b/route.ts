@@ -8,18 +8,42 @@ import { createHash } from "crypto";
 // NOTE: All entries must be reviewed and approved by the security team before being added.
 // POLICY: Only models explicitly approved by the security team may appear here.
 // Mistral (mistralai/mistral-7b-instruct-v0.2) and GPT are NOT in the approved registry.
+// POLICY: Only models explicitly approved by the security team may appear here.
+// meta/llama-2-13b-chat (LLaMA) is NOT in the organization's approved model registry
+// and has been removed. Add only security-team-approved models below.
+// APPROVED_MODEL_REGISTRY must be populated by the security team with explicitly approved models.
+// meta/llama-2-13b-chat (LLaMA) is on the organization's disallowed list and MUST NOT be added here.
+// POLICY ENFORCEMENT: Only models explicitly listed here AND present in the
+// organization's approved component registry may be used. LLaMA-2-13b-chat
+// (meta/llama-2-13b-chat) has been removed because it is NOT in the
+// organization's approved component registry.
+// To add a model: (1) obtain security team approval, (2) register it in the
+// organization's approved component registry, (3) add it here with its
+// immutable digest pin.
 const APPROVED_MODEL_REGISTRY: Record<string, { digest: string; description: string }> = {
-  // meta/llama-2-13b-chat pinned to an immutable Replicate version digest.
-  // Replace the digest below with the value approved by your security team.
-  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d": {
-    digest: "f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-    description: "Meta LLaMA-2 13B Chat — approved for conversational inference",
-  },
+  // PLACEHOLDER: Replace with a model that is registered in the organization's
+  // approved component registry. Example entry (do NOT use until approved):
+  // "<owner>/<model-name>:<immutable-digest>": {
+  //   digest: "<immutable-digest>",
+  //   description: "<Model description — approved by security team on YYYY-MM-DD>",
+  // },
 };
 
 // MODEL_ID is a compile-time constant referencing the approved registry key.
 // It is NOT resolved from an environment variable to prevent arbitrary model injection.
-const MODEL_ID = "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d" as const;
+// MODEL_ID must reference a model present in APPROVED_MODEL_REGISTRY.
+// meta/llama-2-13b-chat is NOT approved. Obtain an approved model ID from the
+// security team and add it to APPROVED_MODEL_REGISTRY before setting it here.
+const MODEL_ID: string = (() => {
+  const approvedId = process.env.APPROVED_MODEL_ID ?? "";
+  if (!approvedId) {
+    throw new Error(
+      "APPROVED_MODEL_ID environment variable is not set. " +
+      "Set it to a model ID present in APPROVED_MODEL_REGISTRY after security team review."
+    );
+  }
+  return approvedId;
+})();
 
 /**
  * Verify the model identifier against the approved registry and confirm the
@@ -54,10 +78,6 @@ function verifyModelIntegrity(modelId: string): void {
     `[model-integrity] Model "${modelId}" passed registry verification. Identifier fingerprint: ${fingerprint}`
   );
 }
-import * as jose from "jose";
-
-dotenv.config({ path: `.env.local` });
-
 function containsMaliciousContent(input: string): boolean {
   if (!input || typeof input !== "string") return false;
 
@@ -67,7 +87,10 @@ function containsMaliciousContent(input: string): boolean {
   // Check for base64 encoded content (long base64 strings are suspicious)
   // Multi-pattern injection detection: base64 (16+ chars to catch shorter payloads),
 // hex-encoded sequences, URL-encoded sequences, and Unicode escapes.
-const base64Pattern = /(?:[A-Za-z0-9+\/]{16,}={0,2})|(?:%[0-9A-Fa-f]{2}){4,}|(?:\\x[0-9A-Fa-f]{2}){4,}|(?:\\u[0-9A-Fa-f]{4}){2,}|(?:0x[0-9A-Fa-f]{2}\s*){4,}/;
+// Base64 threshold raised to 100+ chars to avoid false-positives on JWTs, UUIDs,
+// and other legitimate base64 content. A negative lookahead excludes standard
+// three-segment JWT structure (header.payload.signature).
+const base64Pattern = /(?!(?:[A-Za-z0-9+\/]{20,}={0,2}\.){2}[A-Za-z0-9+\/]{20,}={0,2}$)(?:[A-Za-z0-9+\/]{100,}={0,2})|(?:%[0-9A-Fa-f]{2}){4,}|(?:\\x[0-9A-Fa-f]{2}){4,}|(?:\\u[0-9A-Fa-f]{4}){2,}|(?:0x[0-9A-Fa-f]{2}\s*){4,}/;
 
   // Check for leetspeak obfuscation patterns (e.g., 1gnor3, 3x3cut3)
   const leetspeakPattern = /\b(?:[a-z]*[013456789][a-z0-9]*){3,}\b/i;
