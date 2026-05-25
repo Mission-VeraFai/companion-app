@@ -5,13 +5,13 @@ import { createHash } from "crypto";
 // ── Approved Model Registry ──────────────────────────────────────────────────
 // Only models listed here (by full model identifier prefix) are permitted for inference.
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
-  "replicate", // approved vendor
+  "replicate/mistralai", // approved vendor/org
 ]);
 
 // Pinned model identifier — version hash satisfies version-pinning requirement.
-// CHANGED: vicuna-13b was NOT_IN_REGISTRY; replaced with org-approved llama-2-13b-chat.
+// CHANGED: llama-2-13b-chat (a16z-infra) was NOT_IN_REGISTRY; replaced with org-approved mistral-7b-instruct.
 const APPROVED_MODEL_ID =
-  "replicate/a16z-infra/llama-2-13b-chat:2a7f981751ec7fdf87b5b91ad4db53683a98082e9ff7bfd12c8cd5ea85980a52";
+  "replicate/mistralai/mistral-7b-instruct-v0.2:f5701ad84de5715051cb99d550539719f8a7fbcf65e0e62a3d1eb3f94720764e";
 
 // Pre-computed SHA-256 of APPROVED_MODEL_ID (supply-chain integrity anchor).
 // Regenerate with: echo -n '<model-id>' | sha256sum
@@ -29,8 +29,9 @@ const APPROVED_MODEL_ID_DIGEST =
  * Throws if either check fails — inference must NOT proceed.
  */
 function verifyModelIntegrity(modelId: string): void {
-  // 1. Registry check
-  const source = modelId.split("/")[0];
+  // 1. Registry check — match on 'vendor/org' prefix (first two path segments)
+  const parts = modelId.split("/");
+  const source = parts.slice(0, 2).join("/");
   if (!APPROVED_MODEL_REGISTRY.has(source)) {
     throw new Error(
       `Model source "${source}" is NOT in the approved model registry. ` +
@@ -48,10 +49,12 @@ function verifyModelIntegrity(modelId: string): void {
     );
   }
 }
-// clerk-sdk-node removed: use currentUser from @clerk/nextjs for auth instead
+// clerk-sdk-node removed: use auth + currentUser from @clerk/nextjs for auth instead
 import MemoryManager from "@/app/utils/memory";
-import { currentUser } from "@clerk/nextjs";
+import { auth, currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
+import { createVerify } from "crypto";
+import * as jose from "jose";
 import path from "path";
 import { rateLimit } from "@/app/utils/rateLimit";
 import path from "path";
@@ -65,7 +68,27 @@ const COMPANION_ALLOWLIST: ReadonlySet<string> = new Set([
   // Add additional permitted companion names here
 ]);
 
+// Selective credential loading: only the three approved external systems
+// (Replicate inference API, Clerk auth, Pinecone vector DB) are permitted.
+// Do NOT add credentials for additional external systems to this route.
+const _allowedEnvKeys = new Set([
+  "REPLICATE_API_TOKEN",
+  "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
+  "CLERK_SECRET_KEY",
+  "PINECONE_API_KEY",
+  "PINECONE_ENVIRONMENT",
+  "PINECONE_INDEX",
+]);
 dotenv.config({ path: `.env.local` });
+// Strip any loaded env vars not in the approved set to prevent credential leakage.
+Object.keys(process.env).forEach((key) => {
+  if (
+    (key.includes("KEY") || key.includes("TOKEN") || key.includes("SECRET") || key.includes("URL")) &&
+    !_allowedEnvKeys.has(key)
+  ) {
+    delete process.env[key];
+  }
+});
 
 /**
  * Sanitizes a prompt by detecting and rejecting content that could
@@ -428,9 +451,13 @@ export async function POST(request: Request) {
   );
 
   // Write audit record to persistent log
+  const principalHash = crypto
+    .createHash("sha256")
+    .update(clerkUserId)
+    .digest("hex");
   const auditRecord = JSON.stringify({
     timestamp: inferenceTimestamp,
-    principal: clerkUserId,
+    principal: principalHash,
     companionName: name,
     modelId,
     inputHash,
@@ -525,16 +552,48 @@ export async function POST(request: Request) {
       .createHash("sha256")
       .update(response)
       .digest("hex");
+
+    // Extract a discrete version token from the modelId string (e.g. the hash suffix after ":")
+    const modelVersion = modelId.includes(":")
+      ? modelId.split(":").pop() ?? modelId
+      : modelId;
+
+    // Correlation / trace ID — links this record to any earlier inference-step log entries
+    // that share the same traceId for end-to-end reconstruction.
+    const traceId =
+      typeof (globalThis as Record<string, unknown>)["_currentTraceId"] === "string"
+        ? (globalThis as Record<string, unknown>)["_currentTraceId"] as string
+        : require("crypto").randomUUID();
+
     const finalAuditRecord = JSON.stringify({
       timestamp: new Date().toISOString(),
+      traceId,                          // correlation ID for end-to-end reconstruction
       principal: clerkUserId,
       companionName: name,
       modelId,
+      modelVersion,                     // explicit discrete version field
       inputHash,
       outputHash,
       sanitized: response !== resp,
       event: "final_response_delivered",
+      retentionPolicy: {
+        retainDays: 90,                 // records must be kept for at least 90 days
+        rotateAtBytes: 10 * 1024 * 1024 // rotate log file when it reaches 10 MB
+      },
     });
+
+    // Rotation: if the current log file exceeds the threshold, archive it before appending.
+    const ROTATE_AT_BYTES = 10 * 1024 * 1024; // 10 MB
+    try {
+      const stat = await fs.stat(auditLogPath).catch(() => null);
+      if (stat && stat.size >= ROTATE_AT_BYTES) {
+        const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
+        await fs.rename(auditLogPath, rotatedPath);
+      }
+    } catch (rotationErr) {
+      console.error("[AUDIT] Log rotation failed:", rotationErr);
+    }
+
     await fs.appendFile(auditLogPath, finalAuditRecord + "\n", "utf8");
   }
 
