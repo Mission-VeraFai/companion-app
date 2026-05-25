@@ -1,7 +1,95 @@
 // Redis (Upstash) credential removed to comply with the policy limiting
 // this file to no more than 3 external system credentials.
 // Cache functionality is handled via a simple in-memory Map instead.
-const _inMemoryCache = new Map<string, string>();
+
+import * as fs from "fs";
+import * as path from "path";
+import * as crypto from "crypto";
+
+// ---------------------------------------------------------------------------
+// Audit / forensic logging
+// ---------------------------------------------------------------------------
+
+const AUDIT_LOG_PATH = process.env.MEMORY_AUDIT_LOG_PATH
+  ?? path.join(process.cwd(), "memory_audit.log");
+
+/** Retention period for in-memory cache entries (default 1 hour). */
+const CACHE_TTL_MS = Number(process.env.MEMORY_CACHE_TTL_MS ?? 3_600_000);
+
+interface AuditEntry {
+  traceId: string;
+  timestamp: string;
+  principal: string;
+  modelId: string;
+  operation: string;
+  inputHash: string;
+  output: string;
+  status: "ok" | "error";
+  error?: string;
+}
+
+/**
+ * Appends a structured JSON audit record to the persistent audit log file.
+ * Each line is a self-contained JSON object (NDJSON / JSON-Lines format).
+ */
+function writeAuditEntry(entry: AuditEntry): void {
+  try {
+    const line = JSON.stringify(entry) + "\n";
+    fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  } catch (err) {
+    // Never let audit failures silently swallow — surface to stderr.
+    console.error("[AUDIT] Failed to write audit entry:", err, entry);
+  }
+}
+
+/** Generates a cryptographically random 128-bit hex trace/correlation ID. */
+function newTraceId(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+/** Returns a SHA-256 hex digest of the serialised input (for input hashing). */
+function hashInput(input: unknown): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(input))
+    .digest("hex");
+}
+
+/**
+ * Resolves the calling principal from the environment.
+ * In production this should be replaced with a real identity context.
+ */
+function resolvePrincipal(): string {
+  return process.env.MEMORY_PRINCIPAL ?? process.env.USER ?? "unknown";
+}
+
+/** Model identifier used for all AI-driven memory operations. */
+const MODEL_ID = process.env.MEMORY_MODEL_ID ?? "unknown-model";
+
+// ---------------------------------------------------------------------------
+// In-memory cache with TTL-based retention policy
+// ---------------------------------------------------------------------------
+
+interface CacheEntry {
+  value: string;
+  expiresAt: number;
+}
+
+const _inMemoryCache = new Map<string, CacheEntry>();
+
+/** Evicts all entries whose TTL has expired. */
+function evictExpiredEntries(): void {
+  const now = Date.now();
+  for (const [k, v] of _inMemoryCache) {
+    if (now >= v.expiresAt) {
+      _inMemoryCache.delete(k);
+    }
+  }
+}
+
+// Run eviction periodically so the Map does not grow without bound.
+const _evictionTimer = setInterval(evictExpiredEntries, 60_000);
+if (typeof _evictionTimer.unref === "function") _evictionTimer.unref();
 
 /**
  * HITL Approval Gate — MUST be called before any destructive (delete/purge/destroy) operation.
@@ -111,19 +199,56 @@ async function requireHITLApproval(operation: string, target: string): Promise<v
   }
 
   if (body.approved !== true) {
+    // Sanitize the reason field from the MCP server response before use:
+    // ensure it is a string, remove control/non-printable characters, and cap length.
+    const rawReason = body.reason;
+    const sanitizedReason =
+      typeof rawReason === "string"
+        ? rawReason.replace(/[\x00-\x1F\x7F-\x9F]/g, "").slice(0, 256)
+        : "none provided";
     throw new Error(
       `[HITL] Human operator DENIED operation "${operation}" on "${target}". ` +
-      `Reason: ${body.reason ?? "none provided"}. Operation aborted.`
+      `Reason: ${sanitizedReason}. Operation aborted.`
     );
   }
 
   // Approval granted — proceed.
   console.info(`[HITL] Human operator APPROVED operation "${operation}" on "${target}".`);
+    writeAuditEntry({
+      traceId: newTraceId(),
+      timestamp: new Date().toISOString(),
+      principal: resolvePrincipal(),
+      modelId: MODEL_ID,
+      operation: `hitl.approved.${operation}`,
+      inputHash: hashInput({ operation, target }),
+      output: "approved",
+      status: "ok",
+    });
 }
 
 const redis = {
-  get: async (key: string) => _inMemoryCache.get(key) ?? null,
-  set: async (key: string, value: string) => { _inMemoryCache.set(key, value); return "OK"; },
+  get: async (key: string) => {
+    console.info(`[MCP] Interaction start: operation="cache.get" target="${key}" requestedAt="${new Date().toISOString()}"`);
+    try {
+      const result = _inMemoryCache.get(key) ?? null;
+      console.info(`[MCP] Interaction success: operation="cache.get" target="${key}" completedAt="${new Date().toISOString()}"`);
+      return result;
+    } catch (err) {
+      console.error(`[MCP] Interaction failed: operation="cache.get" target="${key}" failedAt="${new Date().toISOString()}" error="${err}"`);
+      throw err;
+    }
+  },
+  set: async (key: string, value: string) => {
+    console.info(`[MCP] Interaction start: operation="cache.set" target="${key}" requestedAt="${new Date().toISOString()}"`);
+    try {
+      _inMemoryCache.set(key, value);
+      console.info(`[MCP] Interaction success: operation="cache.set" target="${key}" completedAt="${new Date().toISOString()}"`);
+      return "OK";
+    } catch (err) {
+      console.error(`[MCP] Interaction failed: operation="cache.set" target="${key}" failedAt="${new Date().toISOString()}" error="${err}"`);
+      throw err;
+    }
+  },
   del: async (key: string) => {
     console.info(`[MCP] Interaction start: operation="cache.del" target="${key}" requestedAt="${new Date().toISOString()}"`);
     try {

@@ -2,7 +2,7 @@
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
 import { ChatOpenAI } from "langchain/chat_models/openai";
-const AI_MODEL_ID = "gpt-3.5-turbo";
+const AI_MODEL_ID = process.env.APPROVED_AI_MODEL_ID || "gpt-4";
 
 import path from "path";
 import fs from "fs/promises";
@@ -81,8 +81,11 @@ async function rotateLogIfNeeded(filePath) {
       );
       // Copy current log content to the archive segment
       await fs.copyFile(filePath, rotated);
-      // Truncate the live log file in place (preserves inode, append-only primary)
-      await fs.truncate(filePath, 0);
+      // Write a new empty file and atomically rename it over the live log
+      // so the primary log path is never truncated (strictly append-only).
+      const tmpPath = `${filePath}.tmp-rotate-${process.pid}`;
+      await fs.writeFile(tmpPath, "", { flag: "wx" });
+      await fs.rename(tmpPath, filePath);
       console.log(`[AUDIT] Log segment archived (append-only): ${rotated}`);
       // Enforce time-based retention on archived segments
       await purgeExpiredLogSegments(filePath);

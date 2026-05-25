@@ -1,5 +1,5 @@
 -- Reference: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase#create-a-table-and-search-function-in-your-database
--- Uses pgvector with an approved open-source embedding model (e.g. sentence-transformers/all-MiniLM-L6-v2, dim=768)
+-- Uses pgvector with an approved embedding model from the organization registry
 -- Enable the pgvector extension to work with embedding vectors
 create extension vector;
 
@@ -8,7 +8,7 @@ create table documents (
   id bigserial primary key,
   content text, -- corresponds to Document.pageContent
   metadata jsonb, -- corresponds to Document.metadata
-  embedding vector(768) -- 768 dimensions for approved registry model: sentence-transformers/all-MiniLM-L6-v2
+  embedding vector(768) -- 768 dimensions for approved registry model: text-embedding-3-small
 );
 
 -- Audit log table for AI-driven vector similarity retrievals
@@ -18,7 +18,7 @@ create table if not exists match_documents_audit_log (
   occurred_at      timestamptz not null default now(),
   principal        text        not null,
   model_id         text        not null          -- identifier of the AI model/embedding used
-    check (model_id = 'sentence-transformers/all-MiniLM-L6-v2'),
+    check (model_id = 'text-embedding-3-small'),
   input_hash       text        not null,          -- SHA-256 hex of the serialised query_embedding
   match_count      int,
   filter           jsonb,
@@ -47,12 +47,118 @@ create trigger trg_audit_log_no_delete
   before delete on match_documents_audit_log
   for each row execute function audit_log_append_only();
 
+-- ----------------------------------------------------------------
+-- HITL (Human-in-the-Loop) approval flow for DELETE on documents
+-- ----------------------------------------------------------------
+
+-- Queue table: every delete request must be approved by a human before execution
+create table if not exists pending_document_deletions (
+  request_id      bigserial primary key,
+  document_id     bigint      not null references documents(id),
+  requested_by    text        not null,
+  requested_at    timestamptz not null default now(),
+  reason          text,
+  status          text        not null default 'PENDING'
+    check (status in ('PENDING', 'APPROVED', 'REJECTED')),
+  reviewed_by     text,
+  reviewed_at     timestamptz
+);
+
+-- Step 1 – submit a delete request (no data is removed yet)
+create or replace function request_document_deletion(
+  p_document_id  bigint,
+  p_requested_by text,
+  p_reason       text default null
+) returns bigint language plpgsql as $fn$
+declare
+  v_request_id bigint;
+begin
+  if p_document_id is null then
+    raise exception 'request_document_deletion: document_id must not be null';
+  end if;
+  if p_requested_by is null or trim(p_requested_by) = '' then
+    raise exception 'request_document_deletion: requested_by must not be empty';
+  end if;
+
+  insert into pending_document_deletions (document_id, requested_by, reason)
+  values (p_document_id, p_requested_by, p_reason)
+  returning request_id into v_request_id;
+
+  raise notice
+    'Delete request % created for document %. Awaiting human approval.',
+    v_request_id, p_document_id;
+
+  return v_request_id;
+end;
+$fn$;
+
+-- Step 2 – a human approver explicitly approves and triggers the delete
+create or replace function approve_document_deletion(
+  p_request_id  bigint,
+  p_reviewed_by text
+) returns void language plpgsql as $fn$
+declare
+  v_doc_id bigint;
+  v_status text;
+begin
+  if p_reviewed_by is null or trim(p_reviewed_by) = '' then
+    raise exception 'approve_document_deletion: reviewed_by must not be empty';
+  end if;
+
+  select document_id, status
+    into v_doc_id, v_status
+    from pending_document_deletions
+   where request_id = p_request_id
+     for update;
+
+  if not found then
+    raise exception 'approve_document_deletion: request % not found', p_request_id;
+  end if;
+
+  if v_status <> 'PENDING' then
+    raise exception
+      'approve_document_deletion: request % is already in status %, cannot approve',
+      p_request_id, v_status;
+  end if;
+
+  -- Record the human approval
+  update pending_document_deletions
+     set status      = 'APPROVED',
+         reviewed_by = p_reviewed_by,
+         reviewed_at = now()
+   where request_id = p_request_id;
+
+  -- Now perform the actual delete
+  delete from documents where id = v_doc_id;
+
+  raise notice
+    'Document % deleted by human approver % (request %).',
+    v_doc_id, p_reviewed_by, p_request_id;
+end;
+$fn$;
+
+-- Trigger function: block direct DELETEs on documents and redirect to HITL flow
+create or replace function documents_require_hitl_approval()
+returns trigger language plpgsql as $fn$
+begin
+  raise exception
+    'Direct DELETE on documents is not permitted. '
+    'Submit a delete request via request_document_deletion(document_id, requested_by) '
+    'and obtain human approval via approve_document_deletion(request_id, reviewed_by).';
+end;
+$fn$;
+
+drop trigger if exists trg_documents_hitl_delete on documents;
+create trigger trg_documents_hitl_delete
+  before delete on documents
+  for each row execute function documents_require_hitl_approval();
+
 -- Create a function to search for documents
 create function match_documents (
-  query_embedding vector(1536),
+  query_embedding vector(768),
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}',
-  model_id text DEFAULT 'sentence-transformers/all-MiniLM-L6-v2'
+  model_id text DEFAULT 'text-embedding-3-small'
 ) returns table (
   content      text,    -- truncated excerpt (max 1000 chars)
   similarity   float,

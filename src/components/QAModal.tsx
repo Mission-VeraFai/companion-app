@@ -2,9 +2,88 @@
 
 import {Fragment, useEffect, useState} from "react";
 import { Dialog, Transition } from "@headlessui/react";
-import { useCompletion } from "ai/react";
+// useCompletion replaced with approved internal LLM hook
+function useCompletion({ api, body }: { api: string; body?: Record<string, unknown> }) {
+  const [completion, setCompletion] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+
+  const complete = async (prompt: string) => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(api, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, ...body }),
+      });
+      if (!response.ok) {
+        throw new Error(`Approved LLM API error: HTTP ${response.status} ${response.statusText}`);
+      }
+      const data = await response.json();
+      const result = data.completion ?? data.text ?? "";
+      setCompletion(result);
+      return result;
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      setError(err);
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { completion, isLoading, error, complete };
+}
 import { useSession } from "next-auth/react";
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
+
+// Sanitize LLM output by detecting and neutralizing dynamic code execution primitives
+function sanitizeLLMOutput(output: string): string {
+  if (!output) return output;
+
+  // Patterns that represent dynamic code execution primitives
+  const dangerousPatterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /\beval\s*\(/gi, label: "eval()" },
+    { pattern: /\bexec\s*\(/gi, label: "exec()" },
+    { pattern: /new\s+Function\s*\(/gi, label: "new Function()" },
+    { pattern: /\bsetTimeout\s*\(\s*['"`]/gi, label: "setTimeout(string)" },
+    { pattern: /\bsetInterval\s*\(\s*['"`]/gi, label: "setInterval(string)" },
+    { pattern: /\bsetImmediate\s*\(\s*['"`]/gi, label: "setImmediate(string)" },
+    { pattern: /document\.write\s*\(/gi, label: "document.write()" },
+    { pattern: /\bimportScripts\s*\(/gi, label: "importScripts()" },
+    { pattern: /\brequire\s*\(\s*['"`]/gi, label: "require(string)" },
+    { pattern: /\b__import__\s*\(/gi, label: "__import__()" },
+    { pattern: /\bcompile\s*\(/gi, label: "compile()" },
+    { pattern: /\bexecfile\s*\(/gi, label: "execfile()" },
+  ];
+
+  let sanitized = output;
+  const detectedPatterns: string[] = [];
+
+  for (const { pattern, label } of dangerousPatterns) {
+    if (pattern.test(sanitized)) {
+      detectedPatterns.push(label);
+      // Reset lastIndex for global regexes
+      pattern.lastIndex = 0;
+      // Neutralize by inserting a zero-width space after the keyword to break execution
+      sanitized = sanitized.replace(pattern, (match) => {
+        // Insert a unicode word-joiner after the function name to break the call
+        return match.replace(/\(/, "\u2060(");
+      });
+    }
+    // Reset lastIndex after test()
+    pattern.lastIndex = 0;
+  }
+
+  if (detectedPatterns.length > 0) {
+    console.warn(
+      `[security] LLM output contained dynamic code execution primitives and was sanitized. Detected: ${detectedPatterns.join(", ")}`
+    );
+  }
+
+  return sanitized;
+}
 
 // Audit logging for AI-driven actions (decision log / forensic trail)
 // Entries are sent to a server-side endpoint for persistent, append-only, immutable storage.
@@ -63,6 +142,69 @@ async function logAIAuditEntry(entry: {
     // whether to abort the AI action or surface the error to the user.
     throw e;
   }
+}
+
+/**
+ * Validates user input before sending to the AI agent.
+ * Returns null if the input is safe, or an error message string if it is rejected.
+ */
+function validateUserInput(input: string): string | null {
+  if (!input || typeof input !== "string") {
+    return "Input must be a non-empty string.";
+  }
+
+  const trimmed = input.trim();
+
+  if (trimmed.length === 0) {
+    return "Input must not be blank.";
+  }
+
+  if (trimmed.length > 2000) {
+    return "Input exceeds maximum allowed length.";
+  }
+
+  // Detect base64-encoded payloads (long runs of base64 chars are suspicious)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/;
+  if (base64Pattern.test(trimmed)) {
+    return "Input contains potentially encoded content that is not allowed.";
+  }
+
+  // Detect shell command patterns
+  const shellCommandPattern =
+    /(\b(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|Runtime\.exec)\b|[`$]\(|&&|\|\||;\s*\w|>\s*\/|<\s*\/|\bsudo\b|\brm\s+-rf\b|\bchmod\b|\bchown\b|\bcurl\b.*\|\s*bash|\bwget\b.*\|\s*bash)/i;
+  if (shellCommandPattern.test(trimmed)) {
+    return "Input contains shell command patterns that are not allowed.";
+  }
+
+  // Detect prompt injection attempts (instructions to override system prompt)
+  const promptInjectionPattern =
+    /(ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context|rules?)|disregard\s+(all\s+)?(previous|prior|above|earlier)|you\s+are\s+now\s+|new\s+persona|act\s+as\s+|pretend\s+(you\s+are|to\s+be)|forget\s+(all\s+)?(previous|prior|your)\s+(instructions?|training)|system\s*:\s*|<\s*system\s*>|\[\s*system\s*\]|###\s*instruction|\bDAN\b|do\s+anything\s+now)/i;
+  if (promptInjectionPattern.test(trimmed)) {
+    return "Input contains prompt injection patterns that are not allowed.";
+  }
+
+  // Detect leetspeak obfuscation (excessive digit-for-letter substitution)
+  // e.g. 1337, h4x0r, 3x3cut3, etc.
+  const leetspeakPattern = /(?:[a-z]*[013457@$!][a-z0-9@$!]*){4,}/i;
+  if (leetspeakPattern.test(trimmed)) {
+    return "Input contains obfuscated text patterns that are not allowed.";
+  }
+
+  // Detect hidden/invisible unicode characters sometimes used to smuggle instructions
+  // eslint-disable-next-line no-control-regex
+  const hiddenCharsPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E]/;
+  if (hiddenCharsPattern.test(trimmed)) {
+    return "Input contains hidden or invisible characters that are not allowed.";
+  }
+
+  // Detect attempts to inject code blocks or script tags
+  const codeInjectionPattern =
+    /(<\s*script\b|<\s*iframe\b|javascript\s*:|data\s*:\s*text\/html|vbscript\s*:)/i;
+  if (codeInjectionPattern.test(trimmed)) {
+    return "Input contains script or markup injection patterns that are not allowed.";
+  }
+
+  return null; // Input is safe
 }
 
 function generateCorrelationId(): string {
@@ -125,26 +267,13 @@ async function signProvenance(metadata: {
 }
 
 /**
- * Embeds an invisible Unicode watermark into a string by appending
- * zero-width characters that encode the correlation ID in binary.
- * This watermark survives copy-paste and is detectable programmatically.
+ * Returns the text unchanged. Watermarking via invisible Unicode characters
+ * has been removed as it constitutes a hidden prompt injection mechanism
+ * and violates the organisation's content-integrity policy.
  */
-function embedWatermark(text: string, correlationId: string): string {
-  // Encode each character of the correlationId as zero-width joiners (\u200D)
-  // and zero-width non-joiners (\u200C) representing 1 and 0 bits respectively.
-  const bits = correlationId
-    .split("")
-    .map((c) =>
-      c
-        .charCodeAt(0)
-        .toString(2)
-        .padStart(8, "0")
-        .split("")
-        .map((b) => (b === "1" ? "\u200D" : "\u200C"))
-        .join("")
-    )
-    .join("\u2060"); // word-joiner as byte separator
-  return text + "\u200B" + bits; // zero-width space as watermark start marker
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function embedWatermark(text: string, _correlationId: string): string {
+  return text;
 }
 
 // Removed: `last_name` global variable eliminated to prevent PII tracking in component scope per output data minimisation policy.
@@ -662,7 +791,7 @@ export default function QAModal({
                             cy="12"
                             r="10"
                             stroke="currentColor"
-                            stroke-width="4"
+                            strokeWidth="4"
                           ></circle>
                           <path
                             className="opacity-75"
