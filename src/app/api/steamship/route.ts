@@ -5,7 +5,7 @@ import { createHmac } from "crypto";
 // serverless function instances. Under any multi-instance or serverless deployment this
 // store is reset on every cold start and each instance maintains its own independent
 // counter, effectively disabling rate limiting. Replace with a shared, atomic store
-// (e.g. Redis via Upstash, Vercel KV, or a database) before deploying to production.
+// (e.g. a database) before deploying to production.
 const _rateLimitStore = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_MAX = 20;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -1113,7 +1113,31 @@ function logLlmInteraction(event: {
   console.log(JSON.stringify(entry));
 }
 
-function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
+/**
+ * Retention enforcement: validates AUDIT_RETENTION_DAYS is a positive integer
+ * and emits a structured retention-policy audit record at module load time so that
+ * log-management systems can apply the correct lifecycle rule.
+ */
+function enforceAuditRetention(): void {
+  const days = Number(AUDIT_RETENTION_DAYS);
+  if (!Number.isInteger(days) || days <= 0) {
+    throw new Error(
+      `AUDIT CONFIGURATION ERROR: AUDIT_RETENTION_DAYS must be a positive integer, got '${AUDIT_RETENTION_DAYS}'.`
+    );
+  }
+  const retentionRecord = {
+    timestamp: new Date().toISOString(),
+    event: "audit_retention_policy_enforced",
+    retentionDays: days,
+    principal: process.env.AI_AGENT_PRINCIPAL || "unknown",
+    policyVersion: process.env.AUDIT_POLICY_VERSION || "unset",
+  };
+  console.log(JSON.stringify(retentionRecord));
+}
+// Enforce retention policy at module load time
+enforceAuditRetention();
+
+function enforceApprovedAgentUrl(agentUrl: string, callerCorrelationId?: string): ApprovedModelRegistryEntry {
   // Explicit deny-list check: GPT/OpenAI models are disallowed per organization policy
   for (const pattern of DISALLOWED_MODEL_PATTERNS) {
     if (pattern.test(agentUrl)) {
@@ -1142,6 +1166,7 @@ function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
     const traceId = _auditRandomUUID();
     writeAuditRecord({
       traceId,
+      correlationId: callerCorrelationId ?? traceId,
       timestamp: new Date().toISOString(),
       principal: process.env.AI_AGENT_PRINCIPAL || "unknown",
       modelId: "unknown",
@@ -1149,7 +1174,7 @@ function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
       inputHash: hashInput(agentUrl),
       outputSummary: "BLOCKED: agentUrl not in approved registry",
       decision: "DENY",
-      retentionDays: AUDIT_RETENTION_DAYS,
+      retentionDays: Number(AUDIT_RETENTION_DAYS),
       eventDetail: "policy_violation_unapproved_agent_url",
     });
     throw new Error(
@@ -1190,7 +1215,7 @@ function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
   }
   return match;
 }' references a model (GPT/langchain/OpenAI) ` +
-        `that is NOT in the organization's approved model list and is explicitly prohibited.`
+        `that is NOT in the organization's approved model registry and is explicitly prohibited.`
       );
     }
   }
@@ -1205,7 +1230,70 @@ function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
   }
   return match;
 }
+  }
+
+  const match = registry.find((entry) => agentUrl.startsWith(entry.urlPrefix));
+  if (!match) {
+    throw new Error(
+      `POLICY VIOLATION: agentUrl '${agentUrl}' does not match any entry in the ` +
+      `organization-approved model registry. Only approved model endpoints may be invoked. ` +
+      `Approved prefixes: [${registry.map((e) => e.urlPrefix).join(", ")}]`
+    );
+  }
+  return match;
+}
+
+export async function POST(req: Request) {
+  try {
     const sanitizedErrorContext = sanitizeMcpResponseBlocks([{ event_detail: "upstream_agent_error" }])[0];
-    return returnError(500, "An internal error occurred. Please try again later.", sanitizedErrorContext);
+
+    // --- Synthetic Content Provenance, Labeling & Watermarking ---
+    // Attach provenance metadata required by policy for all AI-generated outputs.
+    const provenanceTimestamp = new Date().toISOString();
+    const provenanceModelId =
+      process.env.AI_AGENT_MODEL_ID ??
+      process.env.AI_AGENT_PRINCIPAL ??
+      "unknown-model";
+    const provenanceOriginTag = "steamship-ai-agent";
+    const syntheticContentLabel = "AI_GENERATED";
+
+    // Compute a lightweight HMAC-SHA-256 signature over the provenance fields
+    // so downstream consumers can verify authenticity.
+    let provenanceSignature = "unavailable";
+    try {
+      const signingKey = process.env.PROVENANCE_SIGNING_KEY ?? "default-insecure-key";
+      const encoder = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(signingKey),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+      );
+      const payload = `${provenanceModelId}|${provenanceTimestamp}|${provenanceOriginTag}|${syntheticContentLabel}`;
+      const sigBuffer = await crypto.subtle.sign("HMAC", keyMaterial, encoder.encode(payload));
+      provenanceSignature = Buffer.from(sigBuffer).toString("base64");
+    } catch (_sigErr) {
+      // Non-fatal: log and continue so the response is still returned.
+      console.error("[provenance] Failed to compute HMAC signature:", _sigErr);
+    }
+
+    // Merge provenance fields into the sanitized context block.
+    const provenanceContext = {
+      ...sanitizedErrorContext,
+      provenance: {
+        model_id: provenanceModelId,
+        timestamp: provenanceTimestamp,
+        origin_tag: provenanceOriginTag,
+        content_label: syntheticContentLabel,
+        signature: provenanceSignature,
+        watermark: `wm-${provenanceOriginTag}-${provenanceTimestamp}`,
+      },
+    };
+    // --- End Provenance Block ---
+
+    return returnError(500, "An internal error occurred. Please try again later.", provenanceContext);
+  } catch {
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }
