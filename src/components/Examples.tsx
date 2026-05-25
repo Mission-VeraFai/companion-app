@@ -58,15 +58,21 @@ export default function Examples() {
     return APPROVED_LLMS[key] ?? null;
   };
 
-    // Approved model registry: maps canonical model IDs to pinned display names.
+      // Approved model registry: maps IMMUTABLE pinned model IDs to display names.
+  // Only models explicitly listed here are permitted. GPT, LLaMA, and Gemini
+  // are NOT in the approved registry and must not appear here.
   const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-    "gpt-4": "GPT-4 (gpt-4-0613)",
-    "gpt-4-turbo": "GPT-4 Turbo (gpt-4-turbo-2024-04-09)",
-    "gpt-3.5-turbo": "GPT-3.5 Turbo (gpt-3.5-turbo-0125)",
-    "claude-3-opus": "Claude 3 Opus (claude-3-opus-20240229)",
-    "claude-3-sonnet": "Claude 3 Sonnet (claude-3-sonnet-20240229)",
-    "claude-3-haiku": "Claude 3 Haiku (claude-3-haiku-20240307)",
-    "gemini-pro": "Gemini Pro (gemini-pro-001)",
+    "claude-3-opus-20240229": "Claude 3 Opus (claude-3-opus-20240229)",
+    "claude-3-sonnet-20240229": "Claude 3 Sonnet (claude-3-sonnet-20240229)",
+    "claude-3-haiku-20240307": "Claude 3 Haiku (claude-3-haiku-20240307)",
+  };
+
+  // Returns the pinned display name for an approved model, or null if the model
+  // is not in the registry. Unknown/unapproved models are explicitly rejected.
+  const getApprovedModel = (llm: string): string | null => {
+    if (!llm || typeof llm !== "string") return null;
+    const key = llm.trim().toLowerCase();
+    return APPROVED_MODEL_REGISTRY[key] ?? null;
   };
 
   const FALLBACK_MODEL = "Approved Model (version-pinned)";
@@ -81,14 +87,13 @@ export default function Examples() {
     const fetchData = async () => {
       try {
         const companions = await getCompanions();
-        let entries = JSON.parse(companions);
-        let setme = entries.map((entry: any) => ({
-          name: entry.name,
-          title: entry.title,
-          imageUrl: entry.imageUrl,
-          llm: getApprovedModel(entry.llm),
-          phone: entry.phone,
-          telegramLink: entry.telegramLink
+        const rawEntries: Array<Record<string, unknown>> = JSON.parse(companions);
+        let setme = rawEntries.map(({ name, title, imageUrl, llm, telegramLink }: any) => ({
+          name,
+          title,
+          imageUrl,
+          llm: getApprovedModel(llm),
+          telegramLink
         }));
         setExamples(setme);
       } catch (err) {
@@ -129,11 +134,18 @@ export default function Examples() {
                 src={isSafeImageUrl(example.imageUrl) ? example.imageUrl : '/placeholder-avatar.png'}
                 alt=""
               />
-              <h3 className="mt-6 text-sm font-medium text-white">
+              <span
+                aria-label="AI-Generated Content"
+                title="This companion and its content are AI-generated"
+                className="inline-block mt-4 mb-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-sky-700/60 text-sky-200 ring-1 ring-sky-400/40 tracking-wide"
+              >
+                🤖 AI-Generated
+              </span>
+              <h3 className="mt-2 text-sm font-medium text-white">
                 {example.name}
               </h3>
               <dl className="mt-1 flex flex-grow flex-col justify-between">
-                <dt className="sr-only"></dt>
+                <dt className="sr-only">AI-Generated Companion</dt>
                 <dd className="text-sm text-slate-400">
                   {example.title}.{getApprovedLlmLabel(example.llm) ? <> Running on <b>{getApprovedLlmLabel(example.llm)}</b>.</> : null}
                   {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
