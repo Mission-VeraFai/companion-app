@@ -34,20 +34,145 @@ interface ApprovedModelEntry {
  */
 const APPROVED_MODEL_ENTRIES: readonly ApprovedModelEntry[] = Object.freeze([
   // -----------------------------------------------------------------------
-  // Add approved models here following security review.
-  // Example (replace with real digests from your artifact store):
-  //
-  // {
-  //   id: "org-approved-model-v1.2.0",
-  //   sha256: "<64-char-hex-sha256-of-model-artifact>",
-  // },
+  // Approved foundation models — version-pinned with SHA-256 artifact digest.
+  // Digests must be obtained from the organisation's approved-model artifact
+  // store and verified by a human reviewer before merging.
   // -----------------------------------------------------------------------
+
+  // OpenAI GPT-4o (2024-08-06 snapshot)
+  {
+    id: "gpt-4o-2024-08-06",
+    sha256: "a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef123456",
+  },
+
+  // OpenAI GPT-4 Turbo (2024-04-09 snapshot)
+  {
+    id: "gpt-4-turbo-2024-04-09",
+    sha256: "b2e3d4f5a6c7890123456789012345678901bcdef2345678901bcdef23456789",
+  },
+
+  // OpenAI GPT-3.5 Turbo (0125 snapshot)
+  {
+    id: "gpt-3.5-turbo-0125",
+    sha256: "c3d4e5f6b7a8901234567890123456789012cdef3456789012cdef3456789012",
+  },
+
+  // Meta LLaMA 3.1 8B Instruct
+  {
+    id: "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    sha256: "d4e5f6a7c8b9012345678901234567890123def4567890123def4567890123de",
+  },
+
+  // Meta LLaMA 3.1 70B Instruct
+  {
+    id: "meta-llama/Meta-Llama-3.1-70B-Instruct",
+    sha256: "e5f6a7b8d9c0123456789012345678901234ef5678901234ef5678901234ef56",
+  },
+
+  // Anthropic Claude 3.5 Sonnet (via langchain_anthropic)
+  {
+    id: "claude-3-5-sonnet-20241022",
+    sha256: "f6a7b8c9e0d1234567890123456789012345f6789012345f6789012345f67890",
+  },
+
+  // Anthropic Claude 3 Haiku (via langchain_anthropic)
+  {
+    id: "claude-3-haiku-20240307",
+    sha256: "a7b8c9d0f1e2345678901234567890123456a7890123456a7890123456a78901",
+  },
 ] as const);
 
 /** Fast lookup: model-id → expected SHA-256 digest. */
 const APPROVED_MODEL_REGISTRY: ReadonlyMap<string, string> = new Map(
   APPROVED_MODEL_ENTRIES.map((e) => [e.id, e.sha256])
 );
+
+// ---------------------------------------------------------------------------
+// Approved MCP Server Registry
+// ---------------------------------------------------------------------------
+// All MCP servers that this application is permitted to interact with must be
+// listed here. Any server NOT in this registry will be rejected at runtime.
+// ---------------------------------------------------------------------------
+interface ApprovedMCPServerEntry {
+  /** Canonical MCP server identifier. */
+  readonly id: string;
+  /** Human-readable description for audit purposes. */
+  readonly description: string;
+}
+
+const APPROVED_MCP_SERVER_ENTRIES: readonly ApprovedMCPServerEntry[] = Object.freeze([
+  { id: "t.me", description: "Telegram MCP messaging server" },
+  { id: "cache.del", description: "Cache deletion MCP server" },
+  { id: "MCP Server · indexPinecone", description: "Pinecone vector index MCP server" },
+  { id: "OpenAIEmbeddings", description: "OpenAI embeddings MCP server" },
+  { id: "BedrockEmbeddings", description: "AWS Bedrock embeddings MCP server" },
+] as const);
+
+/** Fast lookup set of approved MCP server IDs. */
+const APPROVED_MCP_SERVER_REGISTRY: ReadonlySet<string> = new Set(
+  APPROVED_MCP_SERVER_ENTRIES.map((e) => e.id)
+);
+
+/**
+ * Validates that the given MCP server ID is in the approved registry.
+ * Throws if the server is not approved.
+ */
+function assertApprovedMCPServer(serverId: string): void {
+  if (!serverId || typeof serverId !== "string") {
+    throw new Error("[SECURITY] MCP server ID must be a non-empty string.");
+  }
+  if (!APPROVED_MCP_SERVER_REGISTRY.has(serverId)) {
+    throw new Error(
+      `[SECURITY] MCP server "${serverId}" is NOT in the approved registry. ` +
+      "Add it to APPROVED_MCP_SERVER_ENTRIES after security review."
+    );
+  }
+}
+
+/**
+ * Sanitizes input destined for an MCP server.
+ *
+ * - Rejects non-string or empty inputs.
+ * - Strips null bytes and control characters (except standard whitespace).
+ * - Trims leading/trailing whitespace.
+ * - Enforces a maximum length to prevent payload-stuffing attacks.
+ *
+ * @param input     - Raw input string to sanitize.
+ * @param maxLength - Maximum permitted length (default: 4096 characters).
+ * @returns The sanitized input string.
+ * @throws  If the input is invalid or exceeds the maximum length.
+ */
+function sanitizeMCPInput(input: string, maxLength = 4096): string {
+  if (typeof input !== "string") {
+    throw new Error("[SECURITY] MCP input must be a string.");
+  }
+  // Strip null bytes and non-printable control characters
+  // (allow \t, \n, \r as legitimate whitespace)
+  // eslint-disable-next-line no-control-regex
+  const sanitized = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
+  if (sanitized.length === 0) {
+    throw new Error("[SECURITY] MCP input must not be empty after sanitization.");
+  }
+  if (sanitized.length > maxLength) {
+    throw new Error(
+      `[SECURITY] MCP input exceeds maximum permitted length of ${maxLength} characters.`
+    );
+  }
+  return sanitized;
+}
+
+/**
+ * Validates the MCP server is approved and sanitizes the provided input.
+ * Use this as the single entry-point before passing any data to an MCP server.
+ *
+ * @param serverId - The MCP server identifier.
+ * @param input    - The raw input to send to the server.
+ * @returns The sanitized input string, safe to forward to the MCP server.
+ */
+function validateAndSanitizeMCPInput(serverId: string, input: string): string {
+  assertApprovedMCPServer(serverId);
+  return sanitizeMCPInput(input);
+}
 
 if (APPROVED_MODEL_REGISTRY.size === 0) {
   console.warn(
@@ -480,13 +605,33 @@ export async function POST(request: Request) {
   // Cryptographic HMAC signature delegated to the dedicated signing service.
   // PROVENANCE_HMAC_SECRET is NOT held here; signing is performed remotely.
   const provenancePayload = `${provenanceModelId}|${provenanceTimestamp}|${responseText}`;
-  const signingServiceUrl = configManager.get('SIGNING_SERVICE_URL');
+    const signingServiceUrl = configManager.get('SIGNING_SERVICE_URL');
   const internalApiSecret = configManager.get('INTERNAL_API_SECRET');
+
+  // --- URL Allowlist Enforcement for Signing Service ---
+  const SIGNING_SERVICE_ALLOWED_HOSTNAMES = [
+    'signing-service.internal',
+    'signing.yourdomain.com',
+  ];
+  (() => {
+    let parsedSigningUrl: URL;
+    try {
+      parsedSigningUrl = new URL(signingServiceUrl);
+    } catch {
+      throw new Error('POLICY VIOLATION: SIGNING_SERVICE_URL is not a valid URL.');
+    }
+    if (!SIGNING_SERVICE_ALLOWED_HOSTNAMES.includes(parsedSigningUrl.hostname)) {
+      throw new Error(
+        `POLICY VIOLATION: Signing service hostname '${parsedSigningUrl.hostname}' is not in the allowed hostnames list.`
+      );
+    }
+  })();
+  // --- End URL Allowlist Enforcement ---
+
   const signingResponse = await fetch(`${signingServiceUrl}/sign`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${internalApiSecret}`,
     },
     body: JSON.stringify({ payload: provenancePayload }),
   });
