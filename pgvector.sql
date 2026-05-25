@@ -1,5 +1,5 @@
 -- Reference: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase#create-a-table-and-search-function-in-your-database
--- Visit Supabase blogpost for more: https://supabase.com/blog/openai-embeddings-postgres-vector
+-- Uses pgvector with an approved open-source embedding model (e.g. sentence-transformers/all-MiniLM-L6-v2, dim=768)
 -- Enable the pgvector extension to work with embedding vectors
 create extension vector;
 
@@ -8,7 +8,7 @@ create table documents (
   id bigserial primary key,
   content text, -- corresponds to Document.pageContent
   metadata jsonb, -- corresponds to Document.metadata
-  embedding vector(1536) -- 1536 works for OpenAI embeddings, change if needed
+  embedding vector(768) -- 768 dimensions for approved open-source embedding models (e.g. sentence-transformers/all-MiniLM-L6-v2)
 );
 
 -- Audit log table for AI-driven vector similarity retrievals
@@ -49,6 +49,18 @@ create trigger trg_audit_log_no_delete
 -- Create a function to search for documents
 create function match_documents (
   query_embedding vector(1536),
+  match_count int DEFAULT null,
+  filter jsonb DEFAULT '{}',
+  model_id text DEFAULT 'openai/text-embedding-ada-002'
+) returns table (
+  content      text,    -- truncated excerpt (max 1000 chars)
+  similarity   float,
+  -- Provenance / synthetic-origin metadata (policy: AI content labeling)
+  ai_generated boolean, -- always TRUE: content was retrieved via AI embedding similarity
+  model_identifier text, -- identifier of the embedding model used for retrieval
+  content_origin   text, -- tag indicating this row originates from a vector-similarity search
+  retrieved_at     timestamptz -- UTC timestamp of retrieval for audit trail
+),
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}'
 ) returns table (
@@ -110,16 +122,29 @@ begin
   -- ----------------------------------------------------------------
   -- Audit: record every invocation using sanitised values only
   -- ----------------------------------------------------------------
-  insert into match_documents_audit_log (principal, match_count, filter)
-  values (current_user, _safe_match_count, _safe_filter);
+  insert into match_documents_audit_log (
+    principal, model_id, input_hash, match_count, filter
+  )
+  values (
+    current_user,
+    model_id,
+    encode(sha256(query_embedding::text::bytea), 'hex'),
+    _safe_match_count,
+    _safe_filter
+  );
 
   -- ----------------------------------------------------------------
   -- Main query using sanitised inputs
   -- ----------------------------------------------------------------
   return query
   select
-    left(content, 1000) as content, -- truncate to 1000 chars to enforce output data minimisation
-    1 - (documents.embedding <=> query_embedding) as similarity
+    left(documents.content, 1000) as content, -- truncate to 1000 chars to enforce output data minimisation
+    1 - (documents.embedding <=> query_embedding) as similarity,
+    -- Provenance / synthetic-origin labels (policy: AI content labeling & watermarking)
+    true                                    as ai_generated,
+    model_id                                as model_identifier,
+    'vector-similarity-retrieval'           as content_origin,
+    now()                                   as retrieved_at
   from documents
   where metadata @> _safe_filter
   order by documents.embedding <=> query_embedding
