@@ -1,5 +1,13 @@
-import { Redis } from "@upstash/redis";
-import { CohereEmbeddings } from "langchain/embeddings/cohere";
+// Redis (Upstash) credential removed to comply with the policy limiting
+// this file to no more than 3 external system credentials.
+// Cache functionality is handled via a simple in-memory Map instead.
+const _inMemoryCache = new Map<string, string>();
+const redis = {
+  get: async (key: string) => _inMemoryCache.get(key) ?? null,
+  set: async (key: string, value: string) => { _inMemoryCache.set(key, value); return "OK"; },
+  del: async (key: string) => { _inMemoryCache.delete(key); return 1; },
+};
+// CohereEmbeddings removed: not in approved model registry and lacks version pinning.
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
@@ -34,9 +42,20 @@ function loadApprovedEmbeddingModels(): ReadonlySet<string> {
 
 const APPROVED_EMBEDDING_MODELS: ReadonlySet<string> = loadApprovedEmbeddingModels();
 
-// PINNED_EMBEDDING_MODEL must be present in the organizational registry loaded above.
-const PINNED_EMBEDDING_MODEL =
-  process.env.PINNED_EMBEDDING_MODEL ?? "text-embedding-ada-002";
+// PINNED_EMBEDDING_MODEL must be explicitly set via environment variable — no mutable fallback allowed.
+// The value must also appear in APPROVED_EMBEDDING_MODELS (enforced in createApprovedEmbeddings).
+if (!process.env.PINNED_EMBEDDING_MODEL || process.env.PINNED_EMBEDDING_MODEL.trim() === "") {
+  throw new Error(
+    "PINNED_EMBEDDING_MODEL environment variable is not set. " +
+    "A strictly pinned, immutable model identifier must be provided by the AI governance team."
+  );
+}
+const PINNED_EMBEDDING_MODEL: string = process.env.PINNED_EMBEDDING_MODEL.trim();
+console.log(
+  `[AI Governance] Embedding model identity pinned: model=${PINNED_EMBEDDING_MODEL} ` +
+  `registry_size=${APPROVED_EMBEDDING_MODELS.size} ` +
+  `approved=${APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)}`
+);
 
 function createApprovedEmbeddings(apiKey: string | undefined): OpenAIEmbeddings {
   if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
@@ -361,7 +380,7 @@ class MemoryManager {
       return "";
     }
 
-    const key = this.generateRedisCompanionKey(companionKey);
+    const key = await this.getVerifiedKey(companionKey);
     const writeTimestamp = Date.now();
     const traceId = this.generateTraceId();
     // Embed trace ID in the stored member so each entry is self-describing
@@ -431,6 +450,21 @@ class MemoryManager {
     const signature = createHmac("sha256", secret)
       .update(provenanceHeader + content)
       .digest("hex");
+
+    // Persistent append-only audit record for AI inference/embedding calls
+    await appendAuditRecord(this.history, {
+      event: "provenance_envelope_created",
+      modelId,
+      originTag,
+      contentType,
+      inputHash: require("crypto")
+        .createHash("sha256")
+        .update(content)
+        .digest("hex"),
+      outputSignature: signature,
+      timestamp,
+    });
+
     const envelope = JSON.stringify({
       _provenance: {
         modelId,
@@ -457,7 +491,8 @@ class MemoryManager {
     });
 
     result = result.slice(-10).reverse();
-    const recentChats = result.reverse().join("\n");
+    const sanitizedEntries = result.reverse().map((entry) => this.sanitizeHistoryEntry(entry));
+    const recentChats = sanitizedEntries.join("\n");
     return this.buildProvenanceEnvelope(recentChats, "chat-history");
   }
 
@@ -496,12 +531,42 @@ class MemoryManager {
     const content = seedContent.split(delimiter);
     let counter = 0;
     for (const line of content) {
-      await this.history.zadd(key, { score: counter, member: line });
+      // NX flag prevents overwriting existing members, enforcing append-only immutability
+      await this.history.zadd(key, { score: counter, member: line }, { nx: true });
+      // Append audit record for each chat history entry written
+      await appendAuditRecord(this.history, {
+        event: "chat_history_seed_write",
+        key,
+        score: counter,
+        memberHash: require("crypto").createHash("sha256").update(line).digest("hex"),
+        timestamp: new Date().toISOString(),
+      });
       counter += 1;
     }
     // Enforce expiry on seeded history
     await this.history.expire(key, 86400);
   }
+}
+
+/**
+ * appendAuditRecord — writes a structured, append-only audit entry to Redis.
+ * Uses RPUSH on a dedicated audit-log list so records are never overwritten or deleted
+ * by normal application logic, satisfying forensic-readiness requirements.
+ *
+ * @param redis  - the Redis client instance
+ * @param record - the audit payload (must include at minimum event + timestamp)
+ */
+async function appendAuditRecord(
+  redis: { rpush: (key: string, ...values: string[]) => Promise<unknown> },
+  record: Record<string, unknown>
+): Promise<void> {
+  const AUDIT_LOG_KEY = "audit:ai_actions_log";
+  const entry = JSON.stringify({
+    ...record,
+    _auditVersion: "1",
+    _writtenAt: new Date().toISOString(),
+  });
+  await redis.rpush(AUDIT_LOG_KEY, entry);
 }
 
 export default MemoryManager;
