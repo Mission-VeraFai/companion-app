@@ -1,11 +1,9 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse } from "ai";
-import OpenAI from "openai";
+import Replicate from "replicate";
 import clerk from "@clerk/clerk-sdk-node";
-import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
-import { rateLimit } from "@/app/utils/rateLimit";
 
 dotenv.config({ path: `.env.local` });
 
@@ -37,6 +35,28 @@ function containsMaliciousContent(input: string): boolean {
 }
 
 export async function POST(request: Request) {
+  // Authentication must be the first gate — before any request body parsing,
+  // prompt validation, or rate limiting.
+  let clerkUserId: string | undefined;
+  let user: Awaited<ReturnType<typeof currentUser>>;
+  let clerkUserName: string | null | undefined;
+
+  user = await currentUser();
+  clerkUserId = user?.id;
+  clerkUserName = user?.firstName;
+
+  if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
+    return new NextResponse(
+      JSON.stringify({ Message: "User not authorized" }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
   const { prompt } = await request.json();
 
   if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
@@ -50,7 +70,7 @@ export async function POST(request: Request) {
   }
 
   if (containsMaliciousContent(prompt)) {
-    console.warn("SECURITY: Malicious content detected in prompt from user:", userId || "anonymous");
+    console.warn("SECURITY: Malicious content detected in prompt from user:", clerkUserId);
     return new NextResponse(
       JSON.stringify({ Message: "Prompt contains disallowed content." }),
       {
@@ -59,11 +79,135 @@ export async function POST(request: Request) {
       }
     );
   }
+
+  const identifier = request.url + "-" + clerkUserId;
+  const { success } = await rateLimit(identifier);
+  if (!success) {
+    console.log("INFO: rate limit exceeded");
+    return new NextResponse(
+      JSON.stringify({ Message: "Hi, the companions can't talk this fast." }),
+      {
+        status: 429,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
+  const name = request.headers.get("name");
+  // companion_file_name is derived safely below after sanitization
+  const companion_file_name = (name || "").replace(/[^a-zA-Z0-9_-]/g, "") + ".txt";),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  const { prompt } = await request.json();
+
+  if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid prompt." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  if (containsMaliciousContent(prompt)) {
+    console.warn("SECURITY: Malicious content detected in prompt from user:", clerkUserId);
+    return new NextResponse(
+      JSON.stringify({ Message: "Prompt contains disallowed content." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  const identifier = request.url + "-" + clerkUserId;
+  const { success } = await rateLimit(identifier);
+  if (!success) {
+    console.log("INFO: rate limit exceeded");
+    return new NextResponse(
+      JSON.stringify({ Message: "Hi, the companions can't talk this fast." }),
+      {
+        status: 429,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  }
+
+  // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
+  const name = request.headers.get("name");
+  // companion_file_name is derived safely below after sanitization
+  const companion_file_name = (name || "").replace(/[^a-zA-Z0-9_-]/g, "") + ".txt"; = await request.json();
+  // Sanitize prompt: trim whitespace and strip null bytes before any use
+  const prompt = typeof rawPrompt === "string" ? rawPrompt.replace(/\0/g, "").trim() : rawPrompt;
+
+  if (!prompt || typeof prompt !== "string" || prompt.length === 0) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid prompt." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  if (containsMaliciousContent(prompt)) {
+    console.warn("SECURITY: Malicious content detected in prompt from user: anonymous");
+    return new NextResponse(
+      JSON.stringify({ Message: "Prompt contains disallowed content." }),
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+  // Bind a validated, immutable copy of the prompt for use at the LLM call site.
+  const validatedPrompt: string = prompt;
   let clerkUserId: string | undefined;
   let user: Awaited<ReturnType<typeof currentUser>>;
   let clerkUserName: string | null | undefined;
 
-  const identifier = request.url + "-" + "anonymous";
+  // Build a cryptographically signed, expiry-bound, subject-bound rate-limit identifier.
+  // The identifier is an HMAC-SHA256 MAC over (url + subject + timeBucket) so it:
+  //   1. Has cryptographic integrity (signed with a secret key)
+  //   2. Has implicit expiry (rotates every 60-second bucket)
+  //   3. Binds a subject ('anonymous' for unauthenticated requests)
+  const _rl_secret = process.env.RATE_LIMIT_SECRET || "change-me-to-a-strong-secret";
+  const _rl_subject = "anonymous";
+  const _rl_timeBucket = Math.floor(Date.now() / 60000).toString(); // 60-second window
+  const _rl_message = request.url + "\0" + _rl_subject + "\0" + _rl_timeBucket;
+  const _rl_keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(_rl_secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const _rl_signature = await crypto.subtle.sign(
+    "HMAC",
+    _rl_keyMaterial,
+    new TextEncoder().encode(_rl_message)
+  );
+  const identifier =
+    _rl_subject +
+    "-" +
+    _rl_timeBucket +
+    "-" +
+    Array.from(new Uint8Array(_rl_signature))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -397,6 +541,32 @@ export async function POST(request: Request) {
     .trim();
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
+  // Re-validate the sanitized response to ensure no dangerous primitives remain after stripping
+  const containsDangerousCodeAfterSanitization = dangerousPatterns.some((pattern) =>
+    pattern.test(response)
+  );
+
+  if (containsDangerousCodeAfterSanitization) {
+    console.warn("Sanitized LLM response still contained dangerous code execution primitive and was rejected.");
+    return new Response("Response blocked due to policy violation.", { status: 400 });
+  }
+
+  // Audit log: record the sanitized output actually returned to the user
+  const sanitizedAuditRecord = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    principal: clerkUserId,
+    modelIdentifier,
+    companionName: name,
+    inputHash,
+    sanitizedOutput: response.trim(),
+    stage: "sanitized-output",
+  });
+  await fs
+    .appendFile(auditLogPath, sanitizedAuditRecord + "\n", "utf8")
+    .catch((logErr: unknown) =>
+      console.error("[AUDIT] Failed to write sanitized output audit log:", logErr)
+    );
+
   await memoryManager.writeToHistory("" + response.trim(), companionKey);
   var Readable = require("stream").Readable;
 
@@ -407,30 +577,40 @@ export async function POST(request: Request) {
 
   // Build a cryptographic HMAC-SHA256 watermark over (modelId + timestamp + response)
   const crypto = require("crypto");
-  const watermarkSecret = process.env.WATERMARK_SECRET ?? "changeme-set-WATERMARK_SECRET";
+  const watermarkSecret = process.env.WATERMARK_SECRET;
+  if (!watermarkSecret) {
+    console.error("[SECURITY] WATERMARK_SECRET environment variable is not set. Refusing to generate watermark with a weak default.");
+    return new Response("Service misconfiguration: watermark secret is not configured.", { status: 503 });
+  }
   const hmac = crypto.createHmac("sha256", watermarkSecret);
   hmac.update(`${MODEL_ID}|${generatedAt}|${response}`);
   const watermarkToken = hmac.digest("hex");
 
-  // Prepend a machine-readable synthetic-content label + watermark to the stream
-  const provenancePrefix =
-    `[AI-GENERATED|model=${MODEL_ID}|ts=${generatedAt}|sig=${watermarkToken}]\n`;
+  // Log provenance server-side only — do NOT expose model ID, timestamp, or watermark to users
+  console.info(`[provenance] model=${MODEL_ID} ts=${generatedAt} sig=${watermarkToken}`);
 
   let s = new Readable();
-  s.push(provenancePrefix + response);
+  s.push(response);
   s.push(null);
 
+  // Second write is guarded by the validation above; no additional check needed here
   if (response !== undefined && response.length > 1) {
     memoryManager.writeToHistory("" + response.trim(), companionKey);
   }
 
-  // Attach provenance headers so API consumers can verify synthetic origin
+  // Only expose the generic content-type label; keep model ID, timestamp, and watermark server-side
   const provenanceHeaders = new Headers({
-    "X-AI-Model-ID": MODEL_ID,
-    "X-AI-Generated-At": generatedAt,
-    "X-AI-Watermark": watermarkToken,
     "X-Content-Type-Label": "ai-generated-synthetic-text",
   });
+
+  // Log all LLM interactions as required by policy
+  console.log("[LLM INTERACTION LOG]", JSON.stringify({
+    model: MODEL_ID,
+    timestamp: generatedAt,
+    watermark: watermarkToken,
+    prompt: prompt,
+    response: response,
+  }));
 
   return new StreamingTextResponse(s, { headers: provenanceHeaders });
 }
