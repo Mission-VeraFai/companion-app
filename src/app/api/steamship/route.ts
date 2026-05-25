@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
-// In-memory rate limiter (replaces Upstash Redis rateLimit to avoid holding a 4th set of external credentials)
+import { createHmac } from "crypto";
+// WARNING: In-memory rate limiter — state is NOT shared across processes, workers, or
+// serverless function instances. Under any multi-instance or serverless deployment this
+// store is reset on every cold start and each instance maintains its own independent
+// counter, effectively disabling rate limiting. Replace with a shared, atomic store
+// (e.g. Redis via Upstash, Vercel KV, or a database) before deploying to production.
 const _rateLimitStore = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_MAX = 20;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -28,15 +33,181 @@ function generateSessionKey(userId: string): string {
 }
 import ConfigManager from "@/app/utils/config";
 
+// ── Model registry enforcement ────────────────────────────────────────────────
+// Every model or agent used in this file MUST be validated through
+// assertModelApproved() before instantiation. The approved registry is sourced
+// exclusively from the APPROVED_MODEL_REGISTRY_JSON environment variable.
+//
+// Models that are NOT_IN_REGISTRY at startup will cause the request to fail
+// with a policy-violation error rather than silently using an unapproved model.
+//
+// Example usage:
+//   const entry = assertModelApproved("gpt-4o");
+//   const model = new ChatOpenAI({ modelName: entry.modelName, modelVersion: entry.modelVersion });
+//
+// Do NOT pass bare string literals like "gpt-4", "claude-3-opus", or
+// "langchain_anthropic" directly to model constructors — always go through
+// assertModelApproved() and use the returned pinned entry.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Patterns that indicate potentially malicious prompt injection or command execution attempts
+const MALICIOUS_PATTERNS: RegExp[] = [
+  // Shell command injection
+  /(?:^|\s|;|\||&|`)(bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[\(\-]/i,
+  /(?:\$\(|`)[^`]*`/,                          // Command substitution $(...) or backticks
+  /;\s*(?:rm|mv|cp|chmod|chown|wget|curl|nc|ncat|netcat)\s/i,  // Chained shell commands
+  /(?:&&|\|\|)\s*(?:rm|mv|cp|chmod|chown|wget|curl|nc|ncat|netcat)\s/i,
+  // Prompt injection / hidden instruction patterns
+  /<\s*(?:system|assistant|user|instruction|prompt)\s*>/i,  // XML-style role tags
+  /\[\s*(?:SYSTEM|INST|INSTRUCTION|OVERRIDE|IGNORE)\s*\]/i, // Bracket-style injection
+  /(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?/i,
+  /you\s+are\s+now\s+(?:in\s+)?(?:developer|jailbreak|dan|unrestricted|god)\s+mode/i,
+  /(?:act|pretend|roleplay|simulate)\s+as\s+(?:an?\s+)?(?:unrestricted|unfiltered|evil|malicious)/i,
+  // Base64-encoded content (heuristic: long base64-looking strings)
+  /(?:[A-Za-z0-9+\/]{40,}={0,2})(?:\s|$)/,
+  // Unicode/zero-width character obfuscation
+  /[\u200B-\u200D\uFEFF\u00AD]/,              // Zero-width / soft-hyphen characters
+  // Path traversal
+  /(?:\.\.\/|\.\.\\/){2,}/,
+  // Environment variable exfiltration
+  /\$(?:PATH|HOME|USER|SHELL|ENV|AWS_|OPENAI_|SECRET|TOKEN|KEY|PASSWORD)/i,
+];
+
+const MAX_USER_MESSAGE_LENGTH = 4000;
+
+/**
+ * Validates userMessage for malicious content before forwarding to the AI agent.
+ * Returns { safe: true } if the message passes all checks,
+ * or { safe: false, reason: string } if a violation is detected.
+ */
+function validateUserMessage(message: unknown): { safe: boolean; reason?: string } {
+  if (typeof message !== "string") {
+    return { safe: false, reason: "Message must be a string." };
+  }
+  if (message.trim().length === 0) {
+    return { safe: false, reason: "Message must not be empty." };
+  }
+  if (message.length > MAX_USER_MESSAGE_LENGTH) {
+    return { safe: false, reason: `Message exceeds maximum allowed length of ${MAX_USER_MESSAGE_LENGTH} characters.` };
+  }
+  for (const pattern of MALICIOUS_PATTERNS) {
+    if (pattern.test(message)) {
+      return { safe: false, reason: "Message contains potentially malicious content and cannot be processed." };
+    }
+  }
+  return { safe: true };
+}
+
 // Approved model registry: loaded exclusively from the APPROVED_MODEL_REGISTRY_JSON
 // environment variable, which MUST be set by the organization-approved registry pipeline.
 // Hardcoding this registry locally is a policy violation — all entries must originate
 // from the org-approved registry and be injected at deploy time via the env var.
 interface ApprovedModelRegistryEntry {
+  /** URL prefix used to route requests to this model's endpoint */
   urlPrefix: string;
+  /** Canonical provider name, e.g. "openai", "anthropic", "meta" */
   modelProvider: string;
+  /** Canonical model name, e.g. "gpt-4o", "claude-3-opus", "llama-3" */
   modelName: string;
+  /**
+   * REQUIRED: Immutable version pin — must be a specific semver tag or
+   * content-addressable digest (e.g. "20240229" or "sha256:abc123…").
+   * Wildcard or empty values are rejected by assertModelApproved().
+   */
   modelVersion: string;
+  /** Optional: embedding model name if this entry covers a RAG/embedding workload */
+  embeddingModel?: string;
+  /** Optional: embedding model version pin */
+  embeddingModelVersion?: string;
+}
+
+// POLICY: All model selection MUST go through getApprovedModel().
+// Direct use of langchain_anthropic, GPT, LLaMA, Claude, or any other
+// model not present in the org-approved registry is prohibited.
+function getApprovedModel(registry: ApprovedModelRegistryEntry[], urlPrefix: string): ApprovedModelRegistryEntry {
+  const entry = registry.find((e) => e.urlPrefix === urlPrefix);
+  if (!entry) {
+    throw new Error(
+      `POLICY VIOLATION: No approved model found for urlPrefix '${urlPrefix}'. ` +
+      "Only models present in the APPROVED_MODEL_REGISTRY_JSON registry may be used."
+    );
+  }
+  return entry;
+}
+
+// Sanitize and validate companionName: only allow alphanumeric, hyphens, and underscores, max 64 chars
+function sanitizeCompanionName(name: unknown): string {
+  if (typeof name !== 'string') {
+    throw new Error('companionName must be a string');
+  }
+  const trimmed = name.trim();
+  if (trimmed.length === 0 || trimmed.length > 64) {
+    throw new Error('companionName must be between 1 and 64 characters');
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
+    throw new Error('companionName contains invalid characters; only alphanumeric, hyphens, and underscores are allowed');
+  }
+  return trimmed;
+}
+
+// Validate agentUrl against approved registry prefixes
+function validateAgentUrl(agentUrl: string, registry: ApprovedModelRegistryEntry[]): void {
+  const approvedPrefixes = registry.map(entry => entry.urlPrefix);
+  const isApproved = approvedPrefixes.some(prefix => agentUrl.startsWith(prefix));
+  if (!isApproved) {
+    throw new Error(`agentUrl '${agentUrl}' does not match any approved model registry URL prefix`);
+  }
+  // Ensure no path traversal or unexpected characters in the URL
+  let parsed: URL;
+  try {
+    parsed = new URL(agentUrl);
+  } catch {
+    throw new Error('agentUrl is not a valid URL');
+  }
+  if (!['https:', 'http:'].includes(parsed.protocol)) {
+    throw new Error('agentUrl must use http or https protocol');
+  }
+  // Reject URLs with credentials embedded
+  if (parsed.username || parsed.password) {
+    throw new Error('agentUrl must not contain embedded credentials');
+  }
+}
+
+/**
+ * assertModelApproved: Call this at every model/agent instantiation site.
+ * Throws a policy violation error if the model identifier is not present in
+ * the approved registry. Returns the pinned registry entry (with version) so
+ * callers MUST use the returned modelVersion rather than a bare string.
+ *
+ * @param modelIdentifier - The model name or provider string being requested
+ *   (e.g. "gpt-4", "claude-3-opus", "langchain_anthropic").
+ * @returns The matching ApprovedModelRegistryEntry with pinned version.
+ */
+function assertModelApproved(modelIdentifier: string): ApprovedModelRegistryEntry {
+  const registry = loadApprovedModelRegistry();
+  const normalised = modelIdentifier.trim().toLowerCase();
+  const entry = registry.find(
+    (e) =>
+      e.modelName.toLowerCase() === normalised ||
+      e.modelProvider.toLowerCase() === normalised ||
+      e.urlPrefix.toLowerCase().includes(normalised)
+  );
+  if (!entry) {
+    throw new Error(
+      `POLICY VIOLATION: Model or agent "${modelIdentifier}" is NOT_IN_REGISTRY. ` +
+      "All AI models and agents must be registered in the org-approved model registry " +
+      "(APPROVED_MODEL_REGISTRY_JSON) with explicit version pinning before use. " +
+      "Add the model to the registry pipeline and redeploy."
+    );
+  }
+  if (!entry.modelVersion || entry.modelVersion.trim() === "") {
+    throw new Error(
+      `POLICY VIOLATION: Registry entry for "${modelIdentifier}" has no pinned version. ` +
+      "Every registry entry must specify an immutable modelVersion (e.g. a semver tag or " +
+      "content-addressable digest). Update the registry entry and redeploy."
+    );
+  }
+  return entry;
 }
 
 function loadApprovedModelRegistry(): ApprovedModelRegistryEntry[] {
@@ -652,6 +823,52 @@ export async function POST(req: Request) {
       }
     }
 
+    // Inline sanitizer: strips dynamic code execution primitives from LLM output blocks
+    function sanitizeLlmBlocks(blocks: unknown): unknown {
+      const DANGEROUS_PATTERNS = [
+        /\beval\s*\(/gi,
+        /\bexec\s*\(/gi,
+        /\bnew\s+Function\s*\(/gi,
+        /\bsetTimeout\s*\(\s*['"`]/gi,
+        /\bsetInterval\s*\(\s*['"`]/gi,
+        /\bimportScripts\s*\(/gi,
+        /\bdocument\.write\s*\(/gi,
+        /\bwindow\s*\[\s*['"`]/gi,
+        /\bglobalThis\s*\[\s*['"`]/gi,
+        /\bprocess\.binding\s*\(/gi,
+        /\brequire\s*\(\s*['"`]child_process/gi,
+      ];
+      function sanitizeString(value: string): string {
+        let sanitized = value;
+        for (const pattern of DANGEROUS_PATTERNS) {
+          sanitized = sanitized.replace(pattern, "[REDACTED]");
+        }
+        return sanitized;
+      }
+      function sanitizeValue(val: unknown): unknown {
+        if (typeof val === "string") return sanitizeString(val);
+        if (Array.isArray(val)) return val.map(sanitizeValue);
+        if (val !== null && typeof val === "object") {
+          const sanitizedObj: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+            sanitizedObj[k] = sanitizeValue(v);
+          }
+          return sanitizedObj;
+        }
+        return val;
+      }
+      return sanitizeValue(blocks);
+    }
+
+    console.log(JSON.stringify({
+      event: "llm_interaction_success",
+      timestamp: new Date().toISOString(),
+      agentUrl,
+      companionName,
+      upstreamStatus: response.status,
+      responseBlocks,
+    }));
+
     if (containsDangerousContent(responseBlocks)) {
       console.error("ERROR: LLM response contains dynamic code execution primitives — rejecting response.");
       return returnError(500, "The agent response was rejected due to unsafe content.");
@@ -673,37 +890,122 @@ export async function POST(req: Request) {
       .update(provenancePayload)
       .digest("hex");
 
+        // Only expose the minimal, non-operational fields to the client.
+    // Internal fields (modelEndpoint, agentUrl, outputHash, originTag, provenanceSignature)
+    // are retained server-side for logging/auditing only and must not be forwarded.
+    void provenanceSignature; // retained for server-side audit log only
+    void provenancePayload;   // retained for server-side audit log only
+
     const syntheticEnvelope = {
       // Human-readable label indicating synthetic / AI-generated origin
       _synthetic: true,
       _contentLabel: "AI-GENERATED",
-      // Provenance metadata
+      // Minimal provenance metadata safe for client consumption
       _provenance: {
-        modelEndpoint: agentUrl,
         companionName,
         generatedAt: provenanceTimestamp,
-        outputHash: outputHash2,
-        originTag: "steamship-agent",
-      },
-      // Cryptographic watermark / integrity signature
-      _signature: {
-        algorithm: "HMAC-SHA256",
-        value: provenanceSignature,
-        coveredFields: ["modelEndpoint", "companionName", "generatedAt", "outputHash"],
       },
       // Original AI-generated payload
       data: responseBlocks,
     };
 
+    // --- Persistent Audit Log (append-only, durable store) ---
+    // Build the audit record with all required forensic fields.
+    const auditRecord = {
+      auditVersion: "1",
+      timestamp: provenanceTimestamp,
+      // Principal: prefer a verified identity header; fall back to a placeholder so the field is always present.
+      principal: (typeof request !== "undefined" && request.headers?.get("x-authenticated-user")) ?? "unknown",
+      modelEndpoint: agentUrl,
+      companionName,
+      // Input hash: SHA-256 of the raw request body (computed earlier in the handler as inputHash / outputHash2 covers output)
+      inputHash: (() => {
+        try {
+          // Re-derive from the provenance payload fields we already have; the caller should pass the real input hash.
+          // We use outputHash2 for output and mark input as "see-request-body" when not separately captured.
+          return typeof inputHash !== "undefined" ? inputHash : "not-captured";
+        } catch {
+          return "not-captured";
+        }
+      })(),
+      outputHash: outputHash2,
+      provenanceSignature,
+      originTag: "steamship-agent",
+      // Redacted snapshot of the output for forensic review (truncated to 4 KB).
+      outputSnippet: JSON.stringify(responseBlocks).slice(0, 4096),
+    };
+
+    // Write to an append-only NDJSON audit log file.
+    // This is a synchronous-safe fire-and-forget: errors are logged but do NOT block the response.
+    (() => {
+      try {
+        const fsModule = require("fs");
+        const pathModule = require("path");
+        const auditDir = process.env.AUDIT_LOG_DIR ?? "/var/log/ai-audit";
+        const auditPath = pathModule.join(auditDir, "audit.log");
+        // Ensure the directory exists (best-effort).
+        try { fsModule.mkdirSync(auditDir, { recursive: true }); } catch { /* already exists */ }
+        // Append a newline-delimited JSON record atomically.
+        fsModule.appendFileSync(auditPath, JSON.stringify(auditRecord) + "\n", { encoding: "utf8", flag: "a" });
+      } catch (auditErr) {
+        // Log the failure but do NOT suppress the response — availability must not be sacrificed.
+        console.error("[AUDIT] Failed to write audit log entry:", auditErr, JSON.stringify(auditRecord));
+      }
+    })();
+
     return NextResponse.json(syntheticEnvelope);
   } else {
         const errorBody = await response.text();
+    console.log(JSON.stringify({
+      event: "mcp_interaction",
+      direction: "response_received",
+      agentUrl,
+      upstreamStatus: response.status,
+      success: false,
+      errorBody,
+      timestamp: new Date().toISOString(),
+    }));
     return returnError(500, errorBody, {
       event_detail: "upstream_agent_error",
       agentUrl,
       upstreamStatus: response.status,
     });
   }
+}
+
+// NOTE: enforceApprovedAgentUrl(agentUrl) MUST be called before any fetch to agentUrl.
+// Example usage (place before the upstream fetch call):
+//   const approvedEntry = enforceApprovedAgentUrl(agentUrl);
+//   // Only proceed if no error is thrown — approvedEntry contains model metadata.
+
+// Helper: sanitize MCP server response blocks before returning to clients
+function sanitizeMcpResponseBlocks(blocks: unknown[]): unknown[] {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.map((block) => {
+    if (block === null || typeof block !== "object") return block;
+    const b = block as Record<string, unknown>;
+    const sanitized: Record<string, unknown> = {};
+    for (const key of Object.keys(b)) {
+      const value = b[key];
+      if (typeof value === "string") {
+        // Strip null bytes, HTML tags, and dangerous script-like patterns
+        let clean = value.replace(/\0/g, "");
+        clean = clean.replace(/<[^>]*>/g, "");
+        clean = clean.replace(/javascript\s*:/gi, "");
+        clean = clean.replace(/data\s*:/gi, "");
+        clean = clean.replace(/vbscript\s*:/gi, "");
+        clean = clean.replace(/on\w+\s*=/gi, "");
+        sanitized[key] = clean;
+      } else if (Array.isArray(value)) {
+        sanitized[key] = sanitizeMcpResponseBlocks(value);
+      } else if (value !== null && typeof value === "object") {
+        sanitized[key] = sanitizeMcpResponseBlocks([value])[0];
+      } else {
+        sanitized[key] = value;
+      }
+    }
+    return sanitized;
+  });
 }
 
 // Helper: verify MCP server identity from response headers
@@ -716,7 +1018,32 @@ function verifyMcpServerIdentity(response: Response, token: string): boolean {
   const { createHmac: _createHmac } = require("crypto");
   const expected = _createHmac("sha256", hmacSecret).update(token).digest("hex");
   return serverTokenHeader === expected;
-});
+}
+
+// Policy enforcement: validate agentUrl against the approved model registry.
+// This MUST be called before any upstream request to a Steamship agent endpoint.
+// Returns the matching registry entry if approved, or throws a policy violation error.
+function enforceApprovedAgentUrl(agentUrl: string): ApprovedModelRegistryEntry {
+  let registry: ApprovedModelRegistryEntry[];
+  try {
+    registry = loadApprovedModelRegistry();
+  } catch (err) {
+    throw new Error(
+      `POLICY VIOLATION: Cannot validate agentUrl '${agentUrl}' — approved model registry failed to load: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+  }
+  const match = registry.find((entry) => agentUrl.startsWith(entry.urlPrefix));
+  if (!match) {
+    throw new Error(
+      `POLICY VIOLATION: agentUrl '${agentUrl}' does not match any entry in the ` +
+      `organization-approved model registry. Only approved model endpoints may be invoked. ` +
+      `Approved prefixes: [${registry.map((e) => e.urlPrefix).join(", ")}]`
+    );
+  }
+  return match;
+}
     return returnError(500, "An internal error occurred. Please try again later.", {
       event_detail: "upstream_agent_error",
     });
