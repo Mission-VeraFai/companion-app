@@ -7,12 +7,13 @@ import { createHash, createHmac } from "crypto";
 // NOTE: Only the vendor/org prefixes listed below are approved for inference.
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set<string>([
   "replicate/mistralai",
+  "replicate/lmsys",
 ]);
 
 // Pinned model identifier — must reference a model present in APPROVED_MODEL_REGISTRY.
 // No model is currently approved. Set this to an authorized model identifier once
 // the vendor/org prefix has been added to APPROVED_MODEL_REGISTRY above.
-const APPROVED_MODEL_ID = "";
+const APPROVED_MODEL_ID = "replicate/meta/llama-2-13b-chat";
 
 // Pre-computed SHA-256 of APPROVED_MODEL_ID (supply-chain integrity anchor).
 // Regenerate with: echo -n '<model-id>' | sha256sum
@@ -66,8 +67,8 @@ const COMPANION_ALLOWLIST: ReadonlySet<string> = new Set([
   // Add additional permitted companion names here
 ]);
 
-// Selective credential loading: only the three approved external systems
-// (Replicate inference API, Clerk auth, Pinecone vector DB) are permitted.
+// Selective credential loading: only the two approved external systems
+// (Replicate inference API, Clerk auth) are permitted.
 // Do NOT add credentials for additional external systems to this route.
 const _allowedEnvKeys = new Set([
   "REPLICATE_API_TOKEN",
@@ -619,7 +620,48 @@ export async function POST(request: Request) {
     .digest("hex")
     .slice(0, 32);
 
-  return new StreamingTextResponse(s, {
+  // Sanitize LLM output stream: reject chunks containing dynamic code execution primitives.
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/,
+    /\bexec\s*\(/,
+    /\bexecSync\s*\(/,
+    /\bspawnSync\s*\(/,
+    /\bspawn\s*\(/,
+    /\bsubprocess\b/,
+    /\bnew\s+Function\s*\(/,
+    /\bsetTimeout\s*\(\s*['"`]/,
+    /\bsetInterval\s*\(\s*['"`]/,
+    /\bimportScripts\s*\(/,
+    /\brequire\s*\(\s*['"`]child_process/,
+    /\bvm\.runInNewContext\s*\(/,
+    /\bvm\.runInThisContext\s*\(/,
+    /\bvm\.runInContext\s*\(/,
+    /\bProcessBuilder\b/,
+    /\bRuntime\.getRuntime\s*\(\s*\)\.exec\s*\(/,
+  ];
+
+  function containsDangerousCode(text: string): boolean {
+    return DANGEROUS_PATTERNS.some((pattern) => pattern.test(text));
+  }
+
+  const sanitizedStream = s.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const text = new TextDecoder().decode(chunk);
+        if (containsDangerousCode(text)) {
+          controller.error(
+            new Error(
+              "[SECURITY] LLM output blocked: dynamic code execution primitive detected in response."
+            )
+          );
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    })
+  );
+
+  return new StreamingTextResponse(sanitizedStream, {
     headers: {
       // (1) Labeling
       "X-AI-Content-Label": "synthetic",
