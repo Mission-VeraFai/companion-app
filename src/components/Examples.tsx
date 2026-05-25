@@ -45,34 +45,18 @@ export default function Examples() {
     },
   ]);
 
-  const APPROVED_LLMS: Record<string, string> = {
-    "claude-3-opus": "Claude 3 Opus",
-    "claude-3-sonnet": "Claude 3 Sonnet",
-    "claude-3-haiku": "Claude 3 Haiku",
-    "claude-2": "Claude 2",
-    "claude-instant": "Claude Instant",
-  };
+    const FALLBACK_MODEL = "Approved Model (version-pinned)";
 
-  const getApprovedLlmLabel = (llm: string): string | null => {
-    const key = (llm || "").toLowerCase().trim();
-    return APPROVED_LLMS[key] ?? null;
-  };
+  // Approved model registry: maps IMMUTABLE pinned model IDs to display names.
+  // Only models explicitly listed here are permitted.
+  const APPROVED_MODEL_REGISTRY: Record<string, string> = {};
 
-      // Approved model registry: maps IMMUTABLE pinned model IDs to display names.
-  // Only models explicitly listed here are permitted. GPT, LLaMA, and Gemini
-  // are NOT in the approved registry and must not appear here.
-  const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-    "claude-3-opus-20240229": "Claude 3 Opus (claude-3-opus-20240229)",
-    "claude-3-sonnet-20240229": "Claude 3 Sonnet (claude-3-sonnet-20240229)",
-    "claude-3-haiku-20240307": "Claude 3 Haiku (claude-3-haiku-20240307)",
-  };
-
-  // Returns the pinned display name for an approved model, or null if the model
-  // is not in the registry. Unknown/unapproved models are explicitly rejected.
-  const getApprovedModel = (llm: string): string | null => {
-    if (!llm || typeof llm !== "string") return null;
+  // Returns the pinned display name for an approved model, or FALLBACK_MODEL if
+  // the model is not in the registry. Unknown/unapproved models are rejected.
+  const getApprovedModel = (llm: string): string => {
+    if (!llm || typeof llm !== "string") return FALLBACK_MODEL;
     const key = llm.trim().toLowerCase();
-    return APPROVED_MODEL_REGISTRY[key] ?? null;
+    return APPROVED_MODEL_REGISTRY[key] ?? FALLBACK_MODEL;
   };
 
   const FALLBACK_MODEL = "Approved Model (version-pinned)";
@@ -87,13 +71,64 @@ export default function Examples() {
     const fetchData = async () => {
       try {
         const companions = await getCompanions();
+        // Sanitize text fields before they reach the AI prompt.
+        const PROMPT_INJECTION_PATTERNS: RegExp[] = [
+          // Hidden/system prompt injection attempts
+          /ignore\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)/i,
+          /system\s*prompt/i,
+          /you\s+are\s+(now|a|an)\s+/i,
+          /act\s+as\s+(a|an)?\s+/i,
+          /pretend\s+(you\s+are|to\s+be)/i,
+          /jailbreak/i,
+          /DAN\b/,
+          // Base64 encoded content (long base64 strings are suspicious)
+          /[A-Za-z0-9+/]{40,}={0,2}/,
+          // Shell commands
+          /[`$]\s*\(/,
+          /;\s*(rm|ls|cat|curl|wget|bash|sh|python|node|exec)\b/i,
+          /\|\s*(bash|sh|python|node|curl|wget)/i,
+          // Binary / non-printable characters
+          // eslint-disable-next-line no-control-regex
+          /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/,
+          // Leetspeak patterns for common injection keywords
+          /1gn[o0]r[e3]\s+/i,
+          /[e3]x[e3]c[u0]t[e3]/i,
+          // Excessive special characters (potential obfuscation)
+          /([^\w\s,.!?'-]){5,}/,
+        ];
+
+        function sanitizePromptField(value: unknown, fieldName: string): string {
+          if (typeof value !== 'string') return '';
+          const trimmed = value.trim();
+          // Reject empty or excessively long values
+          if (trimmed.length === 0) return '';
+          if (trimmed.length > 200) {
+            console.warn(`[Security] Field '${fieldName}' exceeds max length, rejecting.`);
+            return '';
+          }
+          for (const pattern of PROMPT_INJECTION_PATTERNS) {
+            if (pattern.test(trimmed)) {
+              console.warn(`[Security] Field '${fieldName}' failed injection check (pattern: ${pattern}), rejecting value.`);
+              return '';
+            }
+          }
+          // Strip any remaining control characters
+          // eslint-disable-next-line no-control-regex
+          return trimmed.replace(/[\x00-\x1F\x7F]/g, '');
+        }
+
         const rawEntries: Array<Record<string, unknown>> = JSON.parse(companions);
-        let setme = rawEntries.map(({ name, title, imageUrl, llm, telegramLink }: any) => ({
-          name,
-          title,
-          imageUrl,
-          llm: getApprovedModel(llm),
-          telegramLink
+        const sanitiseTelegramLink = (value: unknown): string | null => {
+          if (typeof value !== "string") return null;
+          const trimmed = value.trim();
+          return trimmed.startsWith("https://t.me/") ? trimmed : null;
+        };
+        let setme = rawEntries.map((entry: Record<string, unknown>) => ({
+          name: typeof entry.name === "string" ? entry.name : "",
+          title: typeof entry.title === "string" ? entry.title : "",
+          imageUrl: typeof entry.imageUrl === "string" ? entry.imageUrl : "",
+          llm: getApprovedModel(typeof entry.llm === "string" ? entry.llm : ""),
+          telegramLink: sanitiseTelegramLink(entry.telegramLink),
         }));
         setExamples(setme);
       } catch (err) {
