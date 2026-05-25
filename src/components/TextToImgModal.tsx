@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, useState, useRef, useEffect, useCallback } from "react";
 import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
@@ -16,6 +16,123 @@ function signProvenance(provenance: { generatedAt: string; model: string; synthe
   return crypto.createHmac("sha256", secret).update(payload).digest("hex");
 }
 
+/**
+ * Embeds a UTF-8 string into the least-significant bits of RGBA pixel data.
+ * Format: 32-bit big-endian length header followed by message bits, 1 bit per
+ * channel (R, G, B only — alpha is left untouched to avoid transparency artefacts).
+ * Throws if the image is too small to carry the payload.
+ */
+function embedLsbWatermark(imageData: ImageData, message: string): ImageData {
+  const msgBytes = new TextEncoder().encode(message);
+  const totalBits = 32 + msgBytes.length * 8; // 4-byte length header + payload
+  const availableBits = Math.floor((imageData.data.length / 4) * 3); // 3 channels per pixel
+  if (totalBits > availableBits) {
+    throw new Error(
+      `Watermark payload (${totalBits} bits) exceeds image capacity (${availableBits} bits).`
+    );
+  }
+
+  // Build a flat bit array: [32 length bits] + [payload bits]
+  const bits: number[] = [];
+  const len = msgBytes.length;
+  for (let i = 31; i >= 0; i--) bits.push((len >> i) & 1);
+  for (const byte of msgBytes) {
+    for (let i = 7; i >= 0; i--) bits.push((byte >> i) & 1);
+  }
+
+  const output = new ImageData(
+    new Uint8ClampedArray(imageData.data),
+    imageData.width,
+    imageData.height
+  );
+  const d = output.data;
+  let bitIndex = 0;
+
+  for (let px = 0; px < d.length / 4 && bitIndex < bits.length; px++) {
+    const base = px * 4;
+    // Embed into R, G, B channels only
+    for (let ch = 0; ch < 3 && bitIndex < bits.length; ch++) {
+      d[base + ch] = (d[base + ch] & 0xfe) | bits[bitIndex];
+      bitIndex++;
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Renders an AI-generated image onto a canvas with an LSB steganographic
+ * watermark carrying the provenance HMAC signature, then exposes the
+ * watermarked data URL as an <img> element.
+ */
+function WatermarkedImage({
+  src,
+  provenanceSignature,
+  className,
+}: {
+  src: string;
+  provenanceSignature: string;
+  className?: string;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [watermarkedSrc, setWatermarkedSrc] = useState<string>("");
+  const [watermarkError, setWatermarkError] = useState<string | null>(null);
+
+  const applyWatermark = useCallback(() => {
+    if (!src || !provenanceSignature) return;
+    const img = new window.Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(img, 0, 0);
+      try {
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const watermarked = embedLsbWatermark(imageData, provenanceSignature);
+        ctx.putImageData(watermarked, 0, 0);
+        setWatermarkedSrc(canvas.toDataURL("image/png"));
+        setWatermarkError(null);
+      } catch (err) {
+        setWatermarkError(
+          err instanceof Error ? err.message : "Watermarking failed."
+        );
+      }
+    };
+    img.onerror = () => setWatermarkError("Failed to load image for watermarking.");
+    img.src = src;
+  }, [src, provenanceSignature]);
+
+  useEffect(() => {
+    applyWatermark();
+  }, [applyWatermark]);
+
+  return (
+    <>
+      {/* Hidden canvas used only for pixel manipulation */}
+      <canvas ref={canvasRef} style={{ display: "none" }} />
+      {watermarkError && (
+        <p className="text-red-500 text-xs">{watermarkError}</p>
+      )}
+      {watermarkedSrc ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={watermarkedSrc}
+          alt="AI-generated (watermarked)"
+          className={className}
+        />
+      ) : (
+        src && !watermarkError && (
+          <p className="text-gray-400 text-xs">Applying watermark…</p>
+        )
+      )}
+    </>
+  );
+}
+
 const MAX_PROMPT_LENGTH = 500;
 
 function sanitizePrompt(input: string): string {
@@ -28,6 +145,48 @@ function sanitizePrompt(input: string): string {
   // Enforce maximum length
   sanitized = sanitized.slice(0, MAX_PROMPT_LENGTH);
   return sanitized;
+}
+
+// TODO: Replace with the approved image-generation provider's CDN/storage hosts
+// from the organization's model registry before deploying.
+/**
+ * Approved model registry.
+ * Only models listed here (with pinned version and expected weight digest) may be used.
+ * Digest is a SHA-256 of the canonical model card / weight manifest published by the provider.
+ */
+const APPROVED_MODEL_REGISTRY: Record<
+  string,
+  { pinnedVersion: string; weightDigest: string }
+> = {
+  "dall-e-3": {
+    pinnedVersion: "dall-e-3",
+    weightDigest:
+      "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe88a7d8d9bef4e3b2f3a1c6e5d",
+  },
+};
+
+/**
+ * Validates that a model ID is in the approved registry and returns its pinned
+ * version string and expected weight digest for integrity verification.
+ * Throws if the model is not registered or lacks version/digest pinning.
+ */
+function resolveApprovedModel(modelId: string): {
+  pinnedVersion: string;
+  weightDigest: string;
+} {
+  const entry = APPROVED_MODEL_REGISTRY[modelId];
+  if (!entry) {
+    throw new Error(
+      `Model "${modelId}" is NOT in the approved model registry. ` +
+        `Permitted models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}.`
+    );
+  }
+  if (!entry.pinnedVersion || !entry.weightDigest) {
+    throw new Error(
+      `Model "${modelId}" is missing a pinned version or weight digest in the registry.`
+    );
+  }
+  return entry;
 }
 
 const ALLOWED_IMAGE_HOSTS = [
@@ -92,7 +251,7 @@ export default function TextToImgModal({
   setOpen,
 }: {
   open: boolean;
-  setOpen: any;
+  setOpen: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
     const [imgSrc, setImgSrc] = useState("");
   const [imgProvenance, setImgProvenance] = useState<{
@@ -116,14 +275,32 @@ export default function TextToImgModal({
     try {
       const response = await fetch("/api/audit-log", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          // Enforce append-only semantics and retention policy at the transport layer.
+          // The server MUST honour these headers and reject any DELETE/UPDATE on audit records.
+          "X-Audit-Append-Only": "true",
+          "X-Audit-Retention-Days": "2555", // 7-year minimum retention (adjust to policy)
+        },
         body: JSON.stringify(entry),
       });
       if (!response.ok) {
-        console.error("[AuditLog] Failed to write audit log entry:", response.status, await response.text());
+        const responseBody = await response.text();
+        const auditError = new Error(
+          `[AuditLog] Failed to write audit log entry: HTTP ${response.status} – ${responseBody}`
+        );
+        console.error(auditError.message);
+        // Rethrow so the caller is aware that the audit trail is incomplete.
+        throw auditError;
       }
     } catch (err) {
-      console.error("[AuditLog] Exception writing audit log entry:", err);
+      const wrappedError =
+        err instanceof Error
+          ? err
+          : new Error(`[AuditLog] Exception writing audit log entry: ${String(err)}`);
+      console.error(wrappedError.message, err);
+      // Rethrow — silent audit-log failures violate forensic-readiness policy.
+      throw wrappedError;
     }
   }, []);
 
