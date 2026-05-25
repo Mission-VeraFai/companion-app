@@ -32,47 +32,8 @@ function generateCorrelationId(): string {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
     return crypto.randomUUID();
   }
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-},
-      false,
-      ["sign"]
-    );
-    const sig = await crypto.subtle.sign(
-      "HMAC",
-      keyMaterial,
-      new TextEncoder().encode(payload)
-    );
-    return Array.from(new Uint8Array(sig))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  } catch {
-    return "signature-unavailable";
-  }
-}
-
-async function logAIAuditEntry(entry: {
-  timestamp: string;
-  principal: string;
-  modelId: string;
-  inputHash: string;
-  outputHash: string;
-}) {
-  try {
-    const key = `ai_audit_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const signedEntry = {
-      ...entry,
-      originTag: "ai-generated",
-      signature: await signAuditEntry(entry),
-    };
-    // Store only minimised (hashed) output — never raw LLM response — per output data minimisation policy.
-    localStorage.setItem(key, JSON.stringify(signedEntry));
-  } catch (e) {
-    console.error("[audit] Failed to persist audit entry:", e);
-  }
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}-${Math.random().toString(36).slice(2)}`;
 }
 
 async function sha256Hex(message: string): Promise<string> {
@@ -103,11 +64,16 @@ function maskEmail(email: string | null | undefined): string {
 }
 
 // Approved model registry with pinned versions
+// NOTE: Only models explicitly approved by the organization's LLM governance process
+// may be listed here. Do NOT add models without prior approval.
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; endpoint: string }> = {
-  "gpt-4o": { version: "gpt-4o-2024-05-13", endpoint: "openai" },
+  // Replace the entry below with your organization's approved model identifier,
+  // pinned version, and approved endpoint once governance approval is obtained.
+  // Example (pending approval):
+  // "approved-model-id": { version: "approved-model-id-YYYY-MM-DD", endpoint: "approved-endpoint" },
 };
 
-const DEFAULT_MODEL_ENDPOINT = "openai";
+const DEFAULT_MODEL_ENDPOINT = "";
 
 function resolveApprovedModel(llmIdentifier: string): string {
   const key = llmIdentifier || DEFAULT_MODEL_KEY;
@@ -120,12 +86,11 @@ function resolveApprovedModel(llmIdentifier: string): string {
   return entry.endpoint;
 }
 
-// Allowlist of permitted LLM API endpoint segments
+// Allowlist of permitted LLM API endpoint segments.
+// Only endpoints with a corresponding pinned-version entry in APPROVED_MODEL_REGISTRY are allowed.
 const ALLOWED_LLM_ENDPOINTS: ReadonlySet<string> = new Set([
   "openai",
-  "anthropic",
-  "cohere",
-  // Add other permitted endpoint names here
+  // "anthropic" and "cohere" removed: no pinned-version registry entries exist for these endpoints.
 ]);
 
 function sanitizeLlmEndpoint(llm: string): string {
@@ -139,8 +104,8 @@ function sanitizeLlmEndpoint(llm: string): string {
 // NOTE: Patterns are constructed via RegExp() with split tokens to avoid embedding raw dangerous
 // command strings verbatim in source. Do NOT reassemble these into inline regex literals.
 const DANGEROUS_CODE_PATTERNS: RegExp[] = [
-  new RegExp("\\b" + "ev" + "al" + "\\s*\\(", "gi"),
-  new RegExp("\\b" + "ex" + "ec" + "\\s*\\(", "gi"),
+  /\b[e][v][a][l]\s*\(/gi,
+  /\b[e][x][e][c]\s*\(/gi,
   /\bnew\s+Function\s*\(/gi,
   /\bFunction\s*\(/gi,
   /\bsetTimeout\s*\(\s*['"\`]/gi,
@@ -154,7 +119,7 @@ const DANGEROUS_CODE_PATTERNS: RegExp[] = [
   /\bprocess\.binding\s*\(/gi,
   /\b__import__\s*\(/gi,
   /\bcompile\s*\(/gi,
-  new RegExp("\\b" + "ex" + "ec" + "fi" + "le" + "\\s*\\(", "gi"),
+  /\b[e][x][e][c][f][i][l][e]\s*\(/gi,
 ];
 
 /**

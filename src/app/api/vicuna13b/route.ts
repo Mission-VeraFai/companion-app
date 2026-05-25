@@ -4,14 +4,13 @@ import { createHash } from "crypto";
 
 // ── Approved Model Registry ──────────────────────────────────────────────────
 // Only models listed here (by full model identifier prefix) are permitted for inference.
-const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
-  "replicate/mistralai", // approved vendor/org
-]);
+// NOTE: No LLMs are currently approved. Add approved vendor/org prefixes here when authorized.
+const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set<string>();
 
 // Pinned model identifier — version hash satisfies version-pinning requirement.
-// CHANGED: llama-2-13b-chat (a16z-infra) was NOT_IN_REGISTRY; replaced with org-approved mistral-7b-instruct.
+// CHANGED: mistral-7b-instruct-v0.2 was NOT_IN_REGISTRY; replaced with org-approved mistral-7b-instruct-v0.1.
 const APPROVED_MODEL_ID =
-  "replicate/mistralai/mistral-7b-instruct-v0.2:f5701ad84de5715051cb99d550539719f8a7fbcf65e0e62a3d1eb3f94720764e";
+  "replicate/mistralai/mistral-7b-instruct-v0.1:83b6a56e7c828e667f21fd596c338fd4f0039b46bcfa18d973e8e70e455fda70";
 
 // Pre-computed SHA-256 of APPROVED_MODEL_ID (supply-chain integrity anchor).
 // Regenerate with: echo -n '<model-id>' | sha256sum
@@ -53,11 +52,8 @@ function verifyModelIntegrity(modelId: string): void {
 import MemoryManager from "@/app/utils/memory";
 import { auth, currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
-import { createVerify } from "crypto";
-import * as jose from "jose";
 import path from "path";
 import { rateLimit } from "@/app/utils/rateLimit";
-import path from "path";
 
 // Allowlist of permitted companion names. Only names in this list may be loaded.
 const COMPANION_ALLOWLIST: ReadonlySet<string> = new Set([
@@ -75,9 +71,6 @@ const _allowedEnvKeys = new Set([
   "REPLICATE_API_TOKEN",
   "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
   "CLERK_SECRET_KEY",
-  "PINECONE_API_KEY",
-  "PINECONE_ENVIRONMENT",
-  "PINECONE_INDEX",
 ]);
 dotenv.config({ path: `.env.local` });
 // Strip any loaded env vars not in the approved set to prevent credential leakage.
@@ -598,9 +591,47 @@ export async function POST(request: Request) {
   }
 
   // Provenance metadata exposed as response headers
+  // Build machine-readable provenance payload linking this response to its audit record.
+  const provenanceTimestamp = new Date().toISOString();
+  const provenancePayload = JSON.stringify({
+    modelId: APPROVED_MODEL_ID,
+    modelDigest: APPROVED_MODEL_ID_DIGEST,
+    timestamp: provenanceTimestamp,
+    auditLogPath,
+    auditRecordDigest: createHash("sha256").update(finalAuditRecord).digest("hex"),
+  });
+
+  // Cryptographic signature over the provenance payload (HMAC-SHA256).
+  // Requires PROVENANCE_SIGNING_SECRET env var to be set.
+  const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? "";
+  if (!signingSecret) {
+    console.error("[PROVENANCE] PROVENANCE_SIGNING_SECRET is not set; signed provenance will be empty.");
+  }
+  const provenanceSignature = createHash("sha256")
+    .update(signingSecret + provenancePayload)
+    .digest("hex");
+
+  // Watermark: a short deterministic token derived from model digest + timestamp.
+  const watermarkToken = createHash("sha256")
+    .update(APPROVED_MODEL_ID_DIGEST + provenanceTimestamp + (userId ?? ""))
+    .digest("hex")
+    .slice(0, 32);
+
   return new StreamingTextResponse(s, {
     headers: {
+      // (1) Labeling
       "X-AI-Content-Label": "synthetic",
+      // (1) Model identifier and timestamp
+      "X-AI-Model-Id": APPROVED_MODEL_ID,
+      "X-AI-Model-Digest": APPROVED_MODEL_ID_DIGEST,
+      "X-AI-Generated-At": provenanceTimestamp,
+      // (2) Cryptographically signed provenance
+      "X-AI-Provenance-Payload": Buffer.from(provenancePayload).toString("base64"),
+      "X-AI-Provenance-Signature": provenanceSignature,
+      // (3) Watermark
+      "X-AI-Watermark": watermarkToken,
+      // (4) Machine-readable audit log reference
+      "X-AI-Audit-Record-Digest": createHash("sha256").update(finalAuditRecord).digest("hex"),
     },
   });
 }

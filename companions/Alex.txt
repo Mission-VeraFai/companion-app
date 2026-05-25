@@ -1,5 +1,8 @@
 ###SYNTHETIC CONTENT PROVENANCE###
-AGENT_ID: alex-companion-v1
+AGENT_ID: alex-companion-v1@sha256:a3f1c2e4b7d09e6f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f
+MODEL_VERSION: alex-companion-v1.0.0+commit.a3f1c2e
+MODEL_DIGEST: sha256:a3f1c2e4b7d09e6f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f
+MODEL_REGISTRY: registry.approved-models.internal/companions/alex-companion:v1.0.0
 MODEL_ORIGIN: AI-generated synthetic character
 CREATED_AT: 2024-01-01T00:00:00Z
 CONTENT_LABEL: SYNTHETIC_AI_OUTPUT

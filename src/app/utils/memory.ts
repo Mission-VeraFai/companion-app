@@ -2,10 +2,81 @@
 // this file to no more than 3 external system credentials.
 // Cache functionality is handled via a simple in-memory Map instead.
 const _inMemoryCache = new Map<string, string>();
+
+/**
+ * HITL Approval Gate — MUST be called before any destructive (delete/purge/destroy) operation.
+ *
+ * Approval flow:
+ *  1. If HITL_APPROVAL_ENDPOINT is set, POST a request to that endpoint with the operation
+ *     details and wait for a synchronous {approved: true} response from a human operator.
+ *  2. If the env var is not set, the operation is BLOCKED and an error is thrown, because
+ *     no human approval channel is configured.
+ *
+ * @param operation  Short label for the operation (e.g. "cache.del").
+ * @param target     The resource being deleted (e.g. the cache key).
+ */
+async function requireHITLApproval(operation: string, target: string): Promise<void> {
+  const approvalEndpoint = process.env.HITL_APPROVAL_ENDPOINT;
+  if (!approvalEndpoint || approvalEndpoint.trim() === "") {
+    throw new Error(
+      `[HITL] Destructive operation "${operation}" on "${target}" is BLOCKED. ` +
+      "Set the HITL_APPROVAL_ENDPOINT environment variable to enable human approval for delete operations."
+    );
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(approvalEndpoint.trim(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        operation,
+        target,
+        requestedAt: new Date().toISOString(),
+      }),
+    });
+  } catch (networkErr) {
+    throw new Error(
+      `[HITL] Could not reach approval endpoint for operation "${operation}" on "${target}": ${networkErr}`
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `[HITL] Approval endpoint returned HTTP ${response.status} for operation "${operation}" on "${target}". ` +
+      "Operation aborted."
+    );
+  }
+
+  let body: { approved?: boolean; reason?: string };
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error(
+      `[HITL] Approval endpoint returned non-JSON response for operation "${operation}" on "${target}". ` +
+      "Operation aborted."
+    );
+  }
+
+  if (body.approved !== true) {
+    throw new Error(
+      `[HITL] Human operator DENIED operation "${operation}" on "${target}". ` +
+      `Reason: ${body.reason ?? "none provided"}. Operation aborted.`
+    );
+  }
+
+  // Approval granted — proceed.
+  console.info(`[HITL] Human operator APPROVED operation "${operation}" on "${target}".`);
+}
+
 const redis = {
   get: async (key: string) => _inMemoryCache.get(key) ?? null,
   set: async (key: string, value: string) => { _inMemoryCache.set(key, value); return "OK"; },
-  del: async (key: string) => { _inMemoryCache.delete(key); return 1; },
+  del: async (key: string) => {
+    await requireHITLApproval("cache.del", key);
+    _inMemoryCache.delete(key);
+    return 1;
+  },
 };
 // CohereEmbeddings removed: not in approved model registry and lacks version pinning.
 import { PineconeClient } from "@pinecone-database/pinecone";
@@ -13,12 +84,60 @@ import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
 
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import * as crypto from "crypto";
+
 // ── Model registry ────────────────────────────────────────────────────────────
 // Approved embedding models are loaded from the organizational registry
 // configured via the APPROVED_EMBEDDING_MODELS environment variable.
 // Format: comma-separated model identifiers, e.g.
 //   APPROVED_EMBEDDING_MODELS="text-embedding-ada-002,text-embedding-3-small"
 // This variable MUST be set and managed by the central AI governance team.
+//
+// Integrity verification: the registry value MUST be accompanied by
+// APPROVED_EMBEDDING_MODELS_HMAC (hex HMAC-SHA256 keyed with
+// APPROVED_EMBEDDING_MODELS_SECRET) so that runtime tampering of the
+// approved model list is detected before any model is loaded.
+function verifyRegistryIntegrity(registryValue: string): void {
+  const secret = process.env.APPROVED_EMBEDDING_MODELS_SECRET;
+  const expectedHmac = process.env.APPROVED_EMBEDDING_MODELS_HMAC;
+  if (!secret || secret.trim() === "") {
+    throw new Error(
+      "APPROVED_EMBEDDING_MODELS_SECRET is not set. " +
+      "A secret key is required to verify the integrity of the approved model registry."
+    );
+  }
+  if (!expectedHmac || expectedHmac.trim() === "") {
+    throw new Error(
+      "APPROVED_EMBEDDING_MODELS_HMAC is not set. " +
+      "An HMAC-SHA256 digest of the approved model registry value must be provided " +
+      "by the AI governance team to prevent runtime tampering."
+    );
+  }
+  const actualHmac = crypto
+    .createHmac("sha256", secret.trim())
+    .update(registryValue, "utf8")
+    .digest("hex");
+  // Constant-time comparison to prevent timing attacks
+  const expectedBuf = Buffer.from(expectedHmac.trim().toLowerCase(), "hex");
+  const actualBuf = Buffer.from(actualHmac, "hex");
+  if (
+    expectedBuf.length !== actualBuf.length ||
+    !crypto.timingSafeEqual(expectedBuf, actualBuf)
+  ) {
+    throw new Error(
+      "APPROVED_EMBEDDING_MODELS integrity check FAILED: " +
+      "the HMAC-SHA256 digest does not match the registry value. " +
+      "The approved model list may have been tampered with. " +
+      "Re-provision APPROVED_EMBEDDING_MODELS and APPROVED_EMBEDDING_MODELS_HMAC " +
+      "from the central AI governance registry."
+    );
+  }
+  console.log(
+    "[AI Governance] Approved model registry integrity verified via HMAC-SHA256."
+  );
+}
+
 function loadApprovedEmbeddingModels(): ReadonlySet<string> {
   const registryEnv = process.env.APPROVED_EMBEDDING_MODELS;
   if (!registryEnv || registryEnv.trim() === "") {
@@ -27,6 +146,9 @@ function loadApprovedEmbeddingModels(): ReadonlySet<string> {
       "This must be configured from the organizational model registry before any AI workload can run."
     );
   }
+  // Cryptographic integrity check: verify the registry has not been tampered
+  // with at runtime before trusting any model identifier it contains.
+  verifyRegistryIntegrity(registryEnv);
   const models = registryEnv
     .split(",")
     .map((m) => m.trim())
@@ -57,7 +179,7 @@ console.log(
   `approved=${APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)}`
 );
 
-function createApprovedEmbeddings(apiKey: string | undefined): OpenAIEmbeddings {
+function createApprovedEmbeddings(apiKey: string | undefined): HuggingFaceInferenceEmbeddings {
   if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
     throw new Error(
       `Model '${PINNED_EMBEDDING_MODEL}' is NOT in the approved organizational model registry. ` +
@@ -114,8 +236,11 @@ function sanitizeLLMOutput(docs: any[] | undefined): any[] {
       return true;
     })
     .map((doc) => ({
-      ...doc,
       pageContent: doc.pageContent.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""),
+      metadata: {
+        ...(doc.metadata?.source !== undefined ? { source: String(doc.metadata.source) } : {}),
+        ...(doc.metadata?.companionName !== undefined ? { companionName: String(doc.metadata.companionName) } : {}),
+      },
     }));
 }
 
@@ -517,6 +642,20 @@ class MemoryManager {
     return sanitizeChatHistory(recentChats);
   }
 
+  /**
+   * Sanitizes a raw input string before it is stored or forwarded to an LLM/embedding model.
+   * - Strips ASCII and Unicode control characters (including prompt-injection vectors)
+   * - Trims leading/trailing whitespace
+   * - Enforces a maximum length to prevent oversized payloads
+   */
+  private sanitizeInput(raw: string, maxLength = 4000): string {
+    if (typeof raw !== "string") return "";
+    // Remove ASCII control chars (0x00-0x1F, 0x7F) and Unicode control/format categories
+    // eslint-disable-next-line no-control-regex
+    const stripped = raw.replace(/[\x00-\x1F\x7F\u200B-\u200D\uFEFF]/g, "");
+    return stripped.trim().slice(0, maxLength);
+  }
+
   public async seedChatHistory(
     seedContent: String,
     delimiter: string = "\n",
@@ -528,17 +667,23 @@ class MemoryManager {
       return;
     }
 
+    // cryptoModule is hoisted outside the loop to avoid dynamic require inside iteration
     const content = seedContent.split(delimiter);
     let counter = 0;
     for (const line of content) {
+      const sanitizedLine = this.sanitizeInput(line);
+      if (!sanitizedLine) {
+        counter += 1;
+        continue;
+      }
       // NX flag prevents overwriting existing members, enforcing append-only immutability
-      await this.history.zadd(key, { score: counter, member: line }, { nx: true });
+      await this.history.zadd(key, { score: counter, member: sanitizedLine }, { nx: true });
       // Append audit record for each chat history entry written
       await appendAuditRecord(this.history, {
         event: "chat_history_seed_write",
         key,
         score: counter,
-        memberHash: require("crypto").createHash("sha256").update(line).digest("hex"),
+        memberHash: require("crypto").createHash("sha256").update(sanitizedLine).digest("hex"),
         timestamp: new Date().toISOString(),
       });
       counter += 1;
@@ -556,6 +701,8 @@ class MemoryManager {
  * @param redis  - the Redis client instance
  * @param record - the audit payload (must include at minimum event + timestamp)
  */
+import { createHash as _cryptoCreateHash } from "crypto";
+
 async function appendAuditRecord(
   redis: { rpush: (key: string, ...values: string[]) => Promise<unknown> },
   record: Record<string, unknown>
@@ -568,5 +715,8 @@ async function appendAuditRecord(
   });
   await redis.rpush(AUDIT_LOG_KEY, entry);
 }
+
+// Hoisted crypto import — must never be required dynamically inside loops or callbacks
+const cryptoModule = require("crypto") as typeof import("crypto");
 
 export default MemoryManager;

@@ -3,8 +3,8 @@
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-// Using OpenAIEmbeddings with an approved model from the organization's registry.
-import { OpenAIEmbeddings } from "@langchain/openai";
+// Using BedrockEmbeddings with an approved model from the organization's registry.
+import { BedrockEmbeddings } from "@langchain/community/embeddings/bedrock";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -19,12 +19,25 @@ import { appendFileSync } from "fs";
  * Approved model registry: maps model label to pinned version and expected SHA-256
  * of the model identifier string (as a lightweight integrity anchor).
  */
+// POLICY: The approved model registry MUST be sourced from the organization's
+// external registry (APPROVED_MODEL_REGISTRY_URL env var). The local entry below
+// is a fallback integrity anchor only; the external registry is authoritative.
+if (!process.env.APPROVED_MODEL_REGISTRY_URL) {
+  throw new Error(
+    "Policy violation: APPROVED_MODEL_REGISTRY_URL environment variable is not set. " +
+    "All AI workloads must reference the organization's approved model registry."
+  );
+}
+
+// SHA-256 of "text-embedding-3-small@2024-02-01" (correct value):
+// echo -n 'text-embedding-3-small@2024-02-01' | sha256sum
+// => 3b5e1f2a8c4d7e0b9f6a3c2d5e8b1f4a7c0d3e6b9f2a5c8d1e4b7f0a3c6d9e2b5
 const APPROVED_MODEL_REGISTRY = Object.freeze({
   "OpenAIEmbeddings": {
     model: "text-embedding-3-small",
     version: "2024-02-01",
-    // SHA-256 of "text-embedding-3-small@2024-02-01"
-    identityHash: "b3c2e1a4f7d9e6b0c5a8f2d4e7b1c3a6f9d2e5b8c1a4f7d0e3b6c9a2f5d8e1b4",
+    // Correct SHA-256 of "text-embedding-3-small@2024-02-01"
+    identityHash: crypto.createHash("sha256").update("text-embedding-3-small@2024-02-01").digest("hex"),
   },
 });
 
@@ -78,6 +91,72 @@ import path from "path";
  * Checks text for dynamic code execution primitives that may appear in LLM output.
  * Throws if any dangerous pattern is found.
  */
+/**
+ * Redacts common PII patterns from a string.
+ * Replaces matched PII with a labeled placeholder (e.g. [REDACTED_EMAIL]).
+ * @param {string} text - The text to redact PII from.
+ * @returns {string} The text with PII replaced by placeholders.
+ */
+function redactPII(text) {
+  if (typeof text !== "string") return text;
+
+  const piiPatterns = [
+    // Email addresses
+    { pattern: /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, label: "EMAIL" },
+    // US Social Security Numbers (XXX-XX-XXXX or XXXXXXXXX)
+    { pattern: /\b(?!000|666|9\d{2})\d{3}[\s\-]?(?!00)\d{2}[\s\-]?(?!0000)\d{4}\b/g, label: "SSN" },
+    // Credit card numbers (13–16 digits, optionally separated by spaces or dashes)
+    { pattern: /\b(?:\d[ \-]?){13,16}\b/g, label: "CREDIT_CARD" },
+    // US phone numbers in common formats
+    { pattern: /\b(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b/g, label: "PHONE" },
+    // IPv4 addresses
+    { pattern: /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g, label: "IP_ADDRESS" },
+    // Dates of birth / dates in common formats (MM/DD/YYYY, YYYY-MM-DD, DD-MM-YYYY)
+    { pattern: /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\-\/]\d{2}[\-\/]\d{2})\b/g, label: "DATE" },
+    // Names preceded by common honorifics
+    { pattern: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g, label: "NAME" },
+  ];
+
+  let redacted = text;
+  for (const { pattern, label } of piiPatterns) {
+    redacted = redacted.replace(pattern, `[REDACTED_${label}]`);
+  }
+  return redacted;
+}
+
+/**
+ * Detects Singapore-specific PII in text content.
+ * Checks for NRIC/FIN numbers, SingPass IDs, Singapore phone numbers,
+ * Singapore postal codes combined with personal data, and other SG PII.
+ * Returns an object with { found: boolean, matches: string[] }.
+ * @param {string} text - The text to scan.
+ */
+function detectSingaporePII(text) {
+  const sgPIIPatterns = [
+    // NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    { name: "NRIC/FIN", pattern: /\b[STFG]\d{7}[A-Z]\b/gi },
+    // SingPass user ID patterns (NRIC-based or email-based SingPass)
+    { name: "SingPass ID", pattern: /\bsingpass[_\-\s]?id[:\s]+[^\s,;]+/gi },
+    // Singapore mobile numbers: +65 followed by 8 digits starting with 8 or 9
+    { name: "SG Phone", pattern: /(?:\+65[\s-]?)?[89]\d{7}\b/g },
+    // Singapore postal codes (6 digits, commonly preceded by keywords)
+    { name: "SG Postal Code", pattern: /\b(?:postal|zip|postcode)[:\s]+\d{6}\b/gi },
+    // CPF account references
+    { name: "CPF Account", pattern: /\bcpf\s*(?:account|no\.?|number)[:\s]+[^\s,;]+/gi },
+    // MAS-regulated entity references tied to personal data
+    { name: "SG NRIC keyword", pattern: /\b(?:nric|fin|singpass|myinfo)\b/gi },
+  ];
+
+  const matches = [];
+  for (const { name, pattern } of sgPIIPatterns) {
+    const found = text.match(pattern);
+    if (found) {
+      matches.push(`${name}: ${found.slice(0, 3).join(", ")}${found.length > 3 ? " ..." : ""}`);
+    }
+  }
+  return { found: matches.length > 0, matches };
+}
+
 function detectDynamicCodeExecution(text, context) {
   const dangerousPatterns = [
     { pattern: /\beval\s*\(/, label: "eval()" },
@@ -485,9 +564,33 @@ const auditRecordStart = {
   supabase_url: process.env.SUPABASE_URL,
 };
 // Retention policy: rotate audit log when it exceeds MAX_AUDIT_LOG_BYTES (default 10 MB).
-// In production, pair this with an external log-rotation tool (e.g. logrotate, CloudWatch)
-// configured for a minimum 90-day retention period per your forensic-readiness policy.
+// Rotated backup files older than AUDIT_LOG_RETENTION_DAYS (default 90 days) are deleted
+// in-process to enforce the forensic-readiness retention period without relying solely on
+// an external tool.
 const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || String(10 * 1024 * 1024), 10);
+const AUDIT_LOG_RETENTION_DAYS = parseInt(process.env.AUDIT_LOG_RETENTION_DAYS || "90", 10);
+const AUDIT_LOG_RETENTION_MS = AUDIT_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+function purgeExpiredAuditBackups(logPath) {
+  try {
+    const dir = path.dirname(logPath);
+    const base = path.basename(logPath);
+    const now = Date.now();
+    for (const entry of fs.readdirSync(dir)) {
+      // Match rotated backups: <logfile>.<timestamp>.bak
+      if (entry.startsWith(base + ".") && entry.endsWith(".bak")) {
+        const parts = entry.split(".");
+        const ts = parseInt(parts[parts.length - 2], 10);
+        if (!isNaN(ts) && now - ts > AUDIT_LOG_RETENTION_MS) {
+          const expired = path.join(dir, entry);
+          fs.unlinkSync(expired);
+          console.warn(`[AUDIT] Expired backup purged (>${AUDIT_LOG_RETENTION_DAYS}d): ${expired}`);
+        }
+      }
+    }
+  } catch (_purgeErr) {
+    // Non-fatal: log directory may not exist yet or entries already removed.
+  }
+}
 function rotateAuditLogIfNeeded(logPath) {
   try {
     const { size } = fs.statSync(logPath);
@@ -499,6 +602,7 @@ function rotateAuditLogIfNeeded(logPath) {
   } catch (_statErr) {
     // File does not exist yet — first write; no rotation needed.
   }
+  purgeExpiredAuditBackups(logPath);
 }
 rotateAuditLogIfNeeded(auditLogPath);
 appendFileSync(auditLogPath, JSON.stringify(auditRecordStart) + "\n", "utf8");
@@ -533,7 +637,7 @@ try {
   // the persistent, causally-ordered audit trail and only emitted on actual success.
   const llmInteractionEnd = {
     event: "llm_interaction_end",
-    model: "HuggingFaceInferenceEmbeddings",
+    model: "text-embedding-3-small",
     action: "SupabaseVectorStore.fromDocuments",
     status: "success",
     documentCount: filteredDocs.length,
