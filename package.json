@@ -46,6 +46,8 @@
     "@flydotio/dockerfile": "0.2.14"
   },
   "approvedModelRegistry": {
+    "_policyVersion": "1.0",
+    "_note": "All entries must include modelIdentity, integrityHash (sha512 from npm dist.integrity), approvedVersion, and registry. Replace placeholder hashes with values from: npm view <pkg>@<ver> dist.integrity",
     "registryUrl": "https://registry.npmjs.org",
     "approvedPackages": {
       "ai": {
@@ -58,27 +60,32 @@
       "langchain": {
         "approvedVersion": "0.0.92",
         "registry": "https://registry.npmjs.org/langchain",
-        "modelIdentity": "LangChain — orchestration layer for approved LLMs (GPT-3.5, GPT-4)",
+        "modelIdentity": "LangChain 0.0.92 — orchestration layer for approved LLMs (GPT-3.5, GPT-4)",
         "approvedBy": "security-team",
-        "approvalDate": "2024-01-01"
+        "approvalDate": "2024-01-01",
+        "integrityHash": "sha512-abc123placeholder_langchain_0.0.92_REPLACE_WITH_ACTUAL_DIGEST"
       },
       "replicate": {
         "approvedVersion": "0.9.3",
         "registry": "https://registry.npmjs.org/replicate",
-        "modelIdentity": "Replicate — approved models: meta/llama-2-70b-chat, stability-ai/stable-diffusion",
+        "modelIdentity": "Replicate 0.9.3 — approved models: meta/llama-2-70b-chat (LLaMA 2 70B), stability-ai/stable-diffusion",
         "approvedBy": "security-team",
-        "approvalDate": "2024-01-01"
+        "approvalDate": "2024-01-01",
+        "integrityHash": "sha512-def456placeholder_replicate_0.9.3_REPLACE_WITH_ACTUAL_DIGEST"
       },
       "@pinecone-database/pinecone": {
         "approvedVersion": "0.1.6",
         "registry": "https://registry.npmjs.org/@pinecone-database/pinecone",
-        "modelIdentity": "Pinecone vector database — used exclusively as RAG embedding store for approved foundation models (OpenAI text-embedding-ada-002)",
+        "modelIdentity": "Pinecone vector database 0.1.6 — used exclusively as RAG embedding store for approved foundation models (OpenAI text-embedding-ada-002)",
         "approvedBy": "security-team",
-        "approvalDate": "2024-01-01"
+        "approvalDate": "2024-01-01",
+        "integrityHash": "sha512-ghi789placeholder_pinecone_0.1.6_REPLACE_WITH_ACTUAL_DIGEST"
       },
       "langchain_anthropic": {
         "approvedVersion": "0.0.92",
         "registry": "https://registry.npmjs.org/langchain",
+        "modelIdentity": "LangChain Anthropic integration 0.0.92 — approved foundation model: Anthropic Claude (claude-2, claude-instant-1)",
+        "integrityHash": "sha512-jkl012placeholder_langchain_anthropic_0.0.92_REPLACE_WITH_ACTUAL_DIGEST",
         "modelIdentity": "LangChain Anthropic integration — approved foundation model: Claude 2 (claude-2) via langchain/chat_models/anthropic",
         "approvedBy": "security-team",
         "approvalDate": "2024-01-01"
