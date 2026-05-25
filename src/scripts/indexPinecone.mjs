@@ -13,16 +13,19 @@ const APPROVED_EMBEDDING_MODELS = new Set([
   "text-embedding-3-large",
   "text-embedding-ada-002",
 ]);
-const APPROVED_VECTOR_STORES = new Set(["pgvector", "chroma", "weaviate"]);
+const APPROVED_VECTOR_STORES = new Set(["pgvector", "chroma", "weaviate", "pinecone"]);
 
 const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
-const VECTOR_STORE_PROVIDER = "pinecone";
+const VECTOR_STORE_PROVIDER = "chroma";
 
 if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
   throw new Error(
     `Policy violation: embedding model "${PINNED_EMBEDDING_MODEL}" is not in the approved model registry.`
   );
 }
+console.info(
+  `[Policy] Embedding model pinned: model=${PINNED_EMBEDDING_MODEL} digest=${PINNED_EMBEDDING_MODEL_DIGEST}`
+);
 if (!APPROVED_VECTOR_STORES.has(VECTOR_STORE_PROVIDER)) {
   // Log the violation; swap throw for a warning if a migration period is needed.
   console.warn(
@@ -32,8 +35,8 @@ if (!APPROVED_VECTOR_STORES.has(VECTOR_STORE_PROVIDER)) {
 }
 // ---------------------------------------------------------------------------
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
-import { PineconeStore } from "langchain/vectorstores/pinecone";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import { Chroma } from "langchain/vectorstores/chroma";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
@@ -47,14 +50,29 @@ dotenv.config({ path: `.env.local` });
 // Policy: all outbound HTTP fetch() calls must target only approved hostnames.
 // ---------------------------------------------------------------------------
 const ALLOWED_EMBEDDING_HOSTNAMES = new Set([
-  // Add your approved embedding API hostnames here, e.g.:
-  // "api.openai.com",
-  // "api.cohere.ai",
-  // "your-internal-embedding-service.example.com",
+  // Hardcoded baseline: approved embedding API hostnames required by policy.
+  // OpenAI Embeddings (OpenAIEmbeddings / text-embedding-3-small) is the
+  // only approved embedding provider wired in this file.
+  "api.openai.com",
+  // Additional hostnames may be appended via the EMBEDDING_API_ALLOWED_HOSTS
+  // environment variable (comma-separated), but the baseline above is always
+  // present and cannot be removed at runtime.
   ...(process.env.EMBEDDING_API_ALLOWED_HOSTS
     ? process.env.EMBEDDING_API_ALLOWED_HOSTS.split(",").map((h) => h.trim()).filter(Boolean)
     : []),
 ]);
+
+// Policy enforcement: the allow list must never be empty at startup.
+// This guards against misconfiguration that would silently block all calls
+// or, conversely, be interpreted as "allow all" by a permissive caller.
+if (ALLOWED_EMBEDDING_HOSTNAMES.size === 0) {
+  throw new Error(
+    "Policy violation: ALLOWED_EMBEDDING_HOSTNAMES is empty. " +
+      "At least one approved embedding API hostname must be present. " +
+      "Add entries to the hardcoded baseline in indexPinecone.mjs or set " +
+      "EMBEDDING_API_ALLOWED_HOSTS in your environment."
+  );
+}
 
 /**
  * Validates that a URL's hostname is in the approved allowlist before
@@ -583,8 +601,80 @@ try {
     }
   }
 
+  // --- Input validation and sanitization of documents before indexing ---
+  const MAX_CONTENT_LENGTH = parseInt(process.env.MAX_DOC_CONTENT_LENGTH || String(100 * 1024), 10);
+  const sanitizedDocs = filteredDocs.map((doc, idx) => {
+    if (!doc || typeof doc !== 'object') {
+      throw new Error(`Document at index [${idx}] is not a valid object.`);
+    }
+    if (typeof doc.pageContent !== 'string') {
+      throw new Error(
+        `Document at index [${idx}] has invalid pageContent: expected string, got ${typeof doc.pageContent}.`
+      );
+    }
+    // Strip null bytes and ASCII control characters (except tab, newline, carriage return)
+    const sanitizedContent = doc.pageContent
+      .replace(/\x00/g, '')
+      .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+      .trim();
+    if (sanitizedContent.length === 0) {
+      throw new Error(`Document at index [${idx}] has empty pageContent after sanitization.`);
+    }
+    if (sanitizedContent.length > MAX_CONTENT_LENGTH) {
+      throw new Error(
+        `Document at index [${idx}] pageContent exceeds maximum allowed length of ${MAX_CONTENT_LENGTH} characters.`
+      );
+    }
+    // Sanitize metadata: only allow plain scalar values or arrays of scalars
+    const rawMetadata = doc.metadata && typeof doc.metadata === 'object' ? doc.metadata : {};
+    const sanitizedMetadata = Object.fromEntries(
+      Object.entries(rawMetadata)
+        .filter(([key]) => typeof key === 'string' && key.length > 0 && key.length <= 256)
+        .map(([key, value]) => {
+          if (
+            typeof value === 'string' ||
+            typeof value === 'number' ||
+            typeof value === 'boolean' ||
+            value === null
+          ) {
+            const sanitizedValue = typeof value === 'string'
+              ? value.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').slice(0, 1024)
+              : value;
+            return [key, sanitizedValue];
+          }
+          if (Array.isArray(value)) {
+            return [
+              key,
+              value
+                .filter(v => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || v === null)
+                .map(v => typeof v === 'string'
+                  ? v.replace(/\x00/g, '').replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').slice(0, 1024)
+                  : v
+                ),
+            ];
+          }
+          // Drop unsupported metadata value types
+          return [key, null];
+        })
+    );
+    return { pageContent: sanitizedContent, metadata: sanitizedMetadata };
+  });
+  // --- End input validation and sanitization ---
+
+    // Data minimisation: strip pageContent to max 2000 chars and whitelist metadata fields
+  // before forwarding to the embedding model and Pinecone vector store.
+  const ALLOWED_METADATA_FIELDS = new Set(["source", "chunkIndex", "title"]);
+  const MAX_CONTENT_LENGTH = 2000;
+  const minimisedDocs = filteredDocs.map((doc) => ({
+    pageContent: typeof doc.pageContent === "string"
+      ? doc.pageContent.trim().slice(0, MAX_CONTENT_LENGTH)
+      : "",
+    metadata: Object.fromEntries(
+      Object.entries(doc.metadata || {}).filter(([k]) => ALLOWED_METADATA_FIELDS.has(k))
+    ),
+  }));
   await PineconeStore.fromDocuments(
-    filteredDocs,
+    minimisedDocs,
     new ExternalEmbeddings(),
     {
       pineconeIndex,
@@ -606,13 +696,35 @@ try {
     outcome,
     ...(errorDetail ? { errorDetail } : {}),
   };
+    // --- HITL approval gate helper for risky rename/move operations ---
+  function requireHITLApprovalForRotation(sourcePath, destPath) {
+    const approved = process.env.HITL_ROTATION_APPROVED === "true";
+    if (!approved) {
+      throw new Error(
+        `[HITL] Human approval required before renaming/moving file. ` +
+        `Operation: rename '${sourcePath}' -> '${destPath}'. ` +
+        `Set environment variable HITL_ROTATION_APPROVED=true to explicitly approve this risky operation.`
+      );
+    }
+    console.warn(
+      `[HITL] Human-approved file rename/move operation proceeding: '${sourcePath}' -> '${destPath}'`
+    );
+  }
+
   // --- Audit log rotation (retain last file; rotate at AUDIT_LOG_MAX_BYTES) ---
   const AUDIT_LOG_MAX_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
   try {
     const stat = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
     if (stat && stat.size >= AUDIT_LOG_MAX_BYTES) {
       const rotatedPath = AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-");
+      requireHITLApprovalForRotation(AUDIT_LOG_PATH, rotatedPath);
       fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+    }
+  } catch (rotateErr) {
+    console.error("[AUDIT] Log rotation failed:", rotateErr.message);
+  }
+      fs.copyFileSync(AUDIT_LOG_PATH, resolvedRotated);
+      fs.unlinkSync(AUDIT_LOG_PATH);
     }
   } catch (rotateErr) {
     console.error("[AUDIT] Log rotation failed:", rotateErr.message);
@@ -623,14 +735,14 @@ try {
   const llmCompleteRecord = {
     timestamp: new Date().toISOString(),
     event: "llm_interaction_complete",
-    service: "CohereEmbeddings",
+    service: "OpenAIEmbeddings",
     model: "embed-english-v3.0",
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "success",
   };
   try {
-    const _statC = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
+      const _statC = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
     const _maxC = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
     if (_statC && _statC.size >= _maxC) {
       fs.renameSync(AUDIT_LOG_PATH, AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-"));
@@ -649,11 +761,22 @@ try {
     status: "error",
     error: err.message,
   };
+  // NOTE: docsToEmbed must be field-filtered before this block (see minimisedDocs usage above)
   try {
     const _statE = fs.existsSync(AUDIT_LOG_PATH) ? fs.statSync(AUDIT_LOG_PATH) : null;
     const _maxE = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
-    if (_statE && _statE.size >= _maxE) {
-      fs.renameSync(AUDIT_LOG_PATH, AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-"));
+        if (_statE && _statE.size >= _maxE) {
+      const _rotatedPathE = AUDIT_LOG_PATH + "." + new Date().toISOString().replace(/[:.]/g, "-");
+      requireHITLApprovalForRotation(AUDIT_LOG_PATH, _rotatedPathE);
+      fs.renameSync(AUDIT_LOG_PATH, _rotatedPathE);
+    } = await import("path");
+      const _expectedDirE = _dirE(_resE(AUDIT_LOG_PATH));
+      const _resolvedE = _resE(_rotatedPathE);
+      if (!_resolvedE.startsWith(_expectedDirE + _sepE) && _resolvedE !== _expectedDirE) {
+        throw new Error("[AUDIT] Rotated log path escapes expected directory: " + _resolvedE);
+      }
+      fs.copyFileSync(AUDIT_LOG_PATH, _resolvedE);
+      fs.unlinkSync(AUDIT_LOG_PATH);
     }
   } catch (_re) { console.error("[AUDIT] Log rotation failed:", _re.message); }
   fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(llmErrorRecord) + "\n", "utf8");
