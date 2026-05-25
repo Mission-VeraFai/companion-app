@@ -17,6 +17,15 @@ class ConfigManager {
     return ConfigManager.instance;
   }
 
+  // Only these fields are exposed to callers; add fields here as needed.
+  private static readonly ALLOWED_CONFIG_FIELDS: ReadonlyArray<string> = [
+    "name",
+    "voice",
+    "language",
+    "greeting",
+    "prompt",
+  ];
+
   public getConfig(fieldName: string, configValue: string) {
     //).filter((c: any) => c.name === companionName);
     try {
@@ -25,7 +34,17 @@ class ConfigManager {
           (c: any) => c[fieldName] === configValue
         );
         if (result.length !== 0) {
-          return result[0];
+          // Return only the explicitly allowed fields instead of the full record.
+          const matched = result[0];
+          return ConfigManager.ALLOWED_CONFIG_FIELDS.reduce(
+            (acc: Record<string, unknown>, key: string) => {
+              if (Object.prototype.hasOwnProperty.call(matched, key)) {
+                acc[key] = matched[key];
+              }
+              return acc;
+            },
+            {}
+          );
         }
       }
     } catch (e) {
