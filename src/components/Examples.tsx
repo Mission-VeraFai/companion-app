@@ -83,8 +83,8 @@ export default function Examples() {
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
                   {example.title}. Running on <b>{example.llm}</b>.
-                  {example.telegramLink && (
-                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault}} href={example.telegramLink}>Chat on <b>Telegram</b></a>.</span>
+                  {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
+                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault();}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}
                 </dd>
               </dl>
@@ -96,7 +96,7 @@ export default function Examples() {
                       data-tip="Helpful tip goes here"
                       className="text-sm text-slate-400 inline-block"
                     >
-                      📱Text me at: <b>{example.phone}</b>
+                      📱Text me at: <b>{maskPhone(example.phone)}</b>
                       &nbsp;
                       <svg
                         data-tooltip-id="help-tooltip"
@@ -128,4 +128,59 @@ export default function Examples() {
 function isPhoneNumber(input: string): boolean {
   const phoneNumberRegex = /^\+\d{1,11}$/;
   return phoneNumberRegex.test(input);
+}
+
+function isSafeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+const ALLOWED_TELEGRAM_HOSTNAMES = ['t.me', 'telegram.me'];
+
+function isSafeTelegramUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      ALLOWED_TELEGRAM_HOSTNAMES.includes(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Masks a phone number for display, retaining only the leading '+' and
+ * country-code digit(s) plus the last 2 digits. All middle digits are
+ * replaced with '*' to minimise PII exposure in the UI.
+ * Example: +12025550173 → +1*********73
+ */
+function maskPhone(phone: string): string {
+  if (!isPhoneNumber(phone)) return '***';
+  // Keep the '+' and first digit (country code), mask the middle, show last 2
+  const prefix = phone.slice(0, 2);       // e.g. "+1"
+  const suffix = phone.slice(-2);          // e.g. "73"
+  const maskedLength = phone.length - prefix.length - suffix.length;
+  const masked = '*'.repeat(Math.max(maskedLength, 0));
+  return `${prefix}${masked}${suffix}`;
+}
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length <= 4) return '****';
+  const lastFour = phone.slice(-4);
+  const masked = phone.slice(0, -4).replace(/\d/g, '*');
+  return masked + lastFour;
+}
+
+function maskPhone(phone: string): string {
+  // Keep the '+' and up to 3 leading digits, mask the middle, show last 2 digits
+  if (phone.length <= 4) return '***';
+  const prefix = phone.slice(0, 3);
+  const suffix = phone.slice(-2);
+  const masked = '*'.repeat(Math.max(phone.length - 5, 1));
+  return `${prefix}${masked}${suffix}`;
 }
