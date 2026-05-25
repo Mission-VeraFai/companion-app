@@ -3,8 +3,8 @@
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-// Using BedrockEmbeddings with an approved model from the organization's registry.
-import { BedrockEmbeddings } from "@langchain/community/embeddings/bedrock";
+// Using OpenAIEmbeddings with an approved model from the organization's registry.
+import { OpenAIEmbeddings } from "@langchain/openai";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -38,6 +38,12 @@ const APPROVED_MODEL_REGISTRY = Object.freeze({
     version: "2024-02-01",
     // Correct SHA-256 of "text-embedding-3-small@2024-02-01"
     identityHash: crypto.createHash("sha256").update("text-embedding-3-small@2024-02-01").digest("hex"),
+  },
+  "BedrockEmbeddings": {
+    model: "amazon.titan-embed-text-v2:0",
+    version: "2024-05-01",
+    // SHA-256 of "amazon.titan-embed-text-v2:0@2024-05-01"
+    identityHash: crypto.createHash("sha256").update("amazon.titan-embed-text-v2:0@2024-05-01").digest("hex"),
   },
 });
 
@@ -115,6 +121,20 @@ function redactPII(text) {
     { pattern: /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\-\/]\d{2}[\-\/]\d{2})\b/g, label: "DATE" },
     // Names preceded by common honorifics
     { pattern: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g, label: "NAME" },
+    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    { pattern: /\b[STFG]\d{7}[A-Z]\b/gi, label: "SG_NRIC_FIN" },
+    // SingPass user ID patterns
+    { pattern: /\bsingpass[_\-\s]?id[:\s]+[^\s,;]+/gi, label: "SG_SINGPASS_ID" },
+    // CPF account numbers (typically 9 digits)
+    { pattern: /\b(?:cpf[\s\-]?(?:account|no|number)?[:\s]+)?\d{9}\b/gi, label: "SG_CPF" },
+    // Work Permit numbers (typically WP followed by digits)
+    { pattern: /\bW[Pp]\d{7,10}\b/g, label: "SG_WORK_PERMIT" },
+    // Student Pass numbers (typically SP followed by digits)
+    { pattern: /\bS[Pp]\d{7,10}\b/g, label: "SG_STUDENT_PASS" },
+    // Singapore phone numbers (+65 XXXX XXXX or 8/9 XXXXXXX)
+    { pattern: /\b(?:\+65[\s\-]?)?[89]\d{3}[\s\-]?\d{4}\b/g, label: "SG_PHONE" },
+    // Singapore postal codes (6 digits, optionally preceded by "Singapore" or "S")
+    { pattern: /\b(?:Singapore\s+|S)\(?(\d{6})\)?\b/gi, label: "SG_POSTAL_CODE" },
   ];
 
   let redacted = text;
