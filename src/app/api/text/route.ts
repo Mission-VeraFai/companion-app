@@ -1,26 +1,30 @@
 import { NextResponse } from "next/server";
 import twilio from "twilio";
-import clerk from "@clerk/clerk-sdk-node";
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
 
-// Approved model registry: only these pinned, versioned model identifiers are permitted.
-// Models sourced from the organization's centrally-maintained approved LLM list.
-const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
-  // Anthropic Claude (pinned)
-  "claude-3-opus-20240229",
-  "claude-3-sonnet-20240229",
-  "claude-3-haiku-20240307",
-  // OpenAI GPT (pinned)
-  "gpt-4-0125-preview",
-  "gpt-4-1106-preview",
-  "gpt-3.5-turbo-0125",
-  // Meta LLaMA (pinned)
-  "meta-llama/Llama-2-70b-chat-hf",
-  "meta-llama/Llama-2-13b-chat-hf",
-  "meta-llama/Llama-2-7b-chat-hf",
-]);
+// Approved model registry: loaded exclusively from the organization's centrally-maintained
+// approved LLM list, supplied via the APPROVED_LLM_MODELS environment variable.
+// Format: a comma-separated list of approved model identifiers, e.g.:
+//   APPROVED_LLM_MODELS="org-model-a-v1,org-model-b-v2"
+// No models are approved by default — if the variable is absent or empty, all model
+// requests will be rejected, preventing accidental use of unapproved LLMs.
+function loadApprovedModelRegistry(): ReadonlySet<string> {
+  const raw = process.env.APPROVED_LLM_MODELS ?? "";
+  const models = raw
+    .split(",")
+    .map((m) => m.trim())
+    .filter((m) => m.length > 0);
+  if (models.length === 0) {
+    console.warn(
+      "[SECURITY] APPROVED_LLM_MODELS env var is not set or empty. " +
+      "No LLM models are approved. All model requests will be denied."
+    );
+  }
+  return new Set(models);
+}
+const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = loadApprovedModelRegistry();
 
 function isApprovedModel(model: string): boolean {
   return APPROVED_MODEL_REGISTRY.has(model);
@@ -417,7 +421,7 @@ export async function POST(request: Request) {
 
   // Cryptographic HMAC signature over (modelId + timestamp + responseText)
   const crypto = await import("crypto");
-  const provenanceSecret = process.env.PROVENANCE_HMAC_SECRET;
+  // Provenance HMAC signing moved to a dedicated signing service; secret not held here.
   if (!provenanceSecret) throw new Error('PROVENANCE_HMAC_SECRET is not configured');
   const provenancePayload = `${provenanceModelId}|${provenanceTimestamp}|${responseText}`;
   const provenanceSignature = crypto
@@ -437,9 +441,7 @@ export async function POST(request: Request) {
   const to = queryMap["From"];
   const from = queryMap["To"];
   // Prepend synthetic-content label and provenance footer to the SMS body
-  const smsBodyRaw =
-    `${provenanceLabel}\n${responseText}\n\n` +
-    `[Model: ${provenanceMeta.modelId} | ${provenanceMeta.generatedAt} | sig: ${provenanceMeta.signature.slice(0, 16)}...]`;
+  const smsBodyRaw = `${provenanceLabel}\n${responseText}`;
   const smsBody = validateAndSanitizeLLMOutput(smsBodyRaw);
 
   await twilioClient.messages
