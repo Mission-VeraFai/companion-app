@@ -3,8 +3,40 @@ import dotenv from "dotenv";
 dotenv.config({ path: `.env.local` });
 
 import { Fragment, useState } from "react";
+import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
+
+const MAX_PROMPT_LENGTH = 500;
+
+function sanitizePrompt(input: string): string {
+  // Trim surrounding whitespace
+  let sanitized = input.trim();
+  // Strip HTML/script tags
+  sanitized = sanitized.replace(/<[^>]*>/g, "");
+  // Remove null bytes and other non-printable control characters
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Enforce maximum length
+  sanitized = sanitized.slice(0, MAX_PROMPT_LENGTH);
+  return sanitized;
+}
+
+const ALLOWED_IMAGE_HOSTS = [
+  "oaidalleapiprodscus.blob.core.windows.net",
+  "cdn.openai.com",
+];
+
+function isValidImageUrl(url: unknown): url is string {
+  if (typeof url !== "string" || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    if (!ALLOWED_IMAGE_HOSTS.includes(parsed.hostname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export default function TextToImgModal({
   open,
@@ -13,22 +45,109 @@ export default function TextToImgModal({
   open: boolean;
   setOpen: any;
 }) {
-  const [imgSrc, setImgSrc] = useState("");
+    const [imgSrc, setImgSrc] = useState("");
+  const [imgProvenance, setImgProvenance] = useState<{
+    generatedAt: string;
+    model: string;
+    synthetic: boolean;
+  } | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const sanitizePrompt = (input: string): string | null => {
+    if (!input || typeof input !== "string") return null;
+
+    // Reject if too long
+    if (input.length > 500) return null;
+
+    // Reject base64-encoded content
+    if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(input.trim())) return null;
+
+    // Reject URL-encoded content
+    if (/%[0-9A-Fa-f]{2}/.test(input)) return null;
+
+    // Reject shell command patterns
+    const shellPatterns = [
+      /[`$]\s*\(/,           // command substitution: `(...)` or $(...)
+      /;\s*(rm|curl|wget|bash|sh|python|node|exec|eval)\b/i,
+      /&&|\|\|/,             // shell logical operators
+      /\|\s*\w/,             // pipe to command
+      />{1,2}\s*\/\w/,       // redirect to file path
+      /\.\.\/|\.\.\\/, // path traversal
+    ];
+    for (const pattern of shellPatterns) {
+      if (pattern.test(input)) return null;
+    }
+
+    // Reject prompt injection / jailbreak attempts
+    const injectionPatterns = [
+      /ignore (all |previous |above |prior )?instructions/i,
+      /system\s*prompt/i,
+      /you are now/i,
+      /act as (a|an)?\s+/i,
+      /disregard (all |previous |your )?/i,
+      /\[INST\]|\[SYS\]|<\|im_start\|>|<\|system\|>/i,
+      /---+\s*(system|user|assistant)\s*---+/i,
+    ];
+    for (const pattern of injectionPatterns) {
+      if (pattern.test(input)) return null;
+    }
+
+    // Strip any HTML/script tags
+    const stripped = input.replace(/<[^>]*>/g, "").trim();
+
+    // Allow only printable ASCII and common punctuation for image prompts
+    if (/[^\x20-\x7E]/.test(stripped)) return null;
+
+    return stripped;
+  };
+
   const onSubmit = async (e: any) => {
     e.preventDefault();
+    setPromptError("");
+    const rawValue: string = typeof e.target.value === "string" ? e.target.value : "";
+    const sanitizedPrompt = sanitizePrompt(rawValue);
+    if (!sanitizedPrompt) {
+      setPromptError("Please enter a valid prompt (non-empty, max 500 characters).");
+      return;
+    }
     setLoading(true);
+    const sanitized = sanitizePrompt(e.target.value);
+    if (!sanitized) {
+      setLoading(false);
+      alert("Invalid prompt. Please enter a plain text image description without special commands or encoded content.");
+      return;
+    }
     const response = await fetch("/api/txt2img", {
       method: "POST",
       body: JSON.stringify({
-        prompt: e.target.value,
+        prompt: sanitizedPrompt,
       }),
       headers: {
         "Content-Type": "application/json",
       },
     });
     const data = await response.json();
-    setImgSrc(data[0]);
+    const rawSrc: unknown = data[0];
+    // Validate and sanitize LLM output before use
+    const sanitizeImageSrc = (src: unknown): string => {
+      if (typeof src !== "string") {
+        throw new Error("Invalid image source: not a string");
+      }
+      // Block any dynamic code execution primitives
+      const forbidden = /eval|javascript:|vbscript:|data:text|<script|on\w+\s*=/i;
+      if (forbidden.test(src)) {
+        throw new Error("Invalid image source: contains forbidden content");
+      }
+      // Allow only base64-encoded image data URIs or HTTPS URLs
+      const isDataUri = /^data:image\/(png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(src);
+      const isHttpsUrl = /^https:\/\/[^\s]+$/.test(src);
+      if (!isDataUri && !isHttpsUrl) {
+        throw new Error("Invalid image source: must be a base64 image data URI or HTTPS URL");
+      }
+      return src;
+    };
+    const safeSrc = sanitizeImageSrc(rawSrc);
+    setImgSrc(safeSrc);
     setLoading(false);
   };
   return (
@@ -73,12 +192,7 @@ export default function TextToImgModal({
                     <div className="my-2">
                       <p className="text-sm text-gray-500">
                         Powered by{" "}
-                        <a
-                          className="underline"
-                          href="https://replicate.com/stability-ai/stable-diffusion"
-                        >
-                          stability-ai/stable-diffusion
-                        </a>
+                        an approved image generation model
                       </p>
                     </div>
                   </div>
