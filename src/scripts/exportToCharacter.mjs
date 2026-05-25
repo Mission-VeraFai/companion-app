@@ -1,8 +1,8 @@
 // Redis dependency removed to reduce external credential exposure
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { ChatOpenAI } from "langchain/chat_models/openai";
-const AI_MODEL_ID = "anthropic/claude-3-5-sonnet";
+import { ChatAnthropic } from "langchain/chat_models/anthropic";
+const AI_MODEL_ID = "gpt-4";
 
 import path from "path";
 import fs from "fs/promises";
@@ -11,11 +11,48 @@ import crypto from "crypto";
 const AUDIT_LOG_FILE = "ai_audit_log.jsonl";
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB rotation threshold
 
+/**
+ * HITL approval gate: prompts a human operator for explicit confirmation
+ * before any risky/destructive file operation is executed.
+ * Returns true if approved, throws if denied or no TTY is available.
+ */
+async function hitlApprove(operationDescription) {
+  // In non-interactive / CI environments, block by default for safety.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `[HITL] Risky operation blocked (no interactive TTY): ${operationDescription}`
+    );
+  }
+  process.stdout.write(
+    `\n[HITL APPROVAL REQUIRED]\nOperation : ${operationDescription}\nApprove? (yes/no): `
+  );
+  const answer = await new Promise((resolve) => {
+    let buf = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.resume();
+    process.stdin.once("data", (chunk) => {
+      buf += chunk;
+      process.stdin.pause();
+      resolve(buf.trim().toLowerCase());
+    });
+  });
+  if (answer !== "yes") {
+    throw new Error(
+      `[HITL] Risky operation denied by operator: ${operationDescription}`
+    );
+  }
+  console.log(`[HITL] Operation approved by operator: ${operationDescription}`);
+  return true;
+}
+
 async function rotateLogIfNeeded(filePath) {
   try {
     const stat = await fs.stat(filePath);
     if (stat.size >= MAX_LOG_BYTES) {
       const rotated = `${filePath}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+      await hitlApprove(
+        `Rotate (rename) log file "${filePath}" → "${rotated}" (destructive move)`
+      );
       await fs.rename(filePath, rotated);
     }
   } catch (err) {
@@ -36,9 +73,38 @@ async function writeAuditRecord(record) {
  */
 function buildProvenanceHeader(modelId, content) {
   const timestamp = new Date().toISOString();
-  const hmac = crypto
-    .createHash("sha256")
-    .update(`${modelId}|${timestamp}|${content}`)
+  const hmacSecret = process.env.PROVENANCE_HMAC_SECRET;
+  let signatureLabel;
+  let signature;
+  if (hmacSecret) {
+    signature = crypto
+      .createHmac("sha256", hmacSecret)
+      .update(`${modelId}|${timestamp}|${content}`)
+      .digest("hex");
+    signatureLabel = "HMAC-SHA256";
+  } else {
+    // No secret available — fall back to a plain hash and label it accurately
+    signature = crypto
+      .createHash("sha256")
+      .update(`${modelId}|${timestamp}|${content}`)
+      .digest("hex");
+    signatureLabel = "SHA256    ";
+    console.warn(
+      "[SECURITY WARNING] PROVENANCE_HMAC_SECRET is not set. " +
+      "Provenance header will use a plain SHA-256 hash instead of HMAC-SHA256. " +
+      "Set PROVENANCE_HMAC_SECRET to enable authenticated integrity verification."
+    );
+  }
+
+  return [
+    "=== AI-GENERATED CONTENT — SYNTHETIC ORIGIN ====",
+    `Model-ID   : ${modelId}`,
+    `Generated  : ${timestamp}`,
+    `${signatureLabel}: ${signature}`,
+    "================================================",
+    "",
+  ].join("\n");
+}|${timestamp}|${content}`)
     .digest("hex");
 
   return [
@@ -53,7 +119,7 @@ function buildProvenanceHeader(modelId, content) {
 
 const LLM_LOG_FILE = "llm_interactions.log";
 
-async function logLLMInteraction(input, output, { modelId = MODEL_NAME, principal = USER_ID } = {}) {
+async function logLLMInteraction(input, output, { modelId = AI_MODEL_ID, principal = "anonymous" } = {}) {
   const inputHash = crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
   const outputHash = crypto.createHash("sha256").update(JSON.stringify(output)).digest("hex");
   const entry = JSON.stringify({
@@ -512,6 +578,7 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+const workflowTraceId = `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 const results = await Promise.all(
   questions.map(async (question, spawnIndex) => {
     try {
@@ -526,22 +593,56 @@ const results = await Promise.all(
       );
       console.log(`[SPAWN TRACE] Subagent call ${spawnIndex + 1}/${questions.length} completed.`);
       // Log only non-sensitive metadata to avoid exposing prompt content in plain log files
+            await logLLMInteraction(
+        { question_key: Object.keys(llmInput).join(","), prompt: llmInput.question, workflow_trace_id: workflowTraceId },
+        { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0, output: llmResult?.text ?? "", status: "success" }
+      );
+      return llmResult;
+    } catch (error) {
+      console.error(error);
       await logLLMInteraction(
-        { question_key: Object.keys(llmInput).join(","), spawn_index: spawnIndex },
-        { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0 }
+        { question_key: typeof llmInput !== "undefined" ? Object.keys(llmInput).join(",") : "unknown", workflow_trace_id: workflowTraceId, status: "failed" },
+        { error: error instanceof Error ? error.message : String(error), output_length: 0 }
+      ).catch((logErr) => console.error("[AUDIT] Failed to write failed-decision audit record:", logErr));
+    },
+        { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0, status: "success" }
       );
       return llmResult;
     } catch (error) {
       console.error(`[SPAWN TRACE] Subagent call ${spawnIndex + 1} failed:`, error);
+      await logLLMInteraction(
+        { question_key: question, spawn_index: spawnIndex, workflow_trace_id: workflowTraceId, status: "failed" },
+        { error: error instanceof Error ? error.message : String(error), output_length: 0 }
+      ).catch((logErr) => console.error("[AUDIT] Failed to write failed-decision audit record:", logErr));
     }
   })
 );
 // --- End Subagent Spawn Resource Bounds ---
-      const llmResult = await chain.call(llmInput);
+      // Sanitize all string fields in llmInput derived from LLM-sourced data
+    const sanitizedLlmInput = Object.fromEntries(
+      Object.entries(llmInput).map(([k, v]) => [
+        k,
+        typeof v === "string" ? sanitizeForPrompt(v) : v,
+      ])
+    );
+    await writeAuditRecord({
+      event: "subagent_spawn",
+      timestamp: new Date().toISOString(),
+      question: sanitizeForPrompt(question),
+      inputHash: crypto.createHash("sha256").update(JSON.stringify(sanitizedLlmInput)).digest("hex"),
+    });
+    const llmCallPromise = chain.call(sanitizedLlmInput);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`LLM call timed out after ${LLM_CALL_TIMEOUT_MS}ms for question: ${sanitizeForPrompt(question)}`)),
+        LLM_CALL_TIMEOUT_MS
+      )
+    );
+    const llmResult = await Promise.race([llmCallPromise, timeoutPromise]);
       // Log full interaction content (prompt input and LLM output) as required by policy
       await logLLMInteraction(
         { question_key: Object.keys(llmInput).join(","), prompt: llmInput.question },
-        { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0, output: llmResult?.text ?? "" }
+        { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0 }
       );
       return llmResult;
     } catch (error) {
@@ -560,13 +661,12 @@ for (let i = 0; i < questions.length; i++) {
   output += `*****${questions[i]}*****\n${sanitizedText}\n\n`;
 }
 const redactedChat = recentChat.map((line) => redactPII(line));
-output += `Definition (Advanced)\n${redactedChat.join("\n")}`;
-
 const MAX_CHAT_LINES = 10;
 const MAX_LINE_LENGTH = 200;
 const minimisedChat = redactedChat
   .slice(-MAX_CHAT_LINES)
   .map((line) => (line.length > MAX_LINE_LENGTH ? line.slice(0, MAX_LINE_LENGTH) + "…" : line));
+output += `Definition (Advanced)\n${minimisedChat.join("\n")}`;
 await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, minimisedChat.join("\n"));
 
 // Attach provenance metadata and synthetic-content label before persisting
