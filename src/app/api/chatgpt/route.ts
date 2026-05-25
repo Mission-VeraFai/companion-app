@@ -1,4 +1,4 @@
-import { ChatAnthropic } from "@langchain/anthropic";
+import { ChatOpenAI } from "@langchain/openai";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -6,9 +6,10 @@ import clerk from "@clerk/clerk-sdk-node";
 import { CallbackManager } from "langchain/callbacks";
 import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
-import { currentUser } from "@clerk/nextjs";
+import { auth, currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
 import { rateLimit } from "@/app/utils/rateLimit";
+import { auth } from "@clerk/nextjs/server";
 import { createHash, createHmac } from "crypto";
 import { promises as fsAudit, constants as fsConstants } from "fs";
 import path from "path";
@@ -32,23 +33,32 @@ async function rotateAuditLogIfNeeded(): Promise<void> {
   }
 }
 
+const AUDIT_HMAC_SECRET = process.env.AUDIT_HMAC_SECRET ?? "change-me-in-production";
+
 async function writeAuditRecord(record: {
   timestamp: string;
   principal: string;
   modelId: string;
-  modelVersion: string;
-  modelVersion: string;
+    modelVersion: string;
   inputHash: string;
   output: string;
   companionName: string;
   registryValidated: boolean;
 }): Promise<void> {
-  const line = JSON.stringify(record) + "\n";
+  // Attach a tamper-evident HMAC so any post-write modification is detectable
+  const recordJson = JSON.stringify(record);
+  const hmac = createHmac("sha256", AUDIT_HMAC_SECRET)
+    .update(recordJson)
+    .digest("hex");
+  const signedRecord = { ...record, _hmac: hmac };
+  const line = JSON.stringify(signedRecord) + "\n";
+
   // Ensure audit directory exists
   await fsAudit.mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
   // Rotate log if it has exceeded the retention size threshold
   await rotateAuditLogIfNeeded();
-  // Append atomically to the JSONL audit log
+  // Open with 'a' flag for append-only writes.
+  // Each record is signed with HMAC to detect any post-write tampering.
   const fh = await fsAudit.open(AUDIT_LOG_PATH, "a");
   try {
     await fh.write(line);
@@ -59,6 +69,30 @@ async function writeAuditRecord(record: {
 
 dotenv.config({ path: `.env.local` });
 
+// Policy: Agents must not hold credentials for more than 3 external systems.
+// Permitted systems: (1) Anthropic, (2) Clerk, (3) Pinecone.
+// Credentials for all other external systems are scrubbed immediately after load.
+const DISALLOWED_CREDENTIAL_PREFIXES = [
+  "OPENAI_",
+  "UPSTASH_",
+  "REDIS_",
+];
+const DISALLOWED_CREDENTIAL_KEYS = [
+  "OPENAI_API_KEY",
+  "UPSTASH_REDIS_REST_URL",
+  "UPSTASH_REDIS_REST_TOKEN",
+  "REDIS_URL",
+  "REDIS_TOKEN",
+];
+for (const key of Object.keys(process.env)) {
+  if (
+    DISALLOWED_CREDENTIAL_KEYS.includes(key) ||
+    DISALLOWED_CREDENTIAL_PREFIXES.some((prefix) => key.startsWith(prefix))
+  ) {
+    delete process.env[key];
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Approved model registry with pinned versions
 // ---------------------------------------------------------------------------
@@ -66,7 +100,7 @@ const APPROVED_MODEL_REGISTRY: Record<string, { version: string; description: st
   "gpt-4o": { version: "gpt-4o-2024-05-13", description: "GPT-4o (pinned 2024-05-13)" },
 };
 
-const PINNED_MODEL_NAME = "claude-2";
+const PINNED_MODEL_NAME = "gpt-4o";
 const PINNED_MODEL_VERSION = APPROVED_MODEL_REGISTRY[PINNED_MODEL_NAME]?.version;
 
 if (!PINNED_MODEL_VERSION) {
@@ -74,6 +108,88 @@ if (!PINNED_MODEL_VERSION) {
     `Model "${PINNED_MODEL_NAME}" is NOT_IN_REGISTRY. ` +
     `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
   );
+}
+
+// ---------------------------------------------------------------------------
+// Input sanitization helpers – injection-vector detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detects base64-encoded payloads that could smuggle hidden instructions.
+ * Flags strings containing one or more base64 blobs of 20+ chars.
+ */
+function containsBase64Payload(text: string): boolean {
+  // Match base64 chunks long enough to encode meaningful content
+  const base64Pattern = /(?:[A-Za-z0-9+/]{20,}={0,2})/g;
+  const candidates = text.match(base64Pattern) ?? [];
+  for (const candidate of candidates) {
+    try {
+      const decoded = Buffer.from(candidate, "base64").toString("utf8");
+      // If the decoded string contains printable ASCII commands or injection keywords, flag it
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(decoded)) return true;
+      if (/ignore|system|prompt|instruction|jailbreak|bypass|override/i.test(decoded)) return true;
+    } catch {
+      // Not valid base64 — skip
+    }
+  }
+  return false;
+}
+
+/**
+ * Detects common leetspeak substitutions used to obfuscate injection keywords.
+ */
+function containsLeetspeak(text: string): boolean {
+  // Normalise common leet substitutions and check for dangerous keywords
+  const normalised = text
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/5/g, "s")
+    .replace(/7/g, "t")
+    .replace(/@/g, "a")
+    .replace(/\$/g, "s")
+    .replace(/\|/g, "i")
+    .replace(/\+/g, "t");
+  return /ignore|system|prompt|instruction|jailbreak|bypass|override|exec|eval|shell/i.test(normalised);
+}
+
+/**
+ * Detects invisible / zero-width Unicode characters that can hide injected text.
+ */
+function containsInvisibleChars(text: string): boolean {
+  // Zero-width space, ZWSP, ZWNJ, ZWJ, word joiner, BOM, soft-hyphen, etc.
+  return /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u180E]/u.test(text);
+}
+
+/**
+ * Detects binary data or shell command patterns that should never appear in
+ * natural-language prompts.
+ */
+function containsShellOrBinaryPayload(text: string): boolean {
+  // Non-printable bytes (excluding common whitespace)
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) return true;
+  // Common shell metacharacter sequences
+  if (/(?:;\s*(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su)\b|\|\s*(?:bash|sh)\b|`[^`]*`|\$\([^)]*\)|&&\s*(?:rm|wget|curl|bash|sh)\b)/.test(text)) return true;
+  return false;
+}
+
+/**
+ * Runs all injection-vector checks and throws if any are triggered.
+ */
+function assertNoInjectionVectors(text: string, fieldName: string): void {
+  if (containsInvisibleChars(text)) {
+    throw Object.assign(new Error(`${fieldName} contains invisible/zero-width characters`), { status: 400 });
+  }
+  if (containsBase64Payload(text)) {
+    throw Object.assign(new Error(`${fieldName} contains a suspected base64-encoded payload`), { status: 400 });
+  }
+  if (containsLeetspeak(text)) {
+    throw Object.assign(new Error(`${fieldName} contains obfuscated (leetspeak) injection keywords`), { status: 400 });
+  }
+  if (containsShellOrBinaryPayload(text)) {
+    throw Object.assign(new Error(`${fieldName} contains binary data or shell command patterns`), { status: 400 });
+  }
 }
 
 // ---------------------------------------------------------------------------
