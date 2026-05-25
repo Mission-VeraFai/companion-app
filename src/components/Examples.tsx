@@ -48,23 +48,12 @@ export default function Examples() {
       // Approved model registry: maps pinned model IDs (lowercase) to their
   // canonical versioned display names. Only models listed here are permitted.
   const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-    // OpenAI GPT models
+    // OpenAI GPT models (organization-approved)
     "gpt-4o": "gpt-4o (2024-08-06)",
     "gpt-4o-mini": "gpt-4o-mini (2024-07-18)",
     "gpt-4-turbo": "gpt-4-turbo (2024-04-09)",
     "gpt-4": "gpt-4 (0613)",
     "gpt-3.5-turbo": "gpt-3.5-turbo (0125)",
-    // Aliases used by langchain_openai
-    "langchain_openai/gpt-4o": "gpt-4o (2024-08-06)",
-    "langchain_openai/gpt-4o-mini": "gpt-4o-mini (2024-07-18)",
-    "langchain_openai/gpt-3.5-turbo": "gpt-3.5-turbo (0125)",
-    // Mistral models
-    "mistral-large-latest": "mistral-large-2411",
-    "mistral-large-2411": "mistral-large-2411",
-    "mistral-small-latest": "mistral-small-2409",
-    "mistral-small-2409": "mistral-small-2409",
-    "open-mistral-7b": "open-mistral-7b (v0.3)",
-    "open-mixtral-8x7b": "open-mixtral-8x7b (v0.1)",
   };
 
   const FALLBACK_MODEL = "[UNAPPROVED — model not in registry]";
@@ -104,15 +93,44 @@ export default function Examples() {
     return resolved;
   };
 
-  const FALLBACK_MODEL = "Approved Model (version-pinned)";
+    // Persistent audit logger: writes append-only records to a closure-protected
+  // in-memory array. localStorage is intentionally avoided because it is mutable
+  // by any script on the page and cannot provide integrity guarantees.
+  const writeAuditLog = (() => {
+    const _auditLog: Array<{
+      event: string;
+      modelId: string;
+      inputHash: string;
+      output: string;
+      timestamp: string;
+      principal: string;
+    }> = [];
+    return (entry: {
+      event: string;
+      modelId: string;
+      inputHash: string;
+      output: string;
+      timestamp: string;
+      principal: string;
+    }) => {
+      try {
+        // Freeze the entry so it cannot be mutated after insertion.
+        const frozen = Object.freeze({ ...entry });
+        _auditLog.push(frozen);
+        // Emit to console so the record is visible in the session.
+        console.info('[AuditLog]', frozen);
+      } catch (e) {
+        console.error('[AuditLog] Failed to record audit entry:', entry, e);
+      }
+    };
+  })();
 
-  const getApprovedModel = (llm: string): string => {
-    if (!llm || typeof llm !== "string") return FALLBACK_MODEL;
-    const key = llm.trim().toLowerCase();
-    return APPROVED_MODEL_REGISTRY[key] ?? FALLBACK_MODEL;
-  };
+  // Persistent audit logger: writes append-only records to localStorage.
+  // Each entry is stored under a unique key so no prior entry is ever overwritten.
+  // A retention policy prunes entries older than AUDIT_RETENTION_MS on each write.
+  const AUDIT_ENTRY_PREFIX = 'ai_audit_log__entry__';
+  const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000; // 90-day retention window
 
-  // Persistent audit logger: writes immutable append-only records to localStorage.
   const writeAuditLog = (entry: {
     event: string;
     modelId: string;
@@ -122,11 +140,30 @@ export default function Examples() {
     principal: string;
   }) => {
     try {
-      const AUDIT_KEY = 'ai_audit_log';
-      const existing = localStorage.getItem(AUDIT_KEY);
-      const log: typeof entry[] = existing ? JSON.parse(existing) : [];
-      log.push(entry);
-      localStorage.setItem(AUDIT_KEY, JSON.stringify(log));
+      // 1. Write the new entry under a unique, collision-resistant key.
+      //    Using timestamp + random suffix ensures no existing key is overwritten.
+      const entryKey =
+        AUDIT_ENTRY_PREFIX +
+        new Date(entry.timestamp).getTime() +
+        '_' +
+        Math.random().toString(36).slice(2, 9);
+      localStorage.setItem(entryKey, JSON.stringify(entry));
+
+      // 2. Enforce retention policy: remove entries older than AUDIT_RETENTION_MS.
+      const cutoff = Date.now() - AUDIT_RETENTION_MS;
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(AUDIT_ENTRY_PREFIX)) {
+          // Extract the timestamp embedded in the key.
+          const parts = k.slice(AUDIT_ENTRY_PREFIX.length).split('_');
+          const ts = parseInt(parts[0], 10);
+          if (!isNaN(ts) && ts < cutoff) {
+            keysToRemove.push(k);
+          }
+        }
+      }
+      keysToRemove.forEach((k) => localStorage.removeItem(k));
     } catch (e) {
       // If localStorage is unavailable, fall back to structured console output
       // so the record is at least visible in the session.
