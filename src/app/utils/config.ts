@@ -1,4 +1,5 @@
 import fs from "fs";
+import path from "path";
 import { Config } from "twilio/lib/twiml/VoiceResponse";
 
 class ConfigManager {
@@ -6,7 +7,8 @@ class ConfigManager {
   private config: any;
 
   private constructor() {
-    const data = fs.readFileSync("companions/companions.json", "utf8");
+    const companionsPath = path.resolve(__dirname, "../../companions/companions.json");
+    const data = fs.readFileSync(companionsPath, "utf8");
     this.config = JSON.parse(data);
   }
 
@@ -28,10 +30,15 @@ class ConfigManager {
 
   public getConfig(fieldName: string, configValue: string) {
     //).filter((c: any) => c.name === companionName);
+    // Validate fieldName against the allowlist to prevent object property injection
+    // and prototype pollution (e.g. __proto__, constructor attacks).
+    if (!ConfigManager.ALLOWED_CONFIG_FIELDS.includes(fieldName)) {
+      throw new Error(`Invalid fieldName: "${fieldName}" is not an allowed config field.`);
+    }
     try {
       if (!!this.config && this.config.length !== 0) {
         const result = this.config.filter(
-          (c: any) => c[fieldName] === configValue
+          (c: any) => Object.prototype.hasOwnProperty.call(c, fieldName) && c[fieldName] === configValue
         );
         if (result.length !== 0) {
           // Return only the explicitly allowed fields instead of the full record.
