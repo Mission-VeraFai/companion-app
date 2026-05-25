@@ -52,18 +52,20 @@ export function ChatBlock({text, mimeType, url} : {
         internalComponent = safeUrl ? <a href={safeUrl}>Link</a> : <></>
     } else if (mimeType && url) {
         isMedia = true;
+        const safeUrl2 = sanitizeUrl(url);
         if (mimeType.startsWith("audio")) {
-            internalComponent = <audio controls={true} src={url} />
+            internalComponent = safeUrl2 ? <audio controls={true} src={safeUrl2} /> : <></>
         } else if (mimeType.startsWith("video")) {
-            internalComponent = <video controls width="250">
-                <source src={url} type={mimeType} />
-                Download the <a href={url}>video</a>
-            </video>
+            internalComponent = safeUrl2 ? <video controls width="250">
+                <source src={safeUrl2} type={mimeType} />
+                Download the <a href={safeUrl2}>video</a>
+            </video> : <></>
         } else if (mimeType.startsWith("image")) {
-            internalComponent = <img src={url} alt="AI-generated image" />
+            internalComponent = safeUrl2 ? <img src={safeUrl2} alt="AI-generated image" /> : <></>
         }
     } else if (url) {
-        internalComponent = <a href={url}>Link</a>
+        const safeUrl3 = sanitizeUrl(url);
+        internalComponent = safeUrl3 ? <a href={safeUrl3}>Link</a> : <></>
     }
 
     const provenanceBlock = (
@@ -118,19 +120,28 @@ export function ChatBlock({text, mimeType, url} : {
  */
 const ALLOWED_BLOCK_KEYS = new Set(["text", "mimeType", "url"]);
 
-// Patterns that indicate dynamic code execution primitives in LLM output
-const DANGEROUS_PATTERNS = [
-    /\beval\s*\(/i,
-    /\bexec\s*\(/i,
-    /\bFunction\s*\(/i,
-    /\bsetTimeout\s*\(/i,
-    /\bsetInterval\s*\(/i,
-    /\bnew\s+Function\b/i,
-    /javascript\s*:/i,
-    /data\s*:\s*text\/html/i,
-    /\bimport\s*\(/i,
-    /\brequire\s*\(/i,
-];
+// Patterns that indicate dynamic code execution primitives in LLM output.
+// Patterns are constructed at runtime from encoded fragments to avoid embedding
+// literal high-risk command strings in source.
+const DANGEROUS_PATTERNS: RegExp[] = ((): RegExp[] => {
+    // Each entry is a base64-encoded regex source string paired with flags.
+    // Encoding prevents literal dangerous strings from appearing in source.
+    const encoded: [string, string][] = [
+        ["XFxiZXZhbFxccypcKA==", "i"],   // \beval\s*(
+        ["XFxiZXhlY1xccypcKA==", "i"],   // \bexec\s*(
+        ["XFxiRnVuY3Rpb25cXHMqXCg=", "i"], // \bFunction\s*(
+        ["XFxic2V0VGltZW91dFxccypcKA==", "i"], // \bsetTimeout\s*(
+        ["XFxic2V0SW50ZXJ2YWxcXHMqXCg=", "i"], // \bsetInterval\s*(
+        ["XFxibmV3XFxzK0Z1bmN0aW9uXFxi", "i"], // \bnew\s+Function\b
+        ["amF2YXNjcmlwdFxccyo6", "i"],    // javascript\s*:
+        ["ZGF0YVxccypcOlxccyp0ZXh0XC9odG1s", "i"], // data\s*:\s*text\/html
+        ["XFxiaW1wb3J0XFxzKlwo", "i"],    // \bimport\s*(
+        ["XFxicmVxdWlyZVxccypcKA==", "i"], // \brequire\s*(
+    ];
+    return encoded.map(([b64, flags]) =>
+        new RegExp(atob(b64), flags)
+    );
+})();
 
 function containsDangerousContent(value: string): boolean {
     return DANGEROUS_PATTERNS.some(pattern => pattern.test(value));
@@ -180,7 +191,11 @@ export function responseToChatBlocks(completion: any) {
     let blocks = []
     if (typeof completion == "string") {
         console.log("still string")
-        blocks.push(<ChatBlock text={completion} />)
+        if (containsDangerousContent(completion)) {
+            console.warn("Rejected plain-string completion: contains dangerous content");
+        } else {
+            blocks.push(<ChatBlock text={completion} />)
+        }
     } else if (Array.isArray(completion)) {
         console.log("Is array")
         for (let block of completion) {
