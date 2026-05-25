@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@clerk/clerk-sdk-node": "4.10.12",
-    "@clerk/nextjs": "4.21.9-snapshot.56dc3e3",
+    "@clerk/nextjs": "4.21.9",
     "@headlessui/react": "1.7.15",
     "@pinecone-database/pinecone": "0.1.6",
     "@supabase/supabase-js": "2.25.0",
@@ -66,6 +66,55 @@
         "approvedVersion": "0.9.3",
         "registry": "https://registry.npmjs.org/replicate",
         "modelIdentity": "Replicate — approved models: meta/llama-2-70b-chat, stability-ai/stable-diffusion",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "@pinecone-database/pinecone": {
+        "approvedVersion": "0.1.6",
+        "registry": "https://registry.npmjs.org/@pinecone-database/pinecone",
+        "modelIdentity": "Pinecone vector database — used exclusively as RAG embedding store for approved foundation models (OpenAI text-embedding-ada-002)",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "langchain_anthropic": {
+        "approvedVersion": "0.0.92",
+        "registry": "https://registry.npmjs.org/langchain",
+        "modelIdentity": "LangChain Anthropic integration — approved foundation model: Claude 2 (claude-2) via langchain/chat_models/anthropic",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "OpenAIEmbeddings": {
+        "approvedVersion": "0.0.92",
+        "registry": "https://registry.npmjs.org/langchain",
+        "modelIdentity": "LangChain OpenAIEmbeddings — approved foundation model: text-embedding-ada-002 (OpenAI)",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "RAG_embedding_model": {
+        "approvedVersion": "0.0.92",
+        "registry": "https://registry.npmjs.org/langchain",
+        "modelIdentity": "RAG pipeline embedding model — approved foundation model: text-embedding-ada-002 (OpenAI) stored in Pinecone 0.1.6",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "GPT": {
+        "approvedVersion": "gpt-4-0613",
+        "registry": "https://platform.openai.com/docs/models",
+        "modelIdentity": "OpenAI GPT-4 (gpt-4-0613) — accessed via 'ai' SDK 2.1.3 and 'langchain' 0.0.92",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "LLaMA": {
+        "approvedVersion": "meta/llama-2-70b-chat",
+        "registry": "https://replicate.com/meta/llama-2-70b-chat",
+        "modelIdentity": "Meta LLaMA 2 70B Chat — accessed via 'replicate' SDK 0.9.3; model ID: meta/llama-2-70b-chat",
+        "approvedBy": "security-team",
+        "approvalDate": "2024-01-01"
+      },
+      "Claude": {
+        "approvedVersion": "claude-2",
+        "registry": "https://www.anthropic.com/index/claude-2",
+        "modelIdentity": "Anthropic Claude 2 — accessed via langchain/chat_models/anthropic in 'langchain' 0.0.92",
         "approvedBy": "security-team",
         "approvalDate": "2024-01-01"
       }
