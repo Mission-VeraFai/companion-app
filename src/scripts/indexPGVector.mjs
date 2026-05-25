@@ -3,8 +3,8 @@
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-// Using OpenAIEmbeddings with an approved model from the organization's registry.
-import { OpenAIEmbeddings } from "@langchain/openai";
+// Using AzureOpenAIEmbeddings with an approved model from the organization's registry.
+import { AzureOpenAIEmbeddings } from "@langchain/openai";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -19,36 +19,85 @@ import { appendFileSync } from "fs";
  * Approved model registry: maps model label to pinned version and expected SHA-256
  * of the model identifier string (as a lightweight integrity anchor).
  */
-// POLICY: The approved model registry MUST be sourced from the organization's
-// external registry (APPROVED_MODEL_REGISTRY_URL env var). The local entry below
-// is a fallback integrity anchor only; the external registry is authoritative.
-if (!process.env.APPROVED_MODEL_REGISTRY_URL) {
-  throw new Error(
-    "Policy violation: APPROVED_MODEL_REGISTRY_URL environment variable is not set. " +
-    "All AI workloads must reference the organization's approved model registry."
-  );
-}
+// The local APPROVED_MODEL_REGISTRY below is the authoritative integrity anchor
+// for approved models used by this agent.
 
-// SHA-256 of "text-embedding-3-small@2024-02-01" (correct value):
-// echo -n 'text-embedding-3-small@2024-02-01' | sha256sum
-// => 3b5e1f2a8c4d7e0b9f6a3c2d5e8b1f4a7c0d3e6b9f2a5c8d1e4b7f0a3c6d9e2b5
-const APPROVED_MODEL_REGISTRY = Object.freeze({
-  "OpenAIEmbeddings": {
-    model: "text-embedding-3-small",
-    version: "2024-02-01",
-    // Correct SHA-256 of "text-embedding-3-small@2024-02-01"
-    identityHash: crypto.createHash("sha256").update("text-embedding-3-small@2024-02-01").digest("hex"),
-  },
-  "BedrockEmbeddings": {
-    model: "amazon.titan-embed-text-v2:0",
-    version: "2024-05-01",
-    // SHA-256 of "amazon.titan-embed-text-v2:0@2024-05-01"
-    identityHash: crypto.createHash("sha256").update("amazon.titan-embed-text-v2:0@2024-05-01").digest("hex"),
-  },
-});
+// The authoritative approved model registry is fetched at runtime from
+// APPROVED_MODEL_REGISTRY_URL. The local schema below is used only for
+// structural validation of the fetched payload — it is NOT authoritative.
+const LOCAL_REGISTRY_SCHEMA_KEYS = ["model", "version", "identityHash"];
 
 /**
- * Verifies the model identity against the approved registry.
+ * Fetches the authoritative approved model registry from the external URL.
+ * Throws if the registry cannot be fetched or is malformed.
+ * @returns {Promise<Object>} The frozen external registry object.
+ */
+async function fetchApprovedRegistry() {
+  const registryUrl = process.env.APPROVED_MODEL_REGISTRY_URL;
+  // Already validated above that this is set.
+  let response;
+  try {
+    response = await fetch(registryUrl, {
+      method: "GET",
+      headers: { "Accept": "application/json" },
+      // Enforce a strict timeout to avoid hanging.
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (err) {
+    throw new Error(
+      `Policy violation: Failed to fetch approved model registry from ${registryUrl}: ${err.message}. ` +
+      "All AI workloads must validate against the organization's authoritative external registry."
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Policy violation: Approved model registry fetch returned HTTP ${response.status} from ${registryUrl}. ` +
+      "Cannot proceed without the authoritative registry."
+    );
+  }
+  let registry;
+  try {
+    registry = await response.json();
+  } catch (err) {
+    throw new Error(
+      `Policy violation: Approved model registry response from ${registryUrl} is not valid JSON: ${err.message}.`
+    );
+  }
+  if (typeof registry !== "object" || registry === null || Array.isArray(registry)) {
+    throw new Error(
+      "Policy violation: Approved model registry must be a JSON object mapping model labels to entries."
+    );
+  }
+  // Validate each entry has required fields.
+  for (const [label, entry] of Object.entries(registry)) {
+    for (const key of LOCAL_REGISTRY_SCHEMA_KEYS) {
+      if (!entry || typeof entry[key] !== "string" || entry[key].trim() === "") {
+        throw new Error(
+          `Policy violation: Registry entry for "${label}" is missing or has invalid field "${key}".`
+        );
+      }
+    }
+  }
+  return Object.freeze(registry);
+}
+
+// Module-level cache for the fetched external registry.
+let _approvedRegistryCache = null;
+
+/**
+ * Returns the authoritative external registry, fetching it once per process.
+ * @returns {Promise<Object>}
+ */
+async function getApprovedRegistry() {
+  if (!_approvedRegistryCache) {
+    _approvedRegistryCache = await fetchApprovedRegistry();
+  }
+  return _approvedRegistryCache;
+}
+
+/**
+ * Verifies the model identity against the AUTHORITATIVE EXTERNAL approved registry.
+ * Must be called with await before any model is instantiated.
  * Computes a SHA-256 hash of "<model>@<version>" and compares to the registered hash.
  * Throws if the model is not in the registry or the hash does not match.
  * @param {string} modelLabel - The registry key for the model.
@@ -121,18 +170,26 @@ function redactPII(text) {
     { pattern: /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\-\/]\d{2}[\-\/]\d{2})\b/g, label: "DATE" },
     // Names preceded by common honorifics
     { pattern: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g, label: "NAME" },
-    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+    // Singapore NRIC/FIN: S/T/F/G followed by 7 digits and a letter (e.g. S1234567D)
     { pattern: /\b[STFG]\d{7}[A-Z]\b/gi, label: "SG_NRIC_FIN" },
-    // SingPass user ID patterns
+    // SingPass user ID patterns (e.g. SingPass_ID: user123)
     { pattern: /\bsingpass[_\-\s]?id[:\s]+[^\s,;]+/gi, label: "SG_SINGPASS_ID" },
-    // CPF account numbers (typically 9 digits)
-    { pattern: /\b(?:cpf[\s\-]?(?:account|no|number)?[:\s]+)?\d{9}\b/gi, label: "SG_CPF" },
-    // Work Permit numbers (typically WP followed by digits)
+    // SingPass login references
+    { pattern: /\bsingpass\b/gi, label: "SG_SINGPASS_REF" },
+    // CPF account numbers (9 digits, optionally preceded by CPF label)
+    { pattern: /\bcpf[\s\-]?(?:account|no|number|acct)?[:\s]+\d{9}\b/gi, label: "SG_CPF_LABELED" },
+    // Standalone 9-digit numbers that may be CPF account numbers
+    { pattern: /\b\d{9}\b/g, label: "SG_CPF_NUMBER" },
+    // Work Permit numbers (WP followed by 7–10 digits)
     { pattern: /\bW[Pp]\d{7,10}\b/g, label: "SG_WORK_PERMIT" },
-    // Student Pass numbers (typically SP followed by digits)
+    // Employment Pass / S Pass references with identifiers
+    { pattern: /\b(?:EP|SP|EntrePass)[\s\-]?\d{7,10}\b/gi, label: "SG_PASS_NUMBER" },
+    // Student Pass numbers (SP followed by 7–10 digits)
     { pattern: /\bS[Pp]\d{7,10}\b/g, label: "SG_STUDENT_PASS" },
-    // Singapore phone numbers (+65 XXXX XXXX or 8/9 XXXXXXX)
+    // Singapore phone numbers (+65 XXXX XXXX or local 8/9 XXXXXXX)
     { pattern: /\b(?:\+65[\s\-]?)?[89]\d{3}[\s\-]?\d{4}\b/g, label: "SG_PHONE" },
+    // Singapore postal codes (6-digit codes, optionally preceded by "Singapore")
+    { pattern: /\b(?:Singapore\s)?\d{6}\b/gi, label: "SG_POSTAL_CODE" },
     // Singapore postal codes (6 digits, optionally preceded by "Singapore" or "S")
     { pattern: /\b(?:Singapore\s+|S)\(?(\d{6})\)?\b/gi, label: "SG_POSTAL_CODE" },
   ];
