@@ -1,4 +1,4 @@
-import { OpenAI } from "langchain/llms/openai";
+import { Anthropic } from "langchain/llms/anthropic";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -9,23 +9,45 @@ import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
 import { rateLimit } from "@/app/utils/rateLimit";
-import { createHash } from "crypto";
+import { createHash, createHmac } from "crypto";
 import { promises as fsAudit, constants as fsConstants } from "fs";
 import path from "path";
 
 const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit", "ai_audit.jsonl");
+const AUDIT_MAX_BYTES = 10 * 1024 * 1024; // 10 MB retention/rotation threshold
+
+async function rotateAuditLogIfNeeded(): Promise<void> {
+  try {
+    const stat = await fsAudit.stat(AUDIT_LOG_PATH);
+    if (stat.size >= AUDIT_MAX_BYTES) {
+      const rotatedPath = AUDIT_LOG_PATH.replace(
+        /\.jsonl$/,
+        `_${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`
+      );
+      await fsAudit.rename(AUDIT_LOG_PATH, rotatedPath);
+    }
+  } catch (err: unknown) {
+    // File does not exist yet — no rotation needed
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
 
 async function writeAuditRecord(record: {
   timestamp: string;
   principal: string;
   modelId: string;
+  modelVersion: string;
+  modelVersion: string;
   inputHash: string;
   output: string;
   companionName: string;
+  registryValidated: boolean;
 }): Promise<void> {
   const line = JSON.stringify(record) + "\n";
   // Ensure audit directory exists
   await fsAudit.mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+  // Rotate log if it has exceeded the retention size threshold
+  await rotateAuditLogIfNeeded();
   // Append atomically to the JSONL audit log
   const fh = await fsAudit.open(AUDIT_LOG_PATH, "a");
   try {
@@ -36,6 +58,25 @@ async function writeAuditRecord(record: {
 }
 
 dotenv.config({ path: `.env.local` });
+
+// ---------------------------------------------------------------------------
+// Approved model registry with pinned versions
+// ---------------------------------------------------------------------------
+const APPROVED_MODEL_REGISTRY: Record<string, { version: string; description: string }> = {
+  "gpt-3.5-turbo": { version: "gpt-3.5-turbo-0125", description: "GPT-3.5 Turbo (pinned 0125)" },
+  "gpt-4": { version: "gpt-4-0613", description: "GPT-4 (pinned 0613)" },
+  "gpt-4-turbo": { version: "gpt-4-turbo-2024-04-09", description: "GPT-4 Turbo (pinned 2024-04-09)" },
+};
+
+const PINNED_MODEL_NAME = "gpt-3.5-turbo";
+const PINNED_MODEL_VERSION = APPROVED_MODEL_REGISTRY[PINNED_MODEL_NAME]?.version;
+
+if (!PINNED_MODEL_VERSION) {
+  throw new Error(
+    `Model "${PINNED_MODEL_NAME}" is NOT_IN_REGISTRY. ` +
+    `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Input sanitization helpers
@@ -65,9 +106,23 @@ function isValidName(name: string | null): name is string {
 }
 
 export async function POST(req: Request) {
-  let clerkUserId;
-  let user;
-  let clerkUserName;
+  let clerkUserId: string | undefined;
+  let user: Awaited<ReturnType<typeof currentUser>>;
+  let clerkUserName: string | undefined;
+
+  // Resolve the authenticated session first — this is mandatory for ALL request paths.
+  user = await currentUser();
+  if (!user || !user.id) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized: valid session required." }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  clerkUserId = user.id;
+  clerkUserName = sanitizeText(
+    user.firstName ?? user.username ?? "",
+    MAX_NAME_LENGTH
+  );
   const rawBody = await req.json();
   const rawPrompt: string = rawBody.prompt ?? "";
   const isText: boolean = rawBody.isText ?? false;
@@ -114,7 +169,20 @@ export async function POST(req: Request) {
 
   console.log("prompt: ", prompt);
   if (isText) {
-    clerkUserId = userId;
+    // Require a signed, time-limited HMAC token to authenticate the userId
+    // for the isText code path. Reject unsigned/unauthenticated user IDs.
+    const verifiedUserId = verifyIsTextToken(isTextToken, ISTEXT_HMAC_SECRET);
+    if (!verifiedUserId) {
+      console.log("isText token missing, invalid, or expired");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    clerkUserId = verifiedUserId;
     clerkUserName = sanitizeText(userName, MAX_NAME_LENGTH);
   } else {
     user = await currentUser();
@@ -275,7 +343,12 @@ export async function POST(req: Request) {
   };
   console.log("[MODEL_IDENTITY]", JSON.stringify(modelIdentityMetadata));
 
-  const model = new OpenAI({
+  // Model identity recorded for audit and request metadata
+const MODEL_ID = PINNED_MODEL_NAME;
+const MODEL_VERSION = PINNED_MODEL_VERSION;
+
+const model = new OpenAI({
+  modelName: MODEL_VERSION, // pinned version from approved registry
     streaming: true,
     modelName: PINNED_MODEL_NAME,
     openAIApiKey: process.env.OPENAI_API_KEY,
@@ -345,6 +418,13 @@ Below is a relevant conversation history
   const inputPayload = JSON.stringify({ relevantHistory, recentChatHistory });
   const inputHash = createHash("sha256").update(inputPayload).digest("hex");
 
+  // Build a signed provenance token: base64(modelId + timestamp + inputHash), HMAC-signed
+  const provenanceSecret = process.env.PROVENANCE_SIGNING_SECRET ?? "default-insecure-secret";
+  const provenanceTimestamp = new Date().toISOString();
+  const provenancePayload = JSON.stringify({ modelId: MODEL_ID, inputHash, timestamp: provenanceTimestamp, principal: clerkUserId });
+  const provenanceSignature = createHmac("sha256", provenanceSecret).update(provenancePayload).digest("hex");
+  const provenanceToken = Buffer.from(provenancePayload).toString("base64") + "." + provenanceSignature;
+
   const result = await chain
     .call({
       relevantHistory,
@@ -353,14 +433,20 @@ Below is a relevant conversation history
     .catch(console.error);
 
   // Write durable audit record immediately after inference
-  await writeAuditRecord({
-    timestamp: new Date().toISOString(),
-    principal: clerkUserId!,
-    modelId: MODEL_ID,
-    inputHash,
-    output: result?.text ?? "",
-    companionName: name ?? "unknown",
-  });
+    try {
+    await writeAuditRecord({
+      timestamp: new Date().toISOString(),
+      principal: clerkUserId,
+      modelId: "gpt-3.5-turbo",
+      modelVersion: process.env.OPENAI_MODEL_VERSION ?? "gpt-3.5-turbo-0125",
+      inputHash,
+      output: auditOutput,
+      companionName: sanitizedName,
+    });
+  } catch (auditErr) {
+    console.error("[AUDIT] Failed to write audit record — aborting AI action:", auditErr);
+    return new NextResponse("Audit logging failure; request aborted.", { status: 500 });
+  }
 
   console.log("result", result);
   // Validate and sanitize LLM output before use
@@ -406,13 +492,28 @@ Below is a relevant conversation history
     .replace(/<[^>]+>/g, "")
     .trim();
 
+  // Watermark: append an invisible Unicode watermark sequence encoding the provenance signature
+  // Uses zero-width characters to encode the first 8 hex chars of the provenance signature
+  const watermarkChars: Record<string, string> = { "0": "\u200B", "1": "\u200C", "2": "\u200D", "3": "\uFEFF", "4": "\u2060", "5": "\u2061", "6": "\u2062", "7": "\u2063", "8": "\u2064", "9": "\u206A", a: "\u206B", b: "\u206C", c: "\u206D", d: "\u206E", e: "\u206F", f: "\u200E" };
+  const watermark = provenanceSignature.slice(0, 8).split("").map((c) => watermarkChars[c] ?? "").join("");
+  const watermarkedOutput = sanitizedOutput + watermark;
+
   const chatHistoryRecord = await memoryManager.writeToHistory(
     sanitizedOutput + "\n",
     companionKey
   );
   console.log("chatHistoryRecord", chatHistoryRecord);
+  // Common AI-content provenance headers for all response types
+  const aiContentHeaders: Record<string, string> = {
+    "X-AI-Generated": "true",
+    "X-AI-Model-ID": MODEL_ID,
+    "X-AI-Provenance-Token": provenanceToken,
+    "X-AI-Content-Label": "synthetic-ai-generated-text",
+    "X-AI-Watermark-Present": "true",
+  };
+
   if (isText) {
-    return NextResponse.json(sanitizedOutput);
+    return NextResponse.json(watermarkedOutput, { headers: aiContentHeaders });
   }
-  return new StreamingTextResponse(stream);
+  return new StreamingTextResponse(stream, { headers: aiContentHeaders });
 }

@@ -6,6 +6,14 @@ import { Fragment, useState } from "react";
 import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
+import crypto from "crypto";
+
+/** Compute a SHA-256 HMAC over provenance metadata for tamper-evidence. */
+function signProvenance(provenance: { generatedAt: string; model: string; synthetic: boolean }): string {
+  const secret = process.env.PROVENANCE_SIGNING_SECRET ?? "default-dev-secret-change-in-prod";
+  const payload = JSON.stringify(provenance);
+  return crypto.createHmac("sha256", secret).update(payload).digest("hex");
+}
 
 const MAX_PROMPT_LENGTH = 500;
 
@@ -51,6 +59,7 @@ export default function TextToImgModal({
     model: string;
     synthetic: boolean;
   } | null>(null);
+  const [provenanceSignature, setProvenanceSignature] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const sanitizePrompt = (input: string): string | null => {
@@ -101,6 +110,29 @@ export default function TextToImgModal({
     return stripped;
   };
 
+  // Approved model registry and pinned version — must match server-side allowlist
+  const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+    "stable-diffusion-v1-5": "stable-diffusion-v1-5",
+    "stable-diffusion-xl-1.0": "stable-diffusion-xl-1.0",
+  };
+  const PINNED_MODEL_ID = "stable-diffusion-v1-5";
+
+  const validateModelProvenance = (responseModel: unknown): void => {
+    if (typeof responseModel !== "string" || responseModel.trim() === "") {
+      throw new Error("Model provenance check failed: response did not include a model identifier.");
+    }
+    if (!APPROVED_MODEL_REGISTRY[responseModel]) {
+      throw new Error(
+        `Model provenance check failed: model '${responseModel}' is not in the approved registry.`
+      );
+    }
+    if (responseModel !== PINNED_MODEL_ID) {
+      throw new Error(
+        `Model version mismatch: expected '${PINNED_MODEL_ID}', got '${responseModel}'.`
+      );
+    }
+  };
+
   const onSubmit = async (e: any) => {
     e.preventDefault();
     setPromptError("");
@@ -117,17 +149,26 @@ export default function TextToImgModal({
       alert("Invalid prompt. Please enter a plain text image description without special commands or encoded content.");
       return;
     }
-    const response = await fetch("/api/txt2img", {
+    const response = await fetch("/api/approved-txt2img", {
       method: "POST",
       body: JSON.stringify({
         prompt: sanitizedPrompt,
+        model: PINNED_MODEL_ID,
       }),
       headers: {
         "Content-Type": "application/json",
       },
     });
     const data = await response.json();
-    const rawSrc: unknown = data[0];
+    // Data minimisation: extract only the image source field from the first element,
+    // discarding all other metadata fields the API may return.
+    const firstItem: unknown = Array.isArray(data) ? data[0] : undefined;
+    const rawSrc: unknown =
+      firstItem !== null && typeof firstItem === "object"
+        ? (firstItem as Record<string, unknown>)["url"] ??
+          (firstItem as Record<string, unknown>)["b64_json"] ??
+          (firstItem as Record<string, unknown>)["src"]
+        : firstItem;
     // Validate and sanitize LLM output before use
     const sanitizeImageSrc = (src: unknown): string => {
       if (typeof src !== "string") {

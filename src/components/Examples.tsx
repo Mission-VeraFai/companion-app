@@ -6,6 +6,28 @@ import { Tooltip } from "react-tooltip";
 
 import { getCompanions } from "./actions";
 
+// Allowlist of trusted image hosting domains.
+const ALLOWED_IMAGE_DOMAINS = [
+  'localhost',
+  'your-app-domain.com',
+  'cdn.your-app-domain.com',
+  'lh3.googleusercontent.com',
+  'avatars.githubusercontent.com',
+];
+
+function isSafeImageUrl(url: string): boolean {
+  if (!url || url.trim() === '') return false;
+  // Allow relative paths (e.g. /images/avatar.png)
+  if (url.startsWith('/')) return true;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    return ALLOWED_IMAGE_DOMAINS.includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 export default function Examples() {
   const [QAModalOpen, setQAModalOpen] = useState(false);
   const [CompParam, setCompParam] = useState({
@@ -19,10 +41,41 @@ export default function Examples() {
       title: "",
       imageUrl: "",
       llm: "",
-      phone: "",
       telegramLink: null
     },
   ]);
+
+  const APPROVED_LLMS: Record<string, string> = {
+    "claude-3-opus": "Claude 3 Opus",
+    "claude-3-sonnet": "Claude 3 Sonnet",
+    "claude-3-haiku": "Claude 3 Haiku",
+    "claude-2": "Claude 2",
+    "claude-instant": "Claude Instant",
+  };
+
+  const getApprovedLlmLabel = (llm: string): string | null => {
+    const key = (llm || "").toLowerCase().trim();
+    return APPROVED_LLMS[key] ?? null;
+  };
+
+    // Approved model registry: maps canonical model IDs to pinned display names.
+  const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+    "gpt-4": "GPT-4 (gpt-4-0613)",
+    "gpt-4-turbo": "GPT-4 Turbo (gpt-4-turbo-2024-04-09)",
+    "gpt-3.5-turbo": "GPT-3.5 Turbo (gpt-3.5-turbo-0125)",
+    "claude-3-opus": "Claude 3 Opus (claude-3-opus-20240229)",
+    "claude-3-sonnet": "Claude 3 Sonnet (claude-3-sonnet-20240229)",
+    "claude-3-haiku": "Claude 3 Haiku (claude-3-haiku-20240307)",
+    "gemini-pro": "Gemini Pro (gemini-pro-001)",
+  };
+
+  const FALLBACK_MODEL = "Approved Model (version-pinned)";
+
+  const getApprovedModel = (llm: string): string => {
+    if (!llm || typeof llm !== "string") return FALLBACK_MODEL;
+    const key = llm.trim().toLowerCase();
+    return APPROVED_MODEL_REGISTRY[key] ?? FALLBACK_MODEL;
+  };
 
   useEffect(() => {
     const fetchData = async () => {
@@ -33,7 +86,7 @@ export default function Examples() {
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          llm: entry.llm,
+          llm: getApprovedModel(entry.llm),
           phone: entry.phone,
           telegramLink: entry.telegramLink
         }));
@@ -73,7 +126,7 @@ export default function Examples() {
                 height={0}
                 sizes="100vw"
                 className="mx-auto h-32 w-32 flex-shrink-0 rounded-full"
-                src={example.imageUrl}
+                src={isSafeImageUrl(example.imageUrl) ? example.imageUrl : '/placeholder-avatar.png'}
                 alt=""
               />
               <h3 className="mt-6 text-sm font-medium text-white">
@@ -82,7 +135,7 @@ export default function Examples() {
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
-                  {example.title}. Running on <b>{example.llm}</b>.
+                  {example.title}.{getApprovedLlmLabel(example.llm) ? <> Running on <b>{getApprovedLlmLabel(example.llm)}</b>.</> : null}
                   {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
                     <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault();}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}

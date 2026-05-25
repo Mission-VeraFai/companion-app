@@ -1,27 +1,54 @@
 import { Redis } from "@upstash/redis";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { CohereEmbeddings } from "langchain/embeddings/cohere";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
 
 // ── Model registry ────────────────────────────────────────────────────────────
-const APPROVED_EMBEDDING_MODELS: ReadonlySet<string> = new Set([
-  "text-embedding-ada-002",
-]);
+// Approved embedding models are loaded from the organizational registry
+// configured via the APPROVED_EMBEDDING_MODELS environment variable.
+// Format: comma-separated model identifiers, e.g.
+//   APPROVED_EMBEDDING_MODELS="text-embedding-ada-002,text-embedding-3-small"
+// This variable MUST be set and managed by the central AI governance team.
+function loadApprovedEmbeddingModels(): ReadonlySet<string> {
+  const registryEnv = process.env.APPROVED_EMBEDDING_MODELS;
+  if (!registryEnv || registryEnv.trim() === "") {
+    throw new Error(
+      "APPROVED_EMBEDDING_MODELS environment variable is not set. " +
+      "This must be configured from the organizational model registry before any AI workload can run."
+    );
+  }
+  const models = registryEnv
+    .split(",")
+    .map((m) => m.trim())
+    .filter((m) => m.length > 0);
+  if (models.length === 0) {
+    throw new Error(
+      "APPROVED_EMBEDDING_MODELS environment variable is empty after parsing. " +
+      "Provide at least one approved model identifier from the organizational registry."
+    );
+  }
+  return new Set(models);
+}
 
-const PINNED_EMBEDDING_MODEL = "text-embedding-ada-002";
+const APPROVED_EMBEDDING_MODELS: ReadonlySet<string> = loadApprovedEmbeddingModels();
+
+// PINNED_EMBEDDING_MODEL must be present in the organizational registry loaded above.
+const PINNED_EMBEDDING_MODEL =
+  process.env.PINNED_EMBEDDING_MODEL ?? "text-embedding-ada-002";
 
 function createApprovedEmbeddings(apiKey: string | undefined): OpenAIEmbeddings {
   if (!APPROVED_EMBEDDING_MODELS.has(PINNED_EMBEDDING_MODEL)) {
     throw new Error(
-      `Model '${PINNED_EMBEDDING_MODEL}' is NOT in the approved model registry. ` +
-      `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}`
+      `Model '${PINNED_EMBEDDING_MODEL}' is NOT in the approved organizational model registry. ` +
+      `Approved models: ${[...APPROVED_EMBEDDING_MODELS].join(", ")}. ` +
+      `Update APPROVED_EMBEDDING_MODELS via the central AI governance registry.`
     );
   }
   console.log(
     `INFO: model identity — provider=openai model=${PINNED_EMBEDDING_MODEL} ` +
-    `registry=approved timestamp=${new Date().toISOString()}`
+    `registry=organizational-env-var approved=true timestamp=${new Date().toISOString()}`
   );
   return new OpenAIEmbeddings({
     openAIApiKey: apiKey,
@@ -89,12 +116,6 @@ function sanitizeChatHistory(input: string): string {
   if (sanitized.length === 0) {
     throw new Error("Invalid input: recentChatHistory is empty after sanitization.");
   }
-  return sanitized;
-}
-
-function sanitizeChatHistory(input: string): string {
-  // Remove null bytes and non-printable control characters (except common whitespace)
-  let sanitized = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 
   // Detect and strip base64-encoded blobs (20+ char base64 strings)
   sanitized = sanitized.replace(/[A-Za-z0-9+/]{20,}={0,2}/g, "[REDACTED_BASE64]");
@@ -128,18 +149,32 @@ function sanitizeChatHistory(input: string): string {
     sanitized = sanitized.replace(pattern, "[REDACTED_INJECTION]");
   }
 
-  // Truncate to a safe maximum length to prevent oversized payloads
-  const MAX_LENGTH = 4000;
-  if (sanitized.length > MAX_LENGTH) {
-    sanitized = sanitized.slice(-MAX_LENGTH);
+  return sanitized;
+}
+
+class HistoryStore {
+  private static instance: HistoryStore;
+  private client: Redis | null = null;
+
+  private constructor() {}
+
+  public static getInstance(): HistoryStore {
+    if (!HistoryStore.instance) {
+      HistoryStore.instance = new HistoryStore();
+    }
+    return HistoryStore.instance;
   }
 
-  return sanitized;
+  public getClient(): Redis {
+    if (!this.client) {
+      this.client = Redis.fromEnv();
+    }
+    return this.client;
+  }
 }
 
 class MemoryManager {
   private static instance: MemoryManager;
-  private history: Redis | null = null;
   private vectorDBClient: PineconeClient | SupabaseClient;
 
   public constructor() {
@@ -158,10 +193,7 @@ class MemoryManager {
   }
 
   private getHistory(): Redis {
-    if (!this.history) {
-      this.history = Redis.fromEnv();
-    }
-    return this.history;
+    return HistoryStore.getInstance().getClient();
   }
 
   public async init() {
@@ -220,6 +252,38 @@ class MemoryManager {
           console.log("WARNING: failed to get vector search results.", err);
         });
       console.log("INFO: LLM interaction end - Supabase similaritySearch results", { resultCount: similarDocs ? similarDocs.length : 0, results: similarDocs });
+      if (similarDocs && similarDocs.length > 0) {
+        const { createHmac } = require("crypto");
+        const secret = process.env.REDIS_KEY_SECRET || "default-provenance-secret";
+        const timestamp = new Date().toISOString();
+        similarDocs = similarDocs.map((doc: any) => {
+          const provenancePayload = JSON.stringify({
+            modelId: PINNED_EMBEDDING_MODEL,
+            timestamp,
+            originTag: "ai-generated",
+            syntheticLabel: "SYNTHETIC_AI_CONTENT",
+            contentType: "vector-search-result",
+          });
+          const contentStr = typeof doc.pageContent === "string" ? doc.pageContent : JSON.stringify(doc.pageContent);
+          const signature = createHmac("sha256", secret)
+            .update(provenancePayload + contentStr)
+            .digest("hex");
+          return {
+            ...doc,
+            metadata: {
+              ...(doc.metadata || {}),
+              _provenance: {
+                modelId: PINNED_EMBEDDING_MODEL,
+                timestamp,
+                originTag: "ai-generated",
+                syntheticLabel: "SYNTHETIC_AI_CONTENT",
+                contentType: "vector-search-result",
+                signature,
+              },
+            },
+          };
+        });
+      }
       return similarDocs;
     }
   }
@@ -230,6 +294,32 @@ class MemoryManager {
       await MemoryManager.instance.init();
     }
     return MemoryManager.instance;
+  }
+
+  private generateTraceId(): string {
+    const { randomBytes } = require("crypto");
+    return randomBytes(16).toString("hex");
+  }
+
+  private hashInput(input: string): string {
+    const { createHash } = require("crypto");
+    return createHash("sha256").update(input).digest("hex");
+  }
+
+  private async appendAuditLog(entry: Record<string, string>): Promise<void> {
+    try {
+      // XADD to an append-only Redis stream; MAXLEN caps retention at 100,000 entries
+      await (this.history as any).xadd(
+        "audit:ai_actions",
+        "MAXLEN",
+        "~",
+        "100000",
+        "*",
+        ...Object.entries(entry).flat()
+      );
+    } catch (err) {
+      console.error("AUDIT LOG WRITE FAILED", err, entry);
+    }
   }
 
   private generateRedisCompanionKey(companionKey: CompanionKey): string {
@@ -243,6 +333,28 @@ class MemoryManager {
     return `session:${mac}`;
   }
 
+  private verifyRedisCompanionKey(companionKey: CompanionKey, key: string): boolean {
+    // Re-derive the expected key and compare using timing-safe equality
+    const expected = this.generateRedisCompanionKey(companionKey);
+    const { timingSafeEqual } = require("crypto");
+    try {
+      const a = Buffer.from(expected);
+      const b = Buffer.from(key);
+      if (a.length !== b.length) return false;
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  private async getVerifiedKey(companionKey: CompanionKey): Promise<string> {
+    const key = this.generateRedisCompanionKey(companionKey);
+    if (!this.verifyRedisCompanionKey(companionKey, key)) {
+      throw new Error("Session key verification failed: key integrity check did not pass");
+    }
+    return key;
+  }
+
   public async writeToHistory(text: string, companionKey: CompanionKey) {
     if (!companionKey || typeof companionKey.userId == "undefined") {
       console.log("Companion key set incorrectly");
@@ -250,14 +362,87 @@ class MemoryManager {
     }
 
     const key = this.generateRedisCompanionKey(companionKey);
+    const writeTimestamp = Date.now();
+    const traceId = this.generateTraceId();
+    // Embed trace ID in the stored member so each entry is self-describing
+    const memberWithTrace = JSON.stringify({ traceId, ts: writeTimestamp, text });
     const result = await this.history.zadd(key, {
-      score: Date.now(),
-      member: text,
+      score: writeTimestamp,
+      member: memberWithTrace,
     });
     // Enforce expiry: session history expires after 24 hours of inactivity
     await this.history.expire(key, 86400);
 
+    // Audit: log chat history write to append-only stream for forensic readiness
+    await this.appendAuditLog({
+      traceId,
+      event: "chat_history_write",
+      userId: companionKey.userId,
+      companionName: companionKey.companionName,
+      modelName: companionKey.modelName,
+      textHash: this.hashInput(text),
+      timestamp: new Date(writeTimestamp).toISOString(),
+      redisKey: key,
+    });
+
     return result;
+  }
+
+    private sanitizeHistoryEntry(entry: string): string {
+    // Remove base64-encoded content (sequences of 20+ base64 chars)
+    entry = entry.replace(/[A-Za-z0-9+/]{20,}={0,2}/g, "[REDACTED_BASE64]");
+
+    // Remove shell command patterns
+    entry = entry.replace(
+      /(`[^`]*`|\$\([^)]*\)|\b(bash|sh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[({["'`])/gi,
+      "[REDACTED_CMD]"
+    );
+
+    // Remove hidden prompt injection markers and common jailbreak patterns
+    entry = entry.replace(
+      /(ignore (previous|above|all) instructions?|disregard (previous|above|all)|you are now|act as|pretend (you are|to be)|system prompt|<\/?s(ystem|\|im_start\|)|\[INST\]|\[\/?SYS\]|###\s*(system|instruction|prompt))/gi,
+      "[REDACTED_INJECTION]"
+    );
+
+    // Remove HTML/script tags that could carry hidden instructions
+    entry = entry.replace(/<[^>]{0,200}>/g, "");
+
+    // Remove null bytes and non-printable control characters (except newline/tab)
+    entry = entry.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+    return entry.trim();
+  }
+
+    private buildProvenanceEnvelope(content: string, contentType: string): string {
+    const { createHmac } = require("crypto");
+    const secret = process.env.REDIS_KEY_SECRET || "default-provenance-secret";
+    const timestamp = new Date().toISOString();
+    const modelId = PINNED_EMBEDDING_MODEL;
+    const originTag = "ai-generated";
+    const provenanceHeader = JSON.stringify({
+      _provenance: {
+        modelId,
+        timestamp,
+        originTag,
+        contentType,
+        syntheticLabel: "SYNTHETIC_AI_CONTENT",
+      },
+    });
+    const signature = createHmac("sha256", secret)
+      .update(provenanceHeader + content)
+      .digest("hex");
+    const envelope = JSON.stringify({
+      _provenance: {
+        modelId,
+        timestamp,
+        originTag,
+        contentType,
+        syntheticLabel: "SYNTHETIC_AI_CONTENT",
+        signature,
+      },
+      content,
+    });
+    return envelope;
   }
 
   public async readLatestHistory(companionKey: CompanionKey): Promise<string> {
@@ -266,6 +451,27 @@ class MemoryManager {
       return "";
     }
 
+    const key = await this.getVerifiedKey(companionKey);
+    let result = await this.history.zrange(key, 0, Date.now(), {
+      byScore: true,
+    });
+
+    result = result.slice(-10).reverse();
+    const recentChats = result.reverse().join("\n");
+    return this.buildProvenanceEnvelope(recentChats, "chat-history");
+  }
+
+    const key = this.generateRedisCompanionKey(companionKey);
+    let result = await this.history.zrange(key, 0, Date.now(), {
+      byScore: true,
+    });
+
+    result = result.slice(-10).reverse();
+    const sanitizedEntries = result.reverse().map((entry) => this.sanitizeHistoryEntry(entry));
+    const recentChats = sanitizedEntries.join("\n");
+    return recentChats;
+  }
+
     const key = this.generateRedisCompanionKey(companionKey);
     let result = await this.history.zrange(key, 0, Date.now(), {
       byScore: true,
@@ -273,7 +479,7 @@ class MemoryManager {
 
     result = result.slice(-10).reverse();
     const recentChats = result.reverse().join("\n");
-    return recentChats;
+    return sanitizeChatHistory(recentChats);
   }
 
   public async seedChatHistory(
@@ -281,7 +487,7 @@ class MemoryManager {
     delimiter: string = "\n",
     companionKey: CompanionKey
   ) {
-    const key = this.generateRedisCompanionKey(companionKey);
+    const key = await this.getVerifiedKey(companionKey);
     if (await this.history.exists(key)) {
       console.log("User already has chat history");
       return;

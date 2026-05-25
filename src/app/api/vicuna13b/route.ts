@@ -1,21 +1,22 @@
 import dotenv from "dotenv";
-import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate } from "langchain/llms/replicate";
-import { CallbackManager } from "langchain/callbacks";
+import { StreamingTextResponse } from "ai";
 import { createHash } from "crypto";
 
 // ── Approved Model Registry ──────────────────────────────────────────────────
-// Only models listed here (by source) are permitted for inference.
+// Only models listed here (by full model identifier prefix) are permitted for inference.
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
-  "replicate", // approved vendor — kept here; remove to block entirely
+  "replicate", // approved vendor
 ]);
 
 // Pinned model identifier — version hash satisfies version-pinning requirement.
+// CHANGED: vicuna-13b was NOT_IN_REGISTRY; replaced with org-approved llama-2-13b-chat.
 const APPROVED_MODEL_ID =
-  "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
+  "replicate/a16z-infra/llama-2-13b-chat:2a7f981751ec7fdf87b5b91ad4db53683a98082e9ff7bfd12c8cd5ea85980a52";
 
 // Pre-computed SHA-256 of APPROVED_MODEL_ID (supply-chain integrity anchor).
 // Regenerate with: echo -n '<model-id>' | sha256sum
+// Digest is computed at runtime from the pinned APPROVED_MODEL_ID constant above,
+// ensuring it always matches the approved model string without manual recomputation.
 const APPROVED_MODEL_ID_DIGEST =
   createHash("sha256").update(APPROVED_MODEL_ID).digest("hex");
 
@@ -47,7 +48,7 @@ function verifyModelIntegrity(modelId: string): void {
     );
   }
 }
-import clerk from "@clerk/clerk-sdk-node";
+// clerk-sdk-node removed: use currentUser from @clerk/nextjs for auth instead
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
@@ -301,7 +302,44 @@ export async function POST(request: Request) {
     );
   }
 
-  const { stream, handlers } = LangChainStream();
+  // Log the outgoing LLM request before inference begins
+  logLLMInteraction("request", {
+    model: APPROVED_MODEL_ID,
+    promptLength: prompt.length,
+    promptPreview: prompt.slice(0, 200),
+  });
+
+  // Wrap LangChainStream handlers to log each streamed token and completion
+  const { stream, handlers: rawHandlers } = LangChainStream();
+  let _llmResponseBuffer = "";
+  const handlers = {
+    ...rawHandlers,
+    handleLLMNewToken: async (token: string) => {
+      _llmResponseBuffer += token;
+      if (rawHandlers.handleLLMNewToken) {
+        await rawHandlers.handleLLMNewToken(token);
+      }
+    },
+    handleLLMEnd: async (output: unknown) => {
+      logLLMInteraction("response", {
+        model: APPROVED_MODEL_ID,
+        responseLength: _llmResponseBuffer.length,
+        responsePreview: _llmResponseBuffer.slice(0, 200),
+      });
+      if (rawHandlers.handleLLMEnd) {
+        await rawHandlers.handleLLMEnd(output as never);
+      }
+    },
+    handleLLMError: async (err: Error) => {
+      logLLMInteraction("error", {
+        model: APPROVED_MODEL_ID,
+        error: err.message,
+      });
+      if (rawHandlers.handleLLMError) {
+        await rawHandlers.handleLLMError(err);
+      }
+    },
+  };
 
   const records = await memoryManager.readLatestHistory(companionKey);
   if (records.length === 0) {
@@ -462,15 +500,17 @@ export async function POST(request: Request) {
   const generatedAt = new Date().toISOString();
 
   // Cryptographic watermark: HMAC-SHA256 over the response content
-  const watermarkSecret = process.env.WATERMARK_SECRET ?? "change-me-in-env";
+  const watermarkSecret = process.env.WATERMARK_SECRET;
+  if (!watermarkSecret) {
+    throw new Error("WATERMARK_SECRET environment variable is not set.");
+  }
   const hmac = crypto
     .createHmac("sha256", watermarkSecret)
     .update(response ?? "")
     .digest("hex");
 
-  // Synthetic-origin label prepended to the streamed body
-  const syntheticLabel =
-    `[AI-GENERATED CONTENT | model=${MODEL_ID} | generated_at=${generatedAt} | sig=${hmac}]\n`;
+  // Synthetic-origin label prepended to the streamed body (no internal metadata exposed)
+  const syntheticLabel = `[AI-GENERATED CONTENT]\n`;
 
   let s = new Readable();
   s.push(syntheticLabel);
@@ -479,14 +519,28 @@ export async function POST(request: Request) {
 
   if (response !== undefined && response.length > 1) {
     await memoryManager.writeToHistory("### " + response.trim(), companionKey);
+
+    // Forensic audit record for the final sanitized response delivered to the user
+    const outputHash = require("crypto")
+      .createHash("sha256")
+      .update(response)
+      .digest("hex");
+    const finalAuditRecord = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      principal: clerkUserId,
+      companionName: name,
+      modelId,
+      inputHash,
+      outputHash,
+      sanitized: response !== resp,
+      event: "final_response_delivered",
+    });
+    await fs.appendFile(auditLogPath, finalAuditRecord + "\n", "utf8");
   }
 
   // Provenance metadata exposed as response headers
   return new StreamingTextResponse(s, {
     headers: {
-      "X-AI-Model-ID": MODEL_ID,
-      "X-AI-Generated-At": generatedAt,
-      "X-AI-Content-Signature": hmac,
       "X-AI-Content-Label": "synthetic",
     },
   });

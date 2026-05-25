@@ -10,9 +10,6 @@ const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
   "claude-3-opus-20240229",
   "claude-3-sonnet-20240229",
   "claude-3-haiku-20240307",
-  "gpt-4-0125-preview",
-  "gpt-4-turbo-2024-04-09",
-  "gpt-3.5-turbo-0125",
 ]);
 
 function isApprovedModel(model: string): boolean {
@@ -23,14 +20,48 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit.log");
+const MAX_AUDIT_FILE_BYTES = 10 * 1024 * 1024; // 10 MB per file
+const MAX_AUDIT_ROTATIONS = 5; // keep audit.log.1 … audit.log.5
+
+function rotateAuditLogIfNeeded(): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(AUDIT_LOG_PATH);
+  } catch {
+    return; // file does not exist yet — nothing to rotate
+  }
+  if (stat.size < MAX_AUDIT_FILE_BYTES) return;
+
+  // Shift existing rotated files: .5 is dropped, .4→.5, …, .1→.2
+  for (let i = MAX_AUDIT_ROTATIONS - 1; i >= 1; i--) {
+    const src = `${AUDIT_LOG_PATH}.${i}`;
+    const dst = `${AUDIT_LOG_PATH}.${i + 1}`;
+    try {
+      if (fs.existsSync(src)) fs.renameSync(src, dst);
+    } catch (renameErr) {
+      // Log rotation rename failed — surface loudly and abort rotation
+      // so the active log is never lost.
+      console.error("AUDIT_ROTATE_FAILURE", renameErr);
+      return;
+    }
+  }
+  try {
+    fs.renameSync(AUDIT_LOG_PATH, `${AUDIT_LOG_PATH}.1`);
+  } catch (renameErr) {
+    console.error("AUDIT_ROTATE_FAILURE", renameErr);
+  }
+}
 
 function writeAuditRecord(record: Record<string, unknown>): void {
-  const line = JSON.stringify(record) + "\n";
+  const line = JSON.stringify({ ...record, written_at: new Date().toISOString() }) + "\n";
   try {
+    rotateAuditLogIfNeeded();
     fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
   } catch (err) {
-    // Fallback: surface the failure so it is not silently swallowed
+    // Re-throw so callers are aware the audit record was NOT persisted.
+    // A silent failure here would break forensic readiness guarantees.
     console.error("AUDIT_WRITE_FAILURE", err);
+    throw new Error(`Audit write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -38,7 +69,6 @@ dotenv.config({ path: `.env.local` });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const internalApiSecret = process.env.INTERNAL_API_SECRET;
-const interAgentApiKey = process.env.INTER_AGENT_API_KEY;
 
 /**
  * Sanitizes incoming SMS prompt text to prevent prompt injection,
@@ -78,18 +108,33 @@ function sanitizePrompt(input: string): string | null {
   return cleaned;
 }
 
-function sanitizePrompt(input: string): string | null {
-  if (typeof input !== "string") return null;
-  // Remove control characters (except normal whitespace)
-  const stripped = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
-  if (stripped.length === 0) return null;
-  // Enforce a maximum length to prevent prompt injection via very long inputs
-  const MAX_LENGTH = 1000;
-  return stripped.slice(0, MAX_LENGTH);
-}
+// Duplicate sanitizePrompt removed: the stricter implementation above is the sole definition.
 
 export async function POST(request: Request) {
-  let queryMap: any = {};
+  // Enforce API key authentication before any other processing.
+  // This ensures the LLM-triggering route is not publicly reachable
+  // without a valid API key, independent of Twilio signature validation.
+  const expectedApiKey = process.env.WEBHOOK_API_KEY;
+  const providedApiKey = request.headers.get("x-api-key");
+  if (!expectedApiKey || !providedApiKey || providedApiKey !== expectedApiKey) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Unauthorized: missing or invalid API key" }),
+      {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  interface TwilioQueryMap {
+    Body?: string;
+    From?: string;
+    To?: string;
+    MessageSid?: string;
+    AccountSid?: string;
+    [key: string]: string | undefined;
+  }
+  let queryMap: TwilioQueryMap = {};
   const twilioClient = twilio(accountSid, twilioAuthToken);
 
   const rawBody = await request.text();
@@ -283,7 +328,7 @@ export async function POST(request: Request) {
     headers: {
       "Content-Type": "application/json",
       name: companionName,
-      Authorization: `Bearer ${internalApiSecret}`,
+      Authorization: `Bearer ${(() => { if (!internalApiSecret) throw new Error('INTERNAL_API_SECRET is not configured'); return internalApiSecret; })()`,
     },
   });
 
@@ -318,14 +363,47 @@ export async function POST(request: Request) {
     return text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
   }
 
+  writeAuditRecord({
+    event: "llm_response",
+    timestamp: new Date().toISOString(),
+    rawResponseText,
+  });
+
   const responseText = validateAndSanitizeLLMOutput(rawResponseText);
+
+  // --- Synthetic Content Provenance ---
+  const provenanceTimestamp = new Date().toISOString();
+  const provenanceModelId = companionModel; // model/companion identifier
+  const provenanceLabel = "[AI-GENERATED CONTENT]";
+
+  // Cryptographic HMAC signature over (modelId + timestamp + responseText)
+  const crypto = await import("crypto");
+  const provenanceSecret = process.env.PROVENANCE_HMAC_SECRET ?? "default-provenance-secret";
+  const provenancePayload = `${provenanceModelId}|${provenanceTimestamp}|${responseText}`;
+  const provenanceSignature = crypto
+    .createHmac("sha256", provenanceSecret)
+    .update(provenancePayload)
+    .digest("hex");
+
+  const provenanceMeta = {
+    syntheticContent: true,
+    label: provenanceLabel,
+    modelId: provenanceModelId,
+    generatedAt: provenanceTimestamp,
+    signature: provenanceSignature,
+  };
+  // --- End Synthetic Content Provenance ---
 
   const to = queryMap["From"];
   const from = queryMap["To"];
-  console.log("responseText: ", responseText);
+  // Prepend synthetic-content label and provenance footer to the SMS body
+  const smsBody =
+    `${provenanceLabel}\n${responseText}\n\n` +
+    `[Model: ${provenanceMeta.modelId} | ${provenanceMeta.generatedAt} | sig: ${provenanceMeta.signature.slice(0, 16)}...]`;
+
   await twilioClient.messages
     .create({
-      body: responseText,
+      body: smsBody,
       from,
       to,
     })
@@ -333,5 +411,8 @@ export async function POST(request: Request) {
       console.log("WARNING: failed to send SMS.", err);
     });
 
-  return NextResponse.json({ message: "Hello from the API!" });
+  return NextResponse.json({
+    message: "Hello from the API!",
+    provenance: provenanceMeta,
+  });
 }

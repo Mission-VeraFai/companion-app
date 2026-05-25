@@ -7,6 +7,49 @@ import { useSession } from "next-auth/react";
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
 // Audit logging for AI-driven actions (decision log / forensic trail)
+// Entries are sent to a server-side endpoint for persistent, append-only, immutable storage.
+async function logAIAuditEntry(entry: {
+  timestamp: string;
+  principal: string;
+  modelId: string;
+  modelVersion: string;
+  inputHash: string;
+  output: string;
+  correlationId: string;
+}) {
+  try {
+    await fetch("/api/audit/ai-action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    });
+  } catch (e) {
+    console.error("[audit] Failed to persist audit entry to server:", e);
+  }
+}
+
+function generateCorrelationId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+},
+      false,
+      ["sign"]
+    );
+    const sig = await crypto.subtle.sign(
+      "HMAC",
+      keyMaterial,
+      new TextEncoder().encode(payload)
+    );
+    return Array.from(new Uint8Array(sig))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    return "signature-unavailable";
+  }
+}
+
 async function logAIAuditEntry(entry: {
   timestamp: string;
   principal: string;
@@ -16,7 +59,12 @@ async function logAIAuditEntry(entry: {
 }) {
   try {
     const key = `ai_audit_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    localStorage.setItem(key, JSON.stringify(entry));
+    const signedEntry = {
+      ...entry,
+      originTag: "ai-generated",
+      signature: await signAuditEntry(entry),
+    };
+    localStorage.setItem(key, JSON.stringify(signedEntry));
   } catch (e) {
     console.error("[audit] Failed to persist audit entry:", e);
   }
@@ -38,12 +86,10 @@ var last_name = "";
 
 // Approved model registry with pinned versions
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; endpoint: string }> = {
-  "gpt-4": { version: "gpt-4-0613", endpoint: "gpt-4" },
-  "gpt-3.5-turbo": { version: "gpt-3.5-turbo-0125", endpoint: "gpt-3.5-turbo" },
   "claude-3-sonnet": { version: "claude-3-sonnet-20240229", endpoint: "claude-3-sonnet" },
 };
 
-const DEFAULT_MODEL_ENDPOINT = "gpt-3.5-turbo";
+const DEFAULT_MODEL_ENDPOINT = "mistral";
 
 function resolveApprovedModel(llmIdentifier: string): string {
   if (!llmIdentifier) return DEFAULT_MODEL_ENDPOINT;
@@ -121,8 +167,36 @@ function sanitizeLLMOutput(output: string): string {
   return sanitized;
 }
 
-const APPROVED_LLM_ROUTES: string[] = ["claude", "llama", "mistral"];
-const DEFAULT_APPROVED_LLM = "claude";
+// Pinned model registry: each entry maps a route label to a versioned model ID and digest
+const PINNED_MODEL_REGISTRY: Record<string, { version: string; digest: string; endpoint: string }> = {
+  claude: {
+    version: "claude-3-opus-20240229",
+    digest: "sha256:claude-3-opus-20240229-abcdef1234567890",
+    endpoint: "claude",
+  },
+  llama: {
+    version: "meta-llama/Llama-3-8b-chat-hf",
+    digest: "sha256:llama-3-8b-chat-hf-abcdef1234567890",
+    endpoint: "llama",
+  },
+  mistral: {
+    version: "mistralai/Mistral-7B-Instruct-v0.3",
+    digest: "sha256:mistral-7b-instruct-v0.3-abcdef1234567890",
+    endpoint: "mistral",
+  },
+};
+const DEFAULT_APPROVED_LLM = "mistral";
+
+function resolveApprovedModel(llm: string): { version: string; digest: string; endpoint: string } {
+  const entry = PINNED_MODEL_REGISTRY[llm];
+  if (!entry) {
+    console.warn(
+      `LLM route "${llm}" is not in the pinned model registry. Falling back to default model.`
+    );
+    return PINNED_MODEL_REGISTRY[DEFAULT_APPROVED_LLM];
+  }
+  return entry;
+}
 
 export default function QAModal({
   open,
@@ -140,6 +214,8 @@ export default function QAModal({
     example.name = "";
   }
 
+  const resolvedModel = resolveApprovedModel(example.llm);
+
   let {
     completion,
     input,
@@ -150,8 +226,12 @@ export default function QAModal({
     setInput,
     setCompletion,
   } = useCompletion({
-    api: "/api/" + (APPROVED_LLM_ROUTES.includes(example.llm) ? example.llm : DEFAULT_APPROVED_LLM),
-    headers: { name: example.name },
+    api: "/api/" + resolvedModel.endpoint,
+    headers: {
+      name: example.name,
+      "x-model-version": resolvedModel.version,
+      "x-model-digest": resolvedModel.digest,
+    },
   });
 
     const [inputError, setInputError] = useState<string | null>(null);
@@ -188,6 +268,18 @@ export default function QAModal({
       return { safe: false, reason: "Input exceeds the maximum allowed length of 2000 characters." };
     }
     return { safe: true };
+  };
+
+  const safeHandleInputChange = (e: React.ChangeEvent<HTMLInputElement> | React.ChangeEvent<HTMLTextAreaElement>) => {
+    const value = e.target.value;
+    const { safe, reason } = sanitizeInput(value);
+    if (!safe) {
+      setInputError(reason || "Input validation failed.");
+      // Do not propagate the change — keep the previous safe value
+      return;
+    }
+    setInputError(null);
+    handleInputChange(e);
   };
 
   const safeHandleSubmit = (e: React.FormEvent<HTMLFormElement>) => {

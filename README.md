@@ -33,7 +33,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 - App logic: [Next.js](https://nextjs.org/)
 - VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
 - LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
-- Text model: [Approved LLM Provider] (contact your organization's AI governance team for the list of approved models)
+- Text model: [Approved LLM Provider — see your organization's AI Model Registry for approved models, pinned versions, and digest hashes]
 - Text streaming: [ai sdk](https://github.com/vercel-labs/ai)
 - Conversation history: [Upstash](https://upstash.com/)
 - Deployment: [Fly](https://fly.io/)
@@ -43,8 +43,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 
 The following instructions should get you up and running with a fully
 functional, local deployment of four AIs to chat with. Note that the companions
-running on Vicuna (Rosie and Lucky) will take more time to respond as we've not
-dealt with the cold start problem. So you may have to wait around a bit :)
+running on organization-approved LLM providers may vary in response time depending on the selected model. Consult your AI Model Registry for approved model identifiers, pinned versions, and digest hashes before deployment.
 
 ### 1. Fork and Clone repo
 
@@ -85,9 +84,9 @@ If you want to text your AI companion in later steps, you should also enable "ph
 <img width="1013" alt="Screen Shot 2023-07-10 at 11 05 42 PM" src="https://github.com/a16z-infra/companion-app/assets/3489963/4435c759-f33e-4e38-a276-1be6d538df28">
 
 
-b. **OpenAI API key**
+b. **LLM Provider API key**
 
-Visit https://platform.openai.com/account/api-keys to get your OpenAI API key if you're using OpenAI for your language model.
+Obtain your API key from your organization's approved LLM provider. Only providers and models listed in your organization's AI Model Registry are permitted. Contact your AI governance team for the approved provider list and corresponding API key instructions.eys to get your OpenAI API key if you're using OpenAI for your language model.
 
 c. **Replicate API key**
 
@@ -317,7 +316,7 @@ npm run export-to-character [COMPANION_NAME] [MODEL_NAME] [USER_ID]
 `
 
 - `COMPANION_NAME`: name of your companion. i.e Alice
-- `MODEL_NAME`: `chatgpt` or `vicuna13b`
+- `MODEL_NAME`: refer to your organization's approved model list for valid options
 - `USER_ID`: you can find this on Clerk, under "Users" -> click on your user -> copy "User ID"
 
 Once you run this script, you will see two files created under the root directory:

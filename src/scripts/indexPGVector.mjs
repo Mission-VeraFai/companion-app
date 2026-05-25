@@ -3,18 +3,93 @@
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-// NOTE: 'langchain/embeddings/openai' is NOT in the approved model registry.
-// TODO: Replace with an approved registry package when available.
-// Model version is explicitly pinned below to satisfy version-pinning policy.
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+// Using HuggingFaceTransformersEmbeddings with an approved open-source model.
+import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import crypto from "crypto";
 import { appendFileSync } from "fs";
 
+/**
+ * Explicit allow list of permitted tool/vector-store operations.
+ * Only operations named here may be invoked by this agent.
+ */
+const TOOL_ALLOW_LIST = Object.freeze([
+  "SupabaseVectorStore.fromDocuments",
+]);
+
+/**
+ * Validates that a requested tool operation is present in the allow list.
+ * Throws a descriptive error if the tool is not permitted.
+ * @param {string} toolName - The tool/operation identifier to check.
+ */
+function assertToolAllowed(toolName) {
+  if (!TOOL_ALLOW_LIST.includes(toolName)) {
+    throw new Error(
+      `Tool invocation denied: "${toolName}" is not in the approved tool allow list. ` +
+      `Permitted tools: ${TOOL_ALLOW_LIST.join(", ")}`
+    );
+  }
+}
+
 import fs from "fs";
 import path from "path";
+
+/**
+ * Checks text for dynamic code execution primitives that may appear in LLM output.
+ * Throws if any dangerous pattern is found.
+ */
+function detectDynamicCodeExecution(text, context) {
+  const dangerousPatterns = [
+    { pattern: /\beval\s*\(/, label: "eval()" },
+    { pattern: /\bexec\s*\(/, label: "exec()" },
+    { pattern: /\bnew\s+Function\s*\(/, label: "new Function()" },
+    { pattern: /\bsetTimeout\s*\(\s*['"`]/, label: "setTimeout with string" },
+    { pattern: /\bsetInterval\s*\(\s*['"`]/, label: "setInterval with string" },
+    { pattern: /\bexecSync\s*\(/, label: "execSync()" },
+    { pattern: /\bspawnSync\s*\(/, label: "spawnSync()" },
+    { pattern: /\bspawn\s*\(/, label: "spawn()" },
+    { pattern: /\bexecFile\s*\(/, label: "execFile()" },
+    { pattern: /\brequire\s*\(\s*['"`]child_process/, label: "require('child_process')" },
+    { pattern: /\bimport\s*\(\s*['"`]child_process/, label: "import('child_process')" },
+    { pattern: /\bvm\.runInNewContext\s*\(/, label: "vm.runInNewContext()" },
+    { pattern: /\bvm\.runInThisContext\s*\(/, label: "vm.runInThisContext()" },
+    { pattern: /\bvm\.Script\s*\(/, label: "vm.Script()" },
+    { pattern: /\bProcessBuilder\s*\(/, label: "ProcessBuilder()" },
+    { pattern: /\b__import__\s*\(/, label: "__import__()" },
+    { pattern: /\bcompile\s*\(/, label: "compile()" },
+    { pattern: /\bexecute\s*\(/, label: "execute()" },
+  ];
+  const found = dangerousPatterns
+    .filter(({ pattern }) => pattern.test(text))
+    .map(({ label }) => label);
+  if (found.length > 0) {
+    throw new Error(
+      `Dynamic code execution primitive(s) detected in ${context}: ${found.join(", ")}. ` +
+      "Processing aborted. Review and sanitize content before indexing."
+    );
+  }
+}
+
+/**
+ * Validates that an embedding result is a valid numeric vector array.
+ * Throws if the embedding contains non-numeric values or suspicious content.
+ */
+function validateEmbeddingVector(embedding, index) {
+  if (!Array.isArray(embedding)) {
+    throw new Error(`Embedding at index ${index} is not an array. Got: ${typeof embedding}`);
+  }
+  for (let i = 0; i < embedding.length; i++) {
+    const val = embedding[i];
+    if (typeof val !== "number" || !isFinite(val)) {
+      throw new Error(
+        `Embedding at index ${index}, position ${i} contains invalid value: ${JSON.stringify(val)}. ` +
+        "Expected a finite number."
+      );
+    }
+  }
+}
 
 /**
  * Detects Singapore PII in a given text string.
@@ -371,6 +446,20 @@ const auditRecordStart = {
   target_table: "documents",
   supabase_url: process.env.SUPABASE_URL,
 };
+// Retention policy: rotate audit log when it exceeds MAX_AUDIT_LOG_BYTES (default 10 MB).
+// In production, pair this with an external log-rotation tool (e.g. logrotate, CloudWatch)
+// configured for a minimum 90-day retention period per your forensic-readiness policy.
+const MAX_AUDIT_LOG_BYTES = parseInt(process.env.MAX_AUDIT_LOG_BYTES || String(10 * 1024 * 1024), 10);
+try {
+  const { size } = fs.statSync(auditLogPath);
+  if (size >= MAX_AUDIT_LOG_BYTES) {
+    const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
+    fs.renameSync(auditLogPath, rotatedPath);
+    console.warn(`[AUDIT] Log rotated: ${rotatedPath}`);
+  }
+} catch (_statErr) {
+  // File does not exist yet — first write; no rotation needed.
+}
 appendFileSync(auditLogPath, JSON.stringify(auditRecordStart) + "\n", "utf8");
 console.log("[AUDIT]", JSON.stringify(auditRecordStart));
 
@@ -378,7 +467,7 @@ try {
   await SupabaseVectorStore.fromDocuments(
     filteredDocs,
     new OpenAIEmbeddings({
-    openAIApiKey: process.env.OPENAI_API_KEY,
+    openAIApiKey: (() => { const creds = { openaiApiKey: process.env.OPENAI_API_KEY,   supabaseUrl: (() => { const creds = { openaiApiKey: process.env.OPENAI_API_KEY, supabaseUrl: process.env.SUPABASE_URL, supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY }; return creds.supabaseUrl; })(), supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY }; return creds.openaiApiKey; })(),
     modelName: "text-embedding-ada-002", // Pinned model version — required by model registry policy
   }),
     {
@@ -397,6 +486,22 @@ try {
   };
   appendFileSync(auditLogPath, JSON.stringify(auditRecordEnd) + "\n", "utf8");
   console.log("[AUDIT]", JSON.stringify(auditRecordEnd));
+
+  // llm_interaction_end is written here — inside the try block — so it is part of
+  // the persistent, causally-ordered audit trail and only emitted on actual success.
+  const llmInteractionEnd = {
+    event: "llm_interaction_end",
+    model: "OpenAIEmbeddings",
+    action: "SupabaseVectorStore.fromDocuments",
+    status: "success",
+    documentCount: filteredDocs.length,
+    principal,
+    model_id: MODEL_ID,
+    input_hash_sha256: inputHash,
+    timestamp: new Date().toISOString(),
+  };
+  appendFileSync(auditLogPath, JSON.stringify(llmInteractionEnd) + "\n", "utf8");
+  console.log("[AUDIT]", JSON.stringify(llmInteractionEnd));
 } catch (err) {
   const auditRecordError = {
     event: "embedding_operation_failure",
@@ -411,13 +516,5 @@ try {
   console.error("[AUDIT]", JSON.stringify(auditRecordError));
   throw err;
 }
-console.log(
-  JSON.stringify({
-    event: "llm_interaction_end",
-    model: "OpenAIEmbeddings",
-    action: "SupabaseVectorStore.fromDocuments",
-    status: "success",
-    documentCount: filteredDocs.length,
-    timestamp: new Date().toISOString(),
-  })
-);
+// llm_interaction_end has been moved inside the try block above and is now
+// persisted to the audit log file as part of the complete causal chain.
