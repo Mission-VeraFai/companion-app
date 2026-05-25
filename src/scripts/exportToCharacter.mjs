@@ -1,15 +1,18 @@
 // Redis dependency removed to reduce external credential exposure
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { ChatAnthropic } from "langchain/chat_models/anthropic";
-const AI_MODEL_ID = "gpt-4";
+import { ChatOpenAI } from "langchain/chat_models/openai";
+const AI_MODEL_ID = "gpt-3.5-turbo";
 
 import path from "path";
 import fs from "fs/promises";
 import crypto from "crypto";
 
 const AUDIT_LOG_FILE = "ai_audit_log.jsonl";
+const LLM_LOG_FILE_PATH = "llm_interactions.log";
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB rotation threshold
+const LOG_RETENTION_DAYS = 90; // Retain archived log segments for 90 days
+const LOG_RETENTION_MS = LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 /**
  * HITL approval gate: prompts a human operator for explicit confirmation
@@ -45,15 +48,44 @@ async function hitlApprove(operationDescription) {
   return true;
 }
 
+async function purgeExpiredLogSegments(filePath) {
+  const dir = path.dirname(path.resolve(filePath));
+  const base = path.basename(filePath);
+  try {
+    const entries = await fs.readdir(dir);
+    const now = Date.now();
+    for (const entry of entries) {
+      if (entry.startsWith(base + ".") && entry.endsWith(".bak")) {
+        const full = path.join(dir, entry);
+        try {
+          const st = await fs.stat(full);
+          if (now - st.mtimeMs > LOG_RETENTION_MS) {
+            await fs.unlink(full);
+            console.log(`[AUDIT] Purged expired log segment (>${LOG_RETENTION_DAYS}d): ${full}`);
+          }
+        } catch (_) { /* best-effort */ }
+      }
+    }
+  } catch (_) { /* best-effort */ }
+}
+
 async function rotateLogIfNeeded(filePath) {
   try {
     const stat = await fs.stat(filePath);
     if (stat.size >= MAX_LOG_BYTES) {
+      // Append-only archival: copy current content to a timestamped segment,
+      // then truncate the live file — never rename/delete the primary log.
       const rotated = `${filePath}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
       await hitlApprove(
-        `Rotate (rename) log file "${filePath}" → "${rotated}" (destructive move)`
+        `Archive log segment "${filePath}" → "${rotated}" (copy+truncate, append-only)`
       );
-      await fs.rename(filePath, rotated);
+      // Copy current log content to the archive segment
+      await fs.copyFile(filePath, rotated);
+      // Truncate the live log file in place (preserves inode, append-only primary)
+      await fs.truncate(filePath, 0);
+      console.log(`[AUDIT] Log segment archived (append-only): ${rotated}`);
+      // Enforce time-based retention on archived segments
+      await purgeExpiredLogSegments(filePath);
     }
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
@@ -76,6 +108,13 @@ function buildProvenanceHeader(modelId, content) {
   const hmacSecret = process.env.PROVENANCE_HMAC_SECRET;
   let signatureLabel;
   let signature;
+  if (!hmacSecret) {
+    throw new Error(
+      "[PROVENANCE ERROR] PROVENANCE_HMAC_SECRET is not set. " +
+      "All AI-generated outputs require an HMAC-SHA256 signed provenance header. " +
+      "Set the PROVENANCE_HMAC_SECRET environment variable before generating output."
+    );
+  }
   if (hmacSecret) {
     signature = crypto
       .createHmac("sha256", hmacSecret)
@@ -83,16 +122,10 @@ function buildProvenanceHeader(modelId, content) {
       .digest("hex");
     signatureLabel = "HMAC-SHA256";
   } else {
-    // No secret available — fall back to a plain hash and label it accurately
-    signature = crypto
-      .createHash("sha256")
-      .update(`${modelId}|${timestamp}|${content}`)
-      .digest("hex");
-    signatureLabel = "SHA256    ";
-    console.warn(
-      "[SECURITY WARNING] PROVENANCE_HMAC_SECRET is not set. " +
-      "Provenance header will use a plain SHA-256 hash instead of HMAC-SHA256. " +
-      "Set PROVENANCE_HMAC_SECRET to enable authenticated integrity verification."
+    throw new Error(
+      "[PROVENANCE ERROR] PROVENANCE_HMAC_SECRET is not set. " +
+      "All AI-generated outputs require an HMAC-SHA256 signed provenance header. " +
+      "Set the PROVENANCE_HMAC_SECRET environment variable before generating output."
     );
   }
 
@@ -119,7 +152,12 @@ function buildProvenanceHeader(modelId, content) {
 
 const LLM_LOG_FILE = "llm_interactions.log";
 
-async function logLLMInteraction(input, output, { modelId = AI_MODEL_ID, principal = "anonymous" } = {}) {
+async function logLLMInteraction(input, output, { modelId = AI_MODEL_ID, principal } = {}) {
+  if (!principal || principal === "anonymous") {
+    throw new Error(
+      "Authentication required: a valid authenticated principal must be provided before invoking the AI agent."
+    );
+  }
   const inputHash = crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
   const outputHash = crypto.createHash("sha256").update(JSON.stringify(output)).digest("hex");
   const entry = JSON.stringify({
@@ -631,6 +669,28 @@ const results = await Promise.all(
       question: sanitizeForPrompt(question),
       inputHash: crypto.createHash("sha256").update(JSON.stringify(sanitizedLlmInput)).digest("hex"),
     });
+    // Pre-flight prompt safety check before invoking the LLM chain
+    const PROMPT_SAFETY_PATTERNS = [
+      /(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/,  // base64
+      /(?:^|\s)(?:bash|sh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[({["'`]/im, // shell/exec commands
+      /\x00|[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/,  // binary/control characters
+      /(?:ignore\s+(?:previous|above|prior)|disregard\s+(?:all|previous)|you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:dan|jailbreak|unrestricted))/i, // hidden prompt injection
+      /(?:[a-z]\d[a-z]|\d[a-z]\d|[!@#$][a-z][!@#$]){3,}/i, // leetspeak patterns
+    ];
+    const promptToCheck = typeof sanitizedLlmInput.question === "string" ? sanitizedLlmInput.question : JSON.stringify(sanitizedLlmInput);
+    for (const pattern of PROMPT_SAFETY_PATTERNS) {
+      if (pattern.test(promptToCheck)) {
+        const safePatternStr = pattern.toString().slice(0, 40);
+        console.error(`[SECURITY] Prompt failed safety check (pattern: ${safePatternStr}). Aborting LLM call.`);
+        await writeAuditRecord({
+          event: "prompt_safety_violation",
+          timestamp: new Date().toISOString(),
+          question: sanitizeForPrompt(question),
+          pattern: safePatternStr,
+        }).catch((e) => console.error("[AUDIT] Failed to write safety violation record:", e));
+        throw new Error("Prompt failed pre-flight safety check and was blocked.");
+      }
+    }
     const llmCallPromise = chain.call(sanitizedLlmInput);
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(
@@ -641,7 +701,7 @@ const results = await Promise.all(
     const llmResult = await Promise.race([llmCallPromise, timeoutPromise]);
       // Log full interaction content (prompt input and LLM output) as required by policy
       await logLLMInteraction(
-        { question_key: Object.keys(llmInput).join(","), prompt: llmInput.question },
+        { question_key: Object.keys(llmInput).join(","), prompt: sanitizeForPrompt(llmInput.question) },
         { output_length: typeof llmResult?.text === "string" ? llmResult.text.length : 0 }
       );
       return llmResult;
@@ -658,16 +718,45 @@ for (let i = 0; i < questions.length; i++) {
     continue;
   }
   const sanitizedText = sanitizeLLMOutput(results[i].text);
+  // Guard: reject LLM output that contains dynamic code execution primitives
+  const DYNAMIC_CODE_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*['"`]/i,
+    /\bsetInterval\s*\(\s*['"`]/i,
+    /\bsubprocess\s*\.\s*(call|run|Popen)\s*\([^)]*shell\s*=\s*True/i,
+    /\bos\.system\s*\(/i,
+    /\bspawnSync\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bexecFile\s*\(/i,
+    /\bchild_process/i,
+    /\brequire\s*\(\s*['"`]child_process/i,
+    /\bimport\s+subprocess\b/i,
+  ];
+  const hasDynamicCodePrimitive = DYNAMIC_CODE_PATTERNS.some((pattern) => pattern.test(sanitizedText));
+  if (hasDynamicCodePrimitive) {
+    console.warn(
+      `WARNING: LLM output for question ${i} contains a dynamic code execution primitive. Output suppressed for safety.`
+    );
+    await writeAuditRecord({
+      event: "llm_output_rejected",
+      timestamp: new Date().toISOString(),
+      question: sanitizeForPrompt(questions[i]),
+      reason: "dynamic_code_execution_primitive_detected",
+    }).catch((err) => console.error("[AUDIT] Failed to write rejection audit record:", err));
+    continue;
+  }
   output += `*****${questions[i]}*****\n${sanitizedText}\n\n`;
 }
-const redactedChat = recentChat.map((line) => redactPII(line));
+const redactedChat = recentChat.map((line) => sanitizeForPrompt(redactPII(line)));
 const MAX_CHAT_LINES = 10;
 const MAX_LINE_LENGTH = 200;
 const minimisedChat = redactedChat
   .slice(-MAX_CHAT_LINES)
   .map((line) => (line.length > MAX_LINE_LENGTH ? line.slice(0, MAX_LINE_LENGTH) + "…" : line));
-output += `Definition (Advanced)\n${minimisedChat.join("\n")}`;
-await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, minimisedChat.join("\n"));
+// Chat history is not appended to character output to enforce output data minimisation.
+await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, JSON.stringify({ lineCount: minimisedChat.length, exportedAt: new Date().toISOString() }));
 
 // Attach provenance metadata and synthetic-content label before persisting
 // AI-generated output so the file's origin is always traceable.
