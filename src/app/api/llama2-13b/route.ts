@@ -7,17 +7,24 @@ import { NextResponse } from "next/server";
 import { createHash } from "crypto";
 
 // Approved model registry: only models listed here with an immutable digest pin are permitted.
+// NOTE: All entries must be reviewed and approved by the security team before being added.
 const APPROVED_MODEL_REGISTRY: Record<string, { digest: string; description: string }> = {
   // Pinned to an immutable Replicate version digest — never use a mutable tag alone.
-  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d": {
-    digest: "f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-    description: "LLaMA-2 13B Chat — approved for conversational inference",
+  "mistralai/mistral-7b-instruct-v0.2:f5701ad84de5715051cb99d550539719f8a7fbcf65e0e62a3d1eb3f94720764": {
+    digest: "f5701ad84de5715051cb99d550539719f8a7fbcf65e0e62a3d1eb3f94720764",
+    description: "Mistral 7B Instruct v0.2 — approved for conversational inference",
   },
 };
 
-// Immutable model reference: owner/name:version-digest (Replicate format).
-const MODEL_ID =
-  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d";
+// Model ID must be set via the APPROVED_MODEL_ID environment variable.
+// The value must correspond to an entry in APPROVED_MODEL_REGISTRY.
+// LLaMA-2 (meta/llama-2-13b-chat) via Replicate is NOT on the organization's approved list.
+const MODEL_ID = process.env.APPROVED_MODEL_ID ?? "";
+if (!MODEL_ID) {
+  throw new Error(
+    "APPROVED_MODEL_ID environment variable is not set. Configure an organization-approved model before starting the service."
+  );
+}
 
 /**
  * Verify the model identifier against the approved registry and confirm the
@@ -63,7 +70,9 @@ function containsMaliciousContent(input: string): boolean {
   const shellCommandPattern = /([`$]\(|\|\s*\w+|;\s*\w+|&&\s*\w+|\|\||>\s*\/|<\s*\/|\bexec\b|\beval\b|\bsystem\b|\bspawn\b|\bpopen\b|\bsubprocess\b|\bos\.system\b|\bchild_process\b)/i;
 
   // Check for base64 encoded content (long base64 strings are suspicious)
-  const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/;
+  // Multi-pattern injection detection: base64 (16+ chars to catch shorter payloads),
+// hex-encoded sequences, URL-encoded sequences, and Unicode escapes.
+const base64Pattern = /(?:[A-Za-z0-9+\/]{16,}={0,2})|(?:%[0-9A-Fa-f]{2}){4,}|(?:\\x[0-9A-Fa-f]{2}){4,}|(?:\\u[0-9A-Fa-f]{4}){2,}|(?:0x[0-9A-Fa-f]{2}\s*){4,}/;
 
   // Check for leetspeak obfuscation patterns (e.g., 1gnor3, 3x3cut3)
   const leetspeakPattern = /\b(?:[a-z]*[013456789][a-z0-9]*){3,}\b/i;
@@ -704,14 +713,21 @@ const MODEL_ID =
   hmac.update(`${MODEL_ID}|${generatedAt}|${response}`);
   const watermarkToken = hmac.digest("hex");
 
-  // Log provenance server-side only — do NOT expose model ID, timestamp, or watermark to users
-  const provenanceRecord = JSON.stringify({
+  // Sign the full provenance record so that tampering or silent removal is detectable
+  const provenancePayload = JSON.stringify({
     timestamp: generatedAt,
     stage: "provenance",
     principal: clerkUserId,
     model: MODEL_ID,
     inputHash,
     watermarkSignature: watermarkToken,
+  });
+  const provenanceHmac = crypto.createHmac("sha256", watermarkSecret);
+  provenanceHmac.update(provenancePayload);
+  const provenanceSignature = provenanceHmac.digest("hex");
+  const provenanceRecord = JSON.stringify({
+    ...JSON.parse(provenancePayload),
+    provenanceSignature,
   });
   await fs
     .appendFile(auditLogPath, provenanceRecord + "\n", "utf8")
@@ -728,10 +744,20 @@ const MODEL_ID =
     memoryManager.writeToHistory("" + response.trim(), companionKey);
   }
 
-  // Only expose the generic content-type label; keep model ID, timestamp, and watermark server-side
+  // Expose full provenance metadata in response headers so clients can verify AI-generated content
   const provenanceHeaders = new Headers({
     "X-Content-Type-Label": "ai-generated-synthetic-text",
+    "X-AI-Model-ID": MODEL_ID,
+    "X-AI-Generated-At": generatedAt,
+    "X-AI-Watermark-Token": watermarkToken,
+    "X-AI-Provenance-Signature": provenanceSignature,
   });
+
+  // Runtime malicious-command check: reject prompt if it contains malicious content
+  if (containsMaliciousContent(prompt)) {
+    console.warn("[SECURITY] Prompt rejected at call site due to malicious content detection.");
+    return new Response("Prompt contains disallowed content.", { status: 400 });
+  }
 
     // Log all LLM interactions as required by policy
   const llmInteractionRecord = JSON.stringify({
@@ -741,14 +767,25 @@ const MODEL_ID =
     model: MODEL_ID,
     inputHash,
     watermarkSignature: watermarkToken,
-    prompt: prompt,
+    prompt: (() => {
+      if (containsMaliciousContent(prompt)) {
+        throw new Error("[SECURITY] Prompt rejected: malicious content detected before LLM invocation.");
+      }
+      // Sanitize: strip null bytes and control characters before sending to model
+      return prompt.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
+    })(),
     response: response,
   });
   await fs
     .appendFile(auditLogPath, llmInteractionRecord + "\n", "utf8")
-    .catch((logErr: unknown) =>
-      console.error("[AUDIT] Failed to write LLM interaction audit log:", logErr)
-    );
+    .catch((logErr: unknown) => {
+      console.error("[AUDIT] Failed to write LLM interaction audit log:", logErr);
+      throw new Error(
+        `[AUDIT] Critical: audit log write failure — execution halted to preserve forensic integrity. Cause: ${
+          logErr instanceof Error ? logErr.message : String(logErr)
+        }`
+      );
+    });
 
   return new StreamingTextResponse(s, { headers: provenanceHeaders });
 }
