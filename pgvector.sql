@@ -8,7 +8,7 @@ create table documents (
   id bigserial primary key,
   content text, -- corresponds to Document.pageContent
   metadata jsonb, -- corresponds to Document.metadata
-  embedding vector(768) -- 768 dimensions for approved open-source embedding models (e.g. sentence-transformers/all-MiniLM-L6-v2)
+  embedding vector(768) -- 768 dimensions for approved registry model: sentence-transformers/all-MiniLM-L6-v2
 );
 
 -- Audit log table for AI-driven vector similarity retrievals
@@ -17,7 +17,8 @@ create table if not exists match_documents_audit_log (
   correlation_id   uuid        not null default gen_random_uuid(),
   occurred_at      timestamptz not null default now(),
   principal        text        not null,
-  model_id         text        not null,          -- identifier of the AI model/embedding used
+  model_id         text        not null          -- identifier of the AI model/embedding used
+    check (model_id = 'sentence-transformers/all-MiniLM-L6-v2'),
   input_hash       text        not null,          -- SHA-256 hex of the serialised query_embedding
   match_count      int,
   filter           jsonb,
@@ -51,7 +52,7 @@ create function match_documents (
   query_embedding vector(1536),
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}',
-  model_id text DEFAULT 'openai/text-embedding-ada-002'
+  model_id text DEFAULT 'sentence-transformers/all-MiniLM-L6-v2'
 ) returns table (
   content      text,    -- truncated excerpt (max 1000 chars)
   similarity   float,
@@ -60,12 +61,6 @@ create function match_documents (
   model_identifier text, -- identifier of the embedding model used for retrieval
   content_origin   text, -- tag indicating this row originates from a vector-similarity search
   retrieved_at     timestamptz -- UTC timestamp of retrieval for audit trail
-),
-  match_count int DEFAULT null,
-  filter jsonb DEFAULT '{}'
-) returns table (
-  content text, -- truncated excerpt (max 1000 chars)
-  similarity float
 )
 language plpgsql
 as $$
@@ -123,14 +118,21 @@ begin
   -- Audit: record every invocation using sanitised values only
   -- ----------------------------------------------------------------
   insert into match_documents_audit_log (
-    principal, model_id, input_hash, match_count, filter
+    principal, model_id, input_hash, match_count, filter, output_summary
   )
   values (
     current_user,
     model_id,
     encode(sha256(query_embedding::text::bytea), 'hex'),
     _safe_match_count,
-    _safe_filter
+    _safe_filter,
+    jsonb_build_object(
+      'requested_match_count', _safe_match_count,
+      'filter_keys', (select jsonb_agg(key) from jsonb_each(_safe_filter)),
+      'model_id', model_id,
+      'retrieval_type', 'vector-similarity-retrieval',
+      'retrieved_at', now()
+    )
   );
 
   -- ----------------------------------------------------------------
