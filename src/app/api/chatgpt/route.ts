@@ -1,4 +1,4 @@
-import { ChatAnthropic } from "@langchain/anthropic";
+import { ChatOpenAI } from "@langchain/openai";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -6,7 +6,7 @@ import clerk from "@clerk/clerk-sdk-node";
 import { CallbackManager } from "langchain/callbacks";
 import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
-import { auth, currentUser } from "@clerk/nextjs";
+import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
 // rateLimit (Upstash Redis) removed to comply with max-3-external-systems policy
 import { auth } from "@clerk/nextjs/server";
@@ -14,11 +14,74 @@ import { createHash, createHmac, timingSafeEqual } from "crypto";
 import https from "https";
 
 // ---------------------------------------------------------------------------
+// Prompt Safety Validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates a prompt for hidden/invisible characters, base64-encoded payloads,
+ * leetspeak obfuscation, shell commands, and binary/executable content.
+ * Throws an error with a descriptive message if any suspicious content is found.
+ */
+function validatePrompt(prompt: string): void {
+  // 1. Reject prompts containing hidden or invisible Unicode characters
+  //    (zero-width spaces, soft hyphens, bidirectional overrides, etc.)
+  const invisibleCharPattern =
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\uFEFF\uFFF9-\uFFFB]/;
+  if (invisibleCharPattern.test(prompt)) {
+    throw new Error("Prompt contains hidden or invisible characters.");
+  }
+
+  // 2. Reject prompts that contain base64-encoded blocks (≥40 chars of base64)
+  //    which are commonly used to smuggle encoded instructions.
+  const base64BlockPattern = /[A-Za-z0-9+/]{40,}={0,2}/;
+  if (base64BlockPattern.test(prompt)) {
+    throw new Error("Prompt contains a base64-encoded block that may hide malicious content.");
+  }
+
+  // 3. Reject leetspeak patterns — common substitutions used to bypass filters.
+  //    Detects strings mixing letters with digits 0/1/3/4/5/7 in place of o/i/e/a/s/t.
+  const leetspeakPattern = /(?:[a-zA-Z][013457][a-zA-Z]|[a-zA-Z]{2}[013457]){3,}/;
+  if (leetspeakPattern.test(prompt)) {
+    throw new Error("Prompt contains leetspeak-style obfuscation.");
+  }
+
+  // 4. Reject shell command patterns.
+  const shellCommandPattern =
+    /(?:^|\s|;|&&|\|\|)(\s*)(sudo|chmod|chown|curl|wget|bash|sh|zsh|fish|powershell|cmd\.exe|eval|exec|system|popen|subprocess|os\.system|rm\s+-rf|dd\s+if=|mkfs|nc\s+-|ncat|netcat|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r|node\s+-e)(?:\s|$|;|&&|\|)/i;
+  if (shellCommandPattern.test(prompt)) {
+    throw new Error("Prompt contains shell command patterns.");
+  }
+
+  // 5. Reject binary/executable content — detect common magic bytes encoded as
+  //    escaped sequences or raw non-printable runs that suggest binary data.
+  //    Also reject prompts that reference executable file extensions with paths.
+  const binaryMagicPattern = /(?:\\x7f\\x45\\x4c\\x46|\\x4d\\x5a|MZ|\x7fELF)/;
+  if (binaryMagicPattern.test(prompt)) {
+    throw new Error("Prompt contains binary or executable content.");
+  }
+  const executablePathPattern =
+    /(?:\/bin\/|\/usr\/bin\/|\/sbin\/|C:\\Windows\\|C:\\\\Windows\\\\)\S+\.(?:exe|bat|cmd|sh|ps1|elf)/i;
+  if (executablePathPattern.test(prompt)) {
+    throw new Error("Prompt references an executable file path.");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Organization-Approved Model Registry
 // ---------------------------------------------------------------------------
-const ORG_MODEL_REGISTRY_URL =
-  process.env.ORG_MODEL_REGISTRY_URL ??
-  (() => { throw new Error("ORG_MODEL_REGISTRY_URL env var must be set to the organization-approved model registry endpoint."); })();
+// Registry URL is pinned to the organization's trusted domain; only the path may be overridden via env.
+const PINNED_REGISTRY_HOST = "https://registry.internal.myorg.example.com";
+const ORG_MODEL_REGISTRY_PATH =
+  process.env.ORG_MODEL_REGISTRY_PATH ?? "/api/v1/approved-models";
+if (!/^\/[a-zA-Z0-9/_-]+$/.test(ORG_MODEL_REGISTRY_PATH)) {
+  throw new Error("ORG_MODEL_REGISTRY_PATH contains invalid characters.");
+}
+const ORG_MODEL_REGISTRY_URL = `${PINNED_REGISTRY_HOST}${ORG_MODEL_REGISTRY_PATH}`;
+
+// HMAC secret used to verify the registry payload signature (X-Registry-Signature header).
+const ORG_REGISTRY_HMAC_SECRET: string =
+  process.env.ORG_REGISTRY_HMAC_SECRET ??
+  (() => { throw new Error("ORG_REGISTRY_HMAC_SECRET env var must be set for registry payload verification."); })();
 
 interface ApprovedModelEntry {
   modelId: string;
@@ -33,7 +96,74 @@ interface OrgModelRegistry {
   approvedModels: ApprovedModelEntry[];
 }
 
-/** Fetch the approved model registry from the organization endpoint. */
+// ---------------------------------------------------------------------------
+// Input Sanitization
+// ---------------------------------------------------------------------------
+
+/** Maximum allowed length for a single user message (characters). */
+const MAX_INPUT_LENGTH = 4000;
+
+/**
+ * Sanitize a string before it is forwarded to the LLM.
+ * - Rejects inputs that exceed the maximum allowed length.
+ * - Strips null bytes and ASCII control characters (except \t, \n, \r).
+ * - Trims leading/trailing whitespace.
+ */
+function sanitizeInput(value: string, label = "input"): string {
+  if (typeof value !== "string") {
+    throw new Error(`Invalid ${label}: expected a string.`);
+  }
+  if (value.length > MAX_INPUT_LENGTH) {
+    throw new Error(
+      `${label} exceeds maximum allowed length of ${MAX_INPUT_LENGTH} characters.`
+    );
+  }
+  // Remove null bytes and non-printable ASCII control characters
+  // (keep \t = 0x09, \n = 0x0A, \r = 0x0D for readability)
+  const sanitized = value
+    .replace(/\x00/g, "")                          // null bytes
+    .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // other control chars
+    .trim();
+  return sanitized;
+}
+
+/**
+ * Allowlist of approved hostnames for the organization model registry.
+ * Only these hostnames are permitted for outbound registry fetches.
+ */
+const APPROVED_REGISTRY_HOSTNAMES: ReadonlySet<string> = new Set([
+  process.env.ORG_MODEL_REGISTRY_ALLOWED_HOST ?? "",
+].filter(Boolean));
+
+/**
+ * Validate that a URL's hostname is in the approved allowlist.
+ * Throws if the URL is invalid or the hostname is not approved.
+ */
+function validateRegistryUrl(urlString: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    throw new Error(`ORG_MODEL_REGISTRY_URL is not a valid URL: ${urlString}`);
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      `ORG_MODEL_REGISTRY_URL must use HTTPS. Got protocol: ${parsed.protocol}`
+    );
+  }
+  if (!APPROVED_REGISTRY_HOSTNAMES.has(parsed.hostname)) {
+    throw new Error(
+      `ORG_MODEL_REGISTRY_URL hostname "${parsed.hostname}" is not in the approved allowlist. ` +
+      `Approved hostnames: ${[...APPROVED_REGISTRY_HOSTNAMES].join(", ") || "(none configured — set ORG_MODEL_REGISTRY_ALLOWED_HOST)"}`
+    );
+  }
+}
+
+/** Fetch the approved model registry from the organization endpoint.
+ *  The response MUST carry an X-Registry-Signature header containing
+ *  HMAC-SHA256(rawBody, ORG_REGISTRY_HMAC_SECRET) so we can detect MITM tampering
+ *  before we parse or trust any field in the payload.
+ */
 async function fetchApprovedRegistry(): Promise<OrgModelRegistry> {
   const res = await fetch(ORG_MODEL_REGISTRY_URL, {
     method: "GET",
@@ -46,7 +176,26 @@ async function fetchApprovedRegistry(): Promise<OrgModelRegistry> {
       `Organization model registry fetch failed: HTTP ${res.status} from ${ORG_MODEL_REGISTRY_URL}`
     );
   }
-  const registry: OrgModelRegistry = await res.json();
+
+  // --- HMAC verification of the raw payload BEFORE parsing ---
+  const rawBody = await res.text();
+  const signatureHeader = res.headers.get("x-registry-signature") ?? "";
+  const expectedSig = createHmac("sha256", ORG_REGISTRY_HMAC_SECRET)
+    .update(rawBody, "utf8")
+    .digest("hex");
+  const sigBuf = Buffer.from(signatureHeader.toLowerCase().trim(), "hex");
+  const expBuf = Buffer.from(expectedSig, "hex");
+  if (
+    sigBuf.length === 0 ||
+    sigBuf.length !== expBuf.length ||
+    !timingSafeEqual(sigBuf, expBuf)
+  ) {
+    throw new Error(
+      "Registry payload HMAC verification failed — possible MITM or tampered response. Aborting."
+    );
+  }
+  // Safe to parse only after signature is verified.
+  const registry: OrgModelRegistry = JSON.parse(rawBody);
   if (!registry?.approvedModels || !Array.isArray(registry.approvedModels)) {
     throw new Error("Organization model registry response is malformed.");
   }
