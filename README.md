@@ -1,4 +1,4 @@
-# AI Companion App (based on AI Getting Started templates)
+# AI Companion App (based on AI Getting Started templates) 
 
 [Live Demo](https://ai-companion-stack.com/)
 
