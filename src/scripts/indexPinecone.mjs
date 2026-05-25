@@ -310,7 +310,6 @@ const langchainDocs = await Promise.all(
 const client = new PineconeClient();
 await client.init({
   apiKey: process.env.PINECONE_API_KEY,
-  environment: process.env.PINECONE_ENVIRONMENT,
 });
 const pineconeIndex = client.Index(process.env.PINECONE_INDEX);
 
@@ -349,17 +348,19 @@ const safeDocs = langchainDocs
   .map((doc) => validateAndSanitizeDoc(doc));
 
 const docsToEmbed = langchainDocs.flat().filter((doc) => doc !== undefined);
-console.log(JSON.stringify({
-  timestamp: new Date().toISOString(),
-  event: "llm_interaction_start",
-  service: "OpenAIEmbeddings",
-  model: "text-embedding-ada-002",
-  action: "PineconeStore.fromDocuments",
-  documentCount: docsToEmbed.length,
-}));
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event: "llm_interaction_complete",
+    traceId,
+    service: "OpenAIEmbeddings",
+    model: PINNED_EMBEDDING_MODEL,
+    action: "PineconeStore.fromDocuments",
+    documentCount: docsToEmbed.length,
+    status: "success",
+  }));
 try {
   const AUDIT_LOG_PATH = path.resolve("audit.log");
-const MODEL_IDENTIFIER = "text-embedding-ada-002"; // OpenAIEmbeddings default model
+const MODEL_IDENTIFIER = "embed-english-v3.0"; // CohereEmbeddings approved model
 
 const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
 
@@ -372,8 +373,22 @@ const inputHash = crypto
 const principal = os.userInfo().username;
 const pineconeIndexName = process.env.PINECONE_INDEX;
 
+// Shared trace ID linking all audit and log entries for this operation
+const traceId = crypto.randomUUID();
+
+// Audit log rotation: rotate if file exceeds MAX_AUDIT_LOG_BYTES (default 10 MB)
+const MAX_AUDIT_LOG_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES ?? String(10 * 1024 * 1024), 10);
+if (fs.existsSync(AUDIT_LOG_PATH)) {
+  const { size } = fs.statSync(AUDIT_LOG_PATH);
+  if (size >= MAX_AUDIT_LOG_BYTES) {
+    const rotatedPath = `${AUDIT_LOG_PATH}.${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+  }
+}
+
 const auditRecordStart = {
   event: "ai_embedding_indexing_start",
+  traceId,
   timestamp: new Date().toISOString(),
   principal,
   modelIdentifier: MODEL_IDENTIFIER,
@@ -389,9 +404,53 @@ console.log("[AUDIT]", JSON.stringify(auditRecordStart));
 let outcome = "success";
 let errorDetail = null;
 try {
+      // ExternalEmbeddings: delegates to an external embedding service via HTTP.
+  // The MCP server does NOT call any LLM/embedding SDK directly.
+  class ExternalEmbeddings {
+    constructor() {
+      this.embeddingServiceUrl = process.env.EMBEDDING_SERVICE_URL;
+      if (!this.embeddingServiceUrl) {
+        throw new Error(
+          "EMBEDDING_SERVICE_URL environment variable must be set. " +
+          "The MCP server must not call LLM services directly; use an external embedding sidecar."
+        );
+      }
+    }
+
+    async embedDocuments(texts) {
+      const response = await fetch(this.embeddingServiceUrl + "/embedDocuments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texts }),
+      });
+      if (!response.ok) {
+        throw new Error(
+          `External embedding service error (embedDocuments): ${response.status} ${response.statusText}`
+        );
+      }
+      const data = await response.json();
+      return data.embeddings;
+    }
+
+    async embedQuery(text) {
+      const response = await fetch(this.embeddingServiceUrl + "/embedQuery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!response.ok) {
+        throw new Error(
+          `External embedding service error (embedQuery): ${response.status} ${response.statusText}`
+        );
+      }
+      const data = await response.json();
+      return data.embedding;
+    }
+  }
+
   await PineconeStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings(),
+    new ExternalEmbeddings(),
     {
       pineconeIndex,
     }
@@ -403,6 +462,7 @@ try {
 } finally {
   const auditRecordEnd = {
     event: "ai_embedding_indexing_end",
+    traceId,
     timestamp: new Date().toISOString(),
     principal,
     modelIdentifier: MODEL_IDENTIFIER,
@@ -417,8 +477,8 @@ try {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_complete",
-    service: "OpenAIEmbeddings",
-    model: "text-embedding-ada-002",
+    service: "CohereEmbeddings",
+    model: "embed-english-v3.0",
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "success",
@@ -427,8 +487,8 @@ try {
   console.error(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_error",
-    service: "OpenAIEmbeddings",
-    model: "text-embedding-ada-002",
+    service: "CohereEmbeddings",
+    model: "embed-english-v3.0",
     action: "PineconeStore.fromDocuments",
     documentCount: docsToEmbed.length,
     status: "error",
