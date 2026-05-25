@@ -23,7 +23,7 @@ RUN apt-get update -qq && \
         pkg-config \
         build-essential && \
     apt-get clean && \
-    find /var/lib/apt/lists -mindepth 1 -delete
+    rm -rf /var/lib/apt/lists/*
 
 # Install node modules
 COPY --link package-lock.json package.json ./
