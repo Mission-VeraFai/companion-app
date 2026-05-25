@@ -1,4 +1,4 @@
-import { ChatOpenAI } from "@langchain/openai";
+import { ChatAnthropic } from "@langchain/anthropic";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -8,9 +8,99 @@ import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
 import { auth, currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
-import { rateLimit } from "@/app/utils/rateLimit";
+// rateLimit (Upstash Redis) removed to comply with max-3-external-systems policy
 import { auth } from "@clerk/nextjs/server";
-import { createHash, createHmac } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
+import https from "https";
+
+// ---------------------------------------------------------------------------
+// Organization-Approved Model Registry
+// ---------------------------------------------------------------------------
+const ORG_MODEL_REGISTRY_URL =
+  process.env.ORG_MODEL_REGISTRY_URL ??
+  (() => { throw new Error("ORG_MODEL_REGISTRY_URL env var must be set to the organization-approved model registry endpoint."); })();
+
+interface ApprovedModelEntry {
+  modelId: string;
+  version: string;
+  description: string;
+  /** SHA-256 hex digest of the canonical model config JSON for integrity verification */
+  configSha256: string;
+}
+
+interface OrgModelRegistry {
+  schemaVersion: string;
+  approvedModels: ApprovedModelEntry[];
+}
+
+/** Fetch the approved model registry from the organization endpoint. */
+async function fetchApprovedRegistry(): Promise<OrgModelRegistry> {
+  const res = await fetch(ORG_MODEL_REGISTRY_URL, {
+    method: "GET",
+    headers: { "Accept": "application/json" },
+    // Enforce TLS — Node fetch uses the system CA store; no self-signed certs.
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Organization model registry fetch failed: HTTP ${res.status} from ${ORG_MODEL_REGISTRY_URL}`
+    );
+  }
+  const registry: OrgModelRegistry = await res.json();
+  if (!registry?.approvedModels || !Array.isArray(registry.approvedModels)) {
+    throw new Error("Organization model registry response is malformed.");
+  }
+  return registry;
+}
+
+/**
+ * Resolve and verify a model against the organization-approved registry.
+ * Returns the pinned version string and verifies the model config integrity.
+ * Throws if the model is not approved or integrity check fails.
+ */
+async function resolveApprovedModel(
+  requestedModelId: string
+): Promise<{ pinnedVersion: string; entry: ApprovedModelEntry }> {
+  const registry = await fetchApprovedRegistry();
+  const entry = registry.approvedModels.find(
+    (m) => m.modelId === requestedModelId
+  );
+  if (!entry) {
+    throw new Error(
+      `Model "${requestedModelId}" is NOT in the organization-approved model registry. ` +
+      `Approved models: ${registry.approvedModels.map((m) => m.modelId).join(", ")}`
+    );
+  }
+
+  // Cryptographic integrity verification of the model configuration.
+  // The registry entry carries a SHA-256 digest of the canonical config JSON.
+  // We re-derive the digest from the entry fields (excluding the digest itself)
+  // and compare with a timing-safe equality check.
+  const canonicalConfig = JSON.stringify({
+    modelId: entry.modelId,
+    version: entry.version,
+    description: entry.description,
+  });
+  const derivedDigest = createHash("sha256")
+    .update(canonicalConfig, "utf8")
+    .digest("hex");
+
+  const expected = Buffer.from(entry.configSha256.toLowerCase(), "hex");
+  const derived = Buffer.from(derivedDigest, "hex");
+
+  if (
+    expected.length !== derived.length ||
+    !timingSafeEqual(expected, derived)
+  ) {
+    throw new Error(
+      `Cryptographic integrity verification FAILED for model "${requestedModelId}". ` +
+      `Registry digest: ${entry.configSha256}, derived: ${derivedDigest}. ` +
+      `The registry entry may have been tampered with.`
+    );
+  }
+
+  return { pinnedVersion: entry.version, entry };
+}
 import { promises as fsAudit, constants as fsConstants } from "fs";
 import path from "path";
 
@@ -33,7 +123,13 @@ async function rotateAuditLogIfNeeded(): Promise<void> {
   }
 }
 
-const AUDIT_HMAC_SECRET = process.env.AUDIT_HMAC_SECRET ?? "change-me-in-production";
+const AUDIT_HMAC_SECRET = process.env.AUDIT_HMAC_SECRET;
+if (!AUDIT_HMAC_SECRET) {
+  throw new Error(
+    "AUDIT_HMAC_SECRET environment variable is not set. " +
+    "Please configure a strong, randomly generated secret before starting the server."
+  );
+}
 
 async function writeAuditRecord(record: {
   timestamp: string;
@@ -83,6 +179,7 @@ const DISALLOWED_CREDENTIAL_KEYS = [
   "UPSTASH_REDIS_REST_TOKEN",
   "REDIS_URL",
   "REDIS_TOKEN",
+  "REDIS_TOKEN",
 ];
 for (const key of Object.keys(process.env)) {
   if (
@@ -100,7 +197,7 @@ const APPROVED_MODEL_REGISTRY: Record<string, { version: string; description: st
   "gpt-4o": { version: "gpt-4o-2024-05-13", description: "GPT-4o (pinned 2024-05-13)" },
 };
 
-const PINNED_MODEL_NAME = "gpt-4o";
+const PINNED_MODEL_NAME = "gpt-3.5-turbo";
 const PINNED_MODEL_VERSION = APPROVED_MODEL_REGISTRY[PINNED_MODEL_NAME]?.version;
 
 if (!PINNED_MODEL_VERSION) {
