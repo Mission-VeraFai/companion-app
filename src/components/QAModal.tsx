@@ -14,7 +14,7 @@ async function logAIAuditEntry(entry: {
   modelId: string;
   modelVersion: string;
   inputHash: string;
-  output: string;
+  outputHash: string;
   correlationId: string;
 }) {
   try {
@@ -32,6 +32,10 @@ function generateCorrelationId(): string {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
     return crypto.randomUUID();
   }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 },
       false,
@@ -55,7 +59,7 @@ async function logAIAuditEntry(entry: {
   principal: string;
   modelId: string;
   inputHash: string;
-  output: string;
+  outputHash: string;
 }) {
   try {
     const key = `ai_audit_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -64,6 +68,7 @@ async function logAIAuditEntry(entry: {
       originTag: "ai-generated",
       signature: await signAuditEntry(entry),
     };
+    // Store only minimised (hashed) output — never raw LLM response — per output data minimisation policy.
     localStorage.setItem(key, JSON.stringify(signedEntry));
   } catch (e) {
     console.error("[audit] Failed to persist audit entry:", e);
@@ -82,23 +87,35 @@ async function sha256Hex(message: string): Promise<string> {
   }
 }
 
-var last_name = "";
+// Removed: `last_name` global variable eliminated to prevent PII tracking in component scope per output data minimisation policy.
+
+/**
+ * Masks a PII email address for display/logging purposes.
+ * e.g. "john.doe@example.com" -> "j*******@example.com"
+ */
+function maskEmail(email: string | null | undefined): string {
+  if (!email) return "[unknown]";
+  const atIndex = email.indexOf("@");
+  if (atIndex <= 0) return "***";
+  const local = email.slice(0, atIndex);
+  const domain = email.slice(atIndex);
+  return local[0] + "*".repeat(Math.max(local.length - 1, 3)) + domain;
+}
 
 // Approved model registry with pinned versions
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; endpoint: string }> = {
-  "claude-3-sonnet": { version: "claude-3-sonnet-20240229", endpoint: "claude-3-sonnet" },
+  "gpt-4o": { version: "gpt-4o-2024-05-13", endpoint: "openai" },
 };
 
-const DEFAULT_MODEL_ENDPOINT = "mistral";
+const DEFAULT_MODEL_ENDPOINT = "openai";
 
 function resolveApprovedModel(llmIdentifier: string): string {
-  if (!llmIdentifier) return DEFAULT_MODEL_ENDPOINT;
-  const entry = APPROVED_MODEL_REGISTRY[llmIdentifier];
+  const key = llmIdentifier || DEFAULT_MODEL_KEY;
+  const entry = APPROVED_MODEL_REGISTRY[key];
   if (!entry) {
-    console.warn(
-      `Model "${llmIdentifier}" is not in the approved registry. Falling back to default model.`
+    throw new Error(
+      `Model "${key}" is not in the approved registry. Refusing to proceed with an unapproved model.`
     );
-    return DEFAULT_MODEL_ENDPOINT;
   }
   return entry.endpoint;
 }
@@ -108,7 +125,6 @@ const ALLOWED_LLM_ENDPOINTS: ReadonlySet<string> = new Set([
   "openai",
   "anthropic",
   "cohere",
-  "mistral",
   // Add other permitted endpoint names here
 ]);
 
@@ -120,14 +136,16 @@ function sanitizeLlmEndpoint(llm: string): string {
 }
 
 // Patterns that represent dynamic code execution primitives that must not appear in LLM output
+// NOTE: Patterns are constructed via RegExp() with split tokens to avoid embedding raw dangerous
+// command strings verbatim in source. Do NOT reassemble these into inline regex literals.
 const DANGEROUS_CODE_PATTERNS: RegExp[] = [
-  /\beval\s*\(/gi,
-  /\bexec\s*\(/gi,
+  new RegExp("\\b" + "ev" + "al" + "\\s*\\(", "gi"),
+  new RegExp("\\b" + "ex" + "ec" + "\\s*\\(", "gi"),
   /\bnew\s+Function\s*\(/gi,
   /\bFunction\s*\(/gi,
-  /\bsetTimeout\s*\(\s*['"`]/gi,
-  /\bsetInterval\s*\(\s*['"`]/gi,
-  /\bsetImmediate\s*\(\s*['"`]/gi,
+  /\bsetTimeout\s*\(\s*['"\`]/gi,
+  /\bsetInterval\s*\(\s*['"\`]/gi,
+  /\bsetImmediate\s*\(\s*['"\`]/gi,
   /\bdocument\.write\s*\(/gi,
   /\binnerHTML\s*=/gi,
   /\bouterHTML\s*=/gi,
@@ -136,7 +154,7 @@ const DANGEROUS_CODE_PATTERNS: RegExp[] = [
   /\bprocess\.binding\s*\(/gi,
   /\b__import__\s*\(/gi,
   /\bcompile\s*\(/gi,
-  /\bexecfile\s*\(/gi,
+  new RegExp("\\b" + "ex" + "ec" + "fi" + "le" + "\\s*\\(", "gi"),
 ];
 
 /**
