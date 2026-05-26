@@ -17,7 +17,7 @@ class ConfigManager {
     return ConfigManager.instance;
   }
 
-  public getConfig(fieldName: string, configValue: string) {
+  public getConfig(fieldName: string, configValue: string, allowedFields?: string[]) {
     //).filter((c: any) => c.name === companionName);
     try {
       if (!!this.config && this.config.length !== 0) {
@@ -25,7 +25,16 @@ class ConfigManager {
           (c: any) => c[fieldName] === configValue
         );
         if (result.length !== 0) {
-          return result[0];
+          const matched = result[0];
+          const fields = allowedFields && allowedFields.length > 0
+            ? allowedFields
+            : [fieldName];
+          return fields.reduce((acc: Record<string, any>, key: string) => {
+            if (Object.prototype.hasOwnProperty.call(matched, key)) {
+              acc[key] = matched[key];
+            }
+            return acc;
+          }, {});
         }
       }
     } catch (e) {
